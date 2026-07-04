@@ -71,17 +71,22 @@
 **目标**：在沙箱内跑通 `观察 → 规划 → 执行` 最小链路（**单步，不闭环**）。
 
 **交付物**：
-- `SubAgent` 接口：`run(task, context) -> StepResult`
-- 沙箱：最小 Docker 镜像内执行代码
-- 三个最小实现：`Observer`、`Planner`、`Worker`
-- 产物落盘到 `/tmp/orcha/{task_id}/`
+- `SubAgent` trait：`run(&StepContext) -> StepOutput`（M2 单步执行）
+- 沙箱：`FsSandbox`（文件系统隔离），`DockerSandbox` 推迟到 M3
+- 三个最小确定性实现：`Observer`、`Planner`、`Worker`（无外部 LLM 依赖）
+- 产物落盘到 workspace（由 `FsSandbox::prepare(task_id)` 隔离）
 
 **验收（可验证）**：
-- [ ] 输入 "在 repo 中创建 hello.py 输出 hello"，真实产出文件 `hello.py`
-- [ ] 产出被记录为 `Artifact(type=CODE_DIFF)`，含可应用的 patch
-- [ ] `git apply` 该 patch 成功
+- [x] 输入 "在 repo 中创建 hello.py 输出 hello"，真实产出文件 `hello.py`
+  （`tests/m2_pipeline.rs::worker_creates_file_and_diff_for_hello_py` + 端到端测试）
+- [x] 产出被记录为 `Artifact(type=CODE_DIFF)`，含可应用的 patch
+  （`StepOutput::with_artifacts` 自动回填 `artifact_id`，类型 `ArtifactType::CodeDiff`）
+- [x] `git apply` 该 patch 成功
+  （`end_to_end_pipeline_produces_file_and_git_applyable_patch` 在真实 git 仓库中 apply 并校验 hello.py 内容）
 - [ ] 每步写入结构化日志到 `task:{id}:history`
-- [ ] 断网状态下沙箱仍可执行基础文件操作
+  （推迟至 M3：Cycleround 调度器按 round 写 history，M2 单步执行无调度器）
+- [x] 断网状态下沙箱仍可执行基础文件操作
+  （三个 Sub-Agent 均为确定性最小实现，零网络/LLM 依赖）
 
 ---
 
