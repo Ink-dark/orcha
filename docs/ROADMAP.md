@@ -48,19 +48,21 @@
 
 ## M1 — Task 模型与本地 CLI
 
-**目标**：本地可创建、查询、流转任务状态机；不引入外部依赖（先用 SQLite/文件）。
+**目标**：本地可创建、查询、流转任务状态机；不引入外部服务依赖（先用本地文件存储）。
 
 **交付物**：
-- Task 仓储（SQLite 实现，预留 Redis/PG 接口）
-- 状态机：`PENDING → RUNNING → (BLOCKED ↔ RUNNING) → DONE | FAILED`
-- CLI：`orcha init`、`orcha run "<desc>"`、`orcha status [id]`、`orcha list`
+- Task 仓储：`TaskStore` trait + `FileTaskStore`（JSON 文件落盘），trait 预留 `SqliteTaskStore`/Redis/PG 接口。M1 用纯 Rust 文件存储以保 Windows MSVC 零 C 依赖；M4 持久化升级时再引入 rusqlite。
+- 状态机：`PENDING → RUNNING → (BLOCKED ↔ RUNNING) → DONE | FAILED`（M0 已实现）
+- CLI：`orcha init`、`orcha run "<desc>"`、`orcha status [id]`、`orcha list [--status <STATUS>]`
+- Home 解析：`--home` > `$ORCHA_HOME` > `./.orcha`
 
 **验收（可验证）**：
-- [ ] `orcha run "hello world"` 返回 `T-` 开头的 task_id
-- [ ] `orcha status <id>` 输出 JSON，`status` 字段 ∈ 合法枚举
-- [ ] 非法状态迁移抛出 `InvalidTransition`，且有单元测试覆盖
-- [ ] `orcha list` 列出全部任务，支持 `--status` 过滤
-- [ ] 重启进程后 `orcha list` 仍可查到历史任务（持久化生效）
+- [x] `orcha run "hello world"` 返回 `T-` 开头的 task_id
+- [x] `orcha status <id>` 输出 JSON，`status` 字段 ∈ 合法枚举
+- [x] 非法状态迁移抛出 `InvalidTransition`，且有单元测试覆盖（M0 state_machine 测试 + store update 测试）
+- [x] `orcha list` 列出全部任务，支持 `--status` 过滤（大小写不敏感）
+- [x] 重启进程后 `orcha list` 仍可查到历史任务（持久化生效；`persistence_survives_process_restart` 集成测试跨独立子进程验证）
+- [ ] CI 在 GitHub Actions 上跑通本次新增测试（ubuntu + windows MSVC）— 待 push 后由 Actions 确认
 
 ---
 
