@@ -14,9 +14,14 @@ env:
 
 jobs:
   lint-test:
-    name: fmt + clippy + test
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: fmt + clippy + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # 覆盖 Linux (glibc) 与 Windows (MSVC) 两条主路径。
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -43,14 +48,19 @@ jobs:
         run: cargo test --all
 
   build-release:
-    name: release build smoke
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+    name: release build smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo build --release
         run: cargo build --release -p orcha-cli
+      # 用 `cargo run` 调用避免 .exe 后缀 / 路径分隔符的平台差异。
       - name: orcha --version smoke
-        run: ./target/release/orcha --version
+        run: cargo run --release -p orcha-cli -- --version
