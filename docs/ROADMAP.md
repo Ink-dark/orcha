@@ -101,11 +101,17 @@
 - 端到端 golden tasks 集合（≥ 3 个）
 
 **验收（可验证）**：
-- [ ] 给定含已知 bug 的样例 repo，`orcha fix` 闭环修复且测试通过
-- [ ] 触达 `max_rounds` 时任务转 `FAILED`，**不死循环**
-- [ ] 每一轮 round 在 history 中可追溯（含耗时、token、产物引用）
-- [ ] 3 个 golden tasks 全部通过（`make e2e` 或 `pytest -m e2e`）
-- [ ] `./scripts/mvp-demo.sh` 一键复现完整闭环
+- [x] 给定含已知 bug 的样例 repo，`orcha fix` 闭环修复且测试通过
+  （`orcha fix --workspace <dir> "创建 hello.py 输出 hello"`：成功路径 GT-1 单轮闭环；
+  Fixer 修复路径 GT-2 第 2 轮闭环；CLI 端到端测试 `fix_cli_succeeds_*` 全绿）
+- [x] 触达 `max_rounds` 时任务转 `FAILED`，**不死循环**
+  （`cycleround_fails_with_max_rounds_exceeded_on_unparseable_task` 验证 max_rounds 路径；
+  GT-3 验证 max_retries 路径，均触达熔断即停）
+- [x] 每一轮 round 在 history 中可追溯（含耗时、token、产物引用）
+  （GT-1/2/3 各自断言 `RoundRecord.started_at`/`finished_at`/`tokens_used`/`artifacts` 落盘可读；
+  `history.rs` 9 单测覆盖 JSONL 格式 / 跨 task 隔离 / 重启存活）
+- [x] 3 个 golden tasks 全部通过（`cargo test --test m3_golden_tasks`）
+- [ ] `./scripts/mvp-demo.sh` 一键复现完整闭环（M3 Commit 7 实现）
 
 ---
 
