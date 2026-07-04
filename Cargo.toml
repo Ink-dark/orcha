@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "packages/orcha-sdk",
+    "packages/orcha-core",
+    "packages/orcha-shell",
+    "packages/orcha-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/Ink-dark/orcha"
+authors = ["Ink-dark"]
+
+[workspace.dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+schemars = { version = "0.8", features = ["chrono"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1.0"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
