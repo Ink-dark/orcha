@@ -37,6 +37,13 @@ impl StepContext {
         self.prior_artifacts.extend(artifacts);
         self
     }
+
+    /// 追加多个前序步骤及其产物（用于 Cycleround 在每步之间累积上下文）。
+    pub fn with_priors(mut self, steps: &[Step], artifacts: &[Artifact]) -> Self {
+        self.prior_steps.extend_from_slice(steps);
+        self.prior_artifacts.extend_from_slice(artifacts);
+        self
+    }
 }
 
 /// Sub-Agent 的统一接口。
