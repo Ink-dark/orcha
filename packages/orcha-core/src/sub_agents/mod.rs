@@ -1,10 +1,14 @@
-//! M2 内置 Sub-Agent 集合：Observer / Planner / Worker。
+//! M2/M3 内置 Sub-Agent 集合：Observer / Planner / Worker / Tester / Reviewer / Fixer。
 //!
-//! 三个实现都是**确定性最小实现**，用于打通单步执行管线；
-//! M3 会替换为基于 LLM 的版本，但 trait 不变。
+//! 这些实现都是**确定性最小实现**，用于打通单步执行管线与 Cycleround 闭环；
+//! 后续可替换为基于 LLM 的版本，但 trait 不变。
 //!
 //! 典型 M2 任务描述：`"在 repo 中创建 hello.py 输出 hello"`，
 //! Worker 会真实写出 `hello.py` 并生成可 `git apply` 的 unified diff。
+//!
+//! M3 Commit 4：新增 [`Fixer`]，在 Worker/Tester/Reviewer 失败时尝试产出修复，
+//! 让下一轮可以重新执行；触达 `max_retries` 后由 Cycleround 返回
+//! `Failed(MaxRetriesExceeded)`。
 
 use std::fs;
 use std::path::Path;
@@ -362,6 +366,94 @@ impl SubAgent for Reviewer {
                 .with_artifacts(vec![artifact])
         }
     }
+}
+
+// ============================================================
+// Fixer (M3 Commit 4)
+// ============================================================
+
+/// 修复者：在 Worker/Tester/Reviewer 失败时尝试产出可让下一轮成功的修复。
+///
+/// M3 最小确定性实现支持一种修复策略：
+/// - 若 workspace 当前**没有**任何测试框架（无 `Cargo.toml` / `pytest.ini` /
+///   `pyproject.toml` / `setup.py` / `test.py`），且 task 描述可解析为
+///   `创建 <filename> 输出 <content>`，则在 workspace 下创建 `test.py`，
+///   断言 `<filename>` 的内容（去 trailing newline 后）等于 `<content>`。
+///   这样下一轮 Tester 即可通过。
+///
+/// 其余失败场景（如 `test.py` 已存在但断言失败、Reviewer 审核失败等）
+/// Fixer 无法修复，返回 failure；Cycleround 累计触达 `max_retries` 后
+/// 返回 `Failed(MaxRetriesExceeded)`。
+///
+/// 注意：Fixer **不会**改写已存在的 `test.py`，避免「为了让测试通过而改测试」
+/// 的作弊行为——若 `test.py` 已存在，则视为用户的测试约束，Fixer 不动它。
+pub struct Fixer;
+
+impl SubAgent for Fixer {
+    fn name(&self) -> &'static str {
+        "fixer"
+    }
+
+    fn run(&self, ctx: &StepContext) -> StepOutput {
+        let artifact = Artifact {
+            artifact_id: next_artifact_id(&ctx.prior_artifacts, "fixer"),
+            artifact_type: ArtifactType::Report,
+            commit_sha: None,
+            patch: None,
+            url: None,
+        };
+
+        let plan = match parse_create_plan(&ctx.task.description) {
+            Ok(p) => p,
+            Err(e) => {
+                return StepOutput::failure("S-fixer", format!("无法解析任务以生成修复: {e}"))
+                    .with_artifacts(vec![artifact]);
+            }
+        };
+
+        // 已有测试框架时 Fixer 不动 test.py（避免改测试让测试通过）。
+        if has_test_framework(&ctx.workspace) {
+            return StepOutput::failure(
+                "S-fixer",
+                "workspace 已有测试框架，Fixer 无法修复测试失败（不修改既有 test.py）",
+            )
+            .with_artifacts(vec![artifact]);
+        }
+
+        // 生成 test.py 内容：用 Rust Debug 格式产出 Python 字符串字面量，
+        // 这样能正确转义换行 / 引号 / 反斜杠。
+        let test_content = format!(
+            "assert open({filename:?}).read().strip() == {content:?}\n",
+            filename = plan.filename,
+            content = plan.content,
+        );
+        let test_path = ctx.workspace.join("test.py");
+        if let Err(e) = fs::write(&test_path, &test_content) {
+            return StepOutput::failure(
+                "S-fixer",
+                format!("写 test.py 失败 {}: {e}", test_path.display()),
+            )
+            .with_artifacts(vec![artifact]);
+        }
+
+        StepOutput::success(
+            "S-fixer",
+            format!(
+                "Fixer 已创建 test.py，断言 {} 内容为 {:?}",
+                plan.filename, plan.content
+            ),
+        )
+        .with_artifacts(vec![artifact])
+    }
+}
+
+/// 判断 workspace 是否已存在测试框架文件。
+fn has_test_framework(workspace: &Path) -> bool {
+    workspace.join("Cargo.toml").exists()
+        || workspace.join("pytest.ini").exists()
+        || workspace.join("pyproject.toml").exists()
+        || workspace.join("setup.py").exists()
+        || workspace.join("test.py").exists()
 }
 
 pub(crate) fn parse_create_plan(desc: &str) -> Result<CreatePlan> {
@@ -813,5 +905,122 @@ mod tests {
             "应当审核最新的（bad）patch 而非第一个 clean 的"
         );
         assert!(out.result.summary.contains("路径穿越"));
+    }
+
+    // ============================================================
+    // Fixer (M3 Commit 4)
+    // ============================================================
+
+    #[test]
+    fn fixer_creates_test_py_when_no_framework_present() {
+        let ws = tempfile::tempdir().unwrap();
+        // 模拟 Worker 已成功：hello.py 已存在。
+        fs::write(ws.path().join("hello.py"), "hello\n").unwrap();
+        let task = Task::new("T-1".into(), "创建 hello.py 输出 hello".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = Fixer.run(&ctx);
+        assert!(out.result.success, "summary: {}", out.result.summary);
+        // test.py 应被创建。
+        let test_path = ws.path().join("test.py");
+        assert!(test_path.is_file(), "test.py should be created");
+        let content = fs::read_to_string(&test_path).unwrap();
+        assert!(
+            content.contains("hello.py"),
+            "test.py 应引用目标文件名: {content}"
+        );
+        assert!(
+            content.contains("hello"),
+            "test.py 应包含期望内容: {content}"
+        );
+        assert_eq!(out.artifacts.len(), 1, "应产出 1 个 Report artifact");
+        assert_eq!(out.artifacts[0].artifact_type, ArtifactType::Report);
+    }
+
+    #[test]
+    fn fixer_fails_when_test_framework_already_present() {
+        let ws = tempfile::tempdir().unwrap();
+        // 已有 test.py（断言错误），Fixer 不应改写它。
+        fs::write(ws.path().join("test.py"), "assert False\n").unwrap();
+        let task = Task::new("T-1".into(), "创建 hello.py 输出 hello".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = Fixer.run(&ctx);
+        assert!(!out.result.success);
+        assert!(out.result.summary.contains("已有测试框架"));
+        // test.py 内容应未被改写。
+        let content = fs::read_to_string(ws.path().join("test.py")).unwrap();
+        assert_eq!(content, "assert False\n", "test.py 不应被改写");
+    }
+
+    #[test]
+    fn fixer_fails_when_task_unparseable() {
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-1".into(), "do something unrelated".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = Fixer.run(&ctx);
+        assert!(!out.result.success);
+        assert!(out.result.summary.contains("无法解析任务"));
+        // 失败时也不应创建 test.py。
+        assert!(!ws.path().join("test.py").exists());
+    }
+
+    #[test]
+    fn fixer_creates_test_py_asserting_content_strips_trailing_newline() {
+        // 验证 Fixer 生成的 test.py 用 .strip() 比较，
+        // 这样 Worker 写出 hello\n 时仍能通过。
+        let ws = tempfile::tempdir().unwrap();
+        fs::write(ws.path().join("hello.py"), "hello\n").unwrap();
+        let task = Task::new("T-1".into(), "创建 hello.py 输出 hello".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = Fixer.run(&ctx);
+        assert!(out.result.success);
+        let test_content = fs::read_to_string(ws.path().join("test.py")).unwrap();
+        assert!(
+            test_content.contains(".strip()"),
+            "test.py 应使用 .strip() 比较: {test_content}"
+        );
+    }
+
+    #[test]
+    fn fixer_detects_cargo_toml_as_existing_framework() {
+        let ws = tempfile::tempdir().unwrap();
+        fs::write(ws.path().join("Cargo.toml"), "").unwrap();
+        let task = Task::new("T-1".into(), "创建 hello.py 输出 hello".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = Fixer.run(&ctx);
+        assert!(!out.result.success, "Cargo.toml 也算测试框架，Fixer 应拒绝");
+        assert!(out.result.summary.contains("已有测试框架"));
+    }
+
+    #[test]
+    fn fixer_generates_valid_python_string_literal_for_content() {
+        // 内容含空格 / 特殊字符时，test.py 仍应是合法 Python。
+        let ws = tempfile::tempdir().unwrap();
+        fs::write(ws.path().join("greet.txt"), "hello world\n").unwrap();
+        let task = Task::new("T-1".into(), "创建 greet.txt 输出 hello world".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = Fixer.run(&ctx);
+        assert!(out.result.success, "summary: {}", out.result.summary);
+        let test_path = ws.path().join("test.py");
+        // 验证生成的 test.py 是合法 Python（语法检查）。
+        // 注意：可能环境无 python，此时跳过语法检查，仅检查内容含 "hello world"。
+        let content = fs::read_to_string(&test_path).unwrap();
+        assert!(content.contains("hello world"));
+        if let Some(py) = find_python() {
+            let check = Command::new(&py)
+                .arg("-c")
+                .arg(format!(
+                    "compile(open({}).read(), 'test.py', 'exec')",
+                    "'test.py'"
+                ))
+                .current_dir(ws.path())
+                .output();
+            if let Ok(o) = check {
+                assert!(
+                    o.status.success(),
+                    "test.py 应是合法 Python，stderr: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+            }
+        }
     }
 }
