@@ -337,6 +337,7 @@ dependencies = [
  "orcha-core",
  "orcha-sdk",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]
