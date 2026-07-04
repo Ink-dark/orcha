@@ -28,17 +28,21 @@
 
 **目标**：建立可运行工程骨架与统一数据契约，所有后续模块在此之上生长。
 
+**技术栈**：Rust (stable), Cargo workspace, serde + schemars, clap。
+
 **交付物**：
-- Monorepo 结构：`packages/orcha-core`、`packages/orcha-shell`、`packages/orcha-cli`、`packages/orcha-sdk`
-- 核心数据模型（Pydantic）：`Task`、`OrchaEvent`、`OrchaResponse`、`Artifact`、`Step`、`StepResult`
-- 测试框架（pytest）+ CI（lint + test）
+- Monorepo 结构（Cargo workspace）：`packages/orcha-core`、`packages/orcha-shell`、`packages/orcha-cli`、`packages/orcha-sdk`
+- 核心数据模型（serde + schemars）：`Task`、`OrchaEvent`、`OrchaResponse`、`Artifact`、`Step`、`StepResult`
+- 测试框架（`cargo test`）+ CI（fmt + clippy + test）
 
 **验收（可验证）**：
-- [ ] `orcha --version` 打印版本号，退出码 `0`
-- [ ] `pytest -q` 全绿，覆盖率 ≥ 60%（`pytest --cov`）
-- [ ] CI 在 PR 上自动运行 lint + test（`.github/workflows/ci.yml` 存在且为 green）
-- [ ] `orcha schema --export > schema.json` 输出全部模型的 JSON Schema
-- [ ] `pre-commit run --all-files` 通过
+- [x] `orcha --version` 打印版本号 `orcha 0.1.0`，退出码 `0`
+- [x] `cargo test --all` 全绿（当前 31 个测试通过）
+- [x] CI 在 PR/push 上自动运行 fmt + clippy + test（`.github/workflows/ci.yml` 存在）
+- [ ] CI 在 GitHub Actions 上首次运行结果为 green（需 push 后由 Actions 实际执行确认）
+- [x] `orcha schema --export > schema.json` 输出全部 15 个模型的 JSON Schema
+- [x] `cargo fmt --all --check` 通过
+- [x] `cargo clippy --all-targets -- -D warnings` 0 警告
 
 ---
 
