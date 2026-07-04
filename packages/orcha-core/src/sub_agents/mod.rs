@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use orcha_sdk::{Artifact, ArtifactType};
@@ -141,6 +142,162 @@ impl SubAgent for Worker {
 pub(crate) struct CreatePlan {
     pub filename: String,
     pub content: String,
+}
+
+// ============================================================
+// Tester (M3 Commit 2)
+// ============================================================
+
+/// 测试执行者：检测 workspace 用的测试框架并执行测试命令。
+///
+/// 检测优先级：
+/// 1. `Cargo.toml` → `cargo test --quiet`（Rust 项目）
+/// 2. `pytest.ini` / `pyproject.toml` / `setup.py` → `pytest -q`（Python 项目）
+/// 3. `test.py` 存在 → `python3 test.py`（或回退 `python test.py`）
+/// 4. 其余 → 失败，提示未检测到测试框架
+///
+/// Tester 是 Cycleround 闭环里 `Plan → Code → Test` 的最后一步；
+/// 失败时由 Fixer 决定是否进入下一轮（M3 Commit 4 接入）。
+pub struct Tester;
+
+impl SubAgent for Tester {
+    fn name(&self) -> &'static str {
+        "tester"
+    }
+
+    fn run(&self, ctx: &StepContext) -> StepOutput {
+        let cmd = match detect_test_command(&ctx.workspace) {
+            Some(c) => c,
+            None => {
+                return StepOutput::failure(
+                    "S-tester",
+                    "未检测到测试框架（Cargo.toml / pytest.ini / test.py 均不存在）",
+                );
+            }
+        };
+
+        let output = match Command::new(&cmd.program)
+            .args(&cmd.args)
+            .current_dir(&ctx.workspace)
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                return StepOutput::failure(
+                    "S-tester",
+                    format!("执行 {} 失败: {e}", cmd.display()),
+                );
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = if stdout.is_empty() {
+            stderr.to_string()
+        } else if stderr.is_empty() {
+            stdout.to_string()
+        } else {
+            format!("{stdout}\n--- stderr ---\n{stderr}")
+        };
+
+        let artifact = Artifact {
+            artifact_id: next_artifact_id(&ctx.prior_artifacts, "tester"),
+            artifact_type: ArtifactType::Report,
+            commit_sha: None,
+            patch: None,
+            url: None,
+        };
+
+        if output.status.success() {
+            StepOutput::success(
+                "S-tester",
+                format!("{} 通过\n{}", cmd.display(), truncate(&combined, 512)),
+            )
+            .with_artifacts(vec![artifact])
+        } else {
+            // 失败时把 artifact 也带上（含输出摘要），便于 Fixer 阅读并产出新计划。
+            StepOutput::failure(
+                "S-tester",
+                format!(
+                    "{} 失败 (exit {:?}):\n{}",
+                    cmd.display(),
+                    output.status.code(),
+                    truncate(&combined, 512)
+                ),
+            )
+            .with_artifacts(vec![artifact])
+        }
+    }
+}
+
+/// 待执行的测试命令。
+pub(crate) struct TestCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl TestCommand {
+    fn display(&self) -> String {
+        let mut s = self.program.clone();
+        for a in &self.args {
+            s.push(' ');
+            s.push_str(a);
+        }
+        s
+    }
+}
+
+/// 检测 workspace 应当跑哪个测试命令。返回 None 表示未识别出测试框架。
+pub(crate) fn detect_test_command(workspace: &Path) -> Option<TestCommand> {
+    if workspace.join("Cargo.toml").exists() {
+        return Some(TestCommand {
+            program: "cargo".into(),
+            args: vec!["test".into(), "--quiet".into()],
+        });
+    }
+    if workspace.join("pytest.ini").exists()
+        || workspace.join("pyproject.toml").exists()
+        || workspace.join("setup.py").exists()
+    {
+        return Some(TestCommand {
+            program: "pytest".into(),
+            args: vec!["-q".into()],
+        });
+    }
+    if workspace.join("test.py").exists() {
+        // 优先 python3，回退到 python（Windows 常见）。
+        let py = find_python().unwrap_or_else(|| "python3".into());
+        return Some(TestCommand {
+            program: py,
+            args: vec!["test.py".into()],
+        });
+    }
+    None
+}
+
+/// 在 PATH 中寻找可用的 Python 解释器。M3 确定性实现：依次试 `python3` / `python`。
+pub(crate) fn find_python() -> Option<String> {
+    for cmd in ["python3", "python"] {
+        let ok = Command::new(cmd)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            return Some(cmd.to_string());
+        }
+    }
+    None
+}
+
+/// 把字符串截断到 max 字符（超出加 `…`）。用于测试输出摘要。
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 pub(crate) fn parse_create_plan(desc: &str) -> Result<CreatePlan> {
@@ -365,5 +522,119 @@ mod tests {
         }];
         let id = next_artifact_id(&prior, "worker");
         assert_eq!(id, "ART-worker-002");
+    }
+
+    // ============================================================
+    // Tester (M3 Commit 2)
+    // ============================================================
+
+    #[test]
+    fn tester_detects_cargo_when_cargo_toml_present() {
+        let ws = tempfile::tempdir().unwrap();
+        fs::write(ws.path().join("Cargo.toml"), "").unwrap();
+        let cmd = detect_test_command(ws.path()).expect("应检测到 cargo test");
+        assert_eq!(cmd.program, "cargo");
+        assert_eq!(cmd.args, vec!["test".to_string(), "--quiet".to_string()]);
+    }
+
+    #[test]
+    fn tester_detects_pytest_when_pytest_ini_present() {
+        let ws = tempfile::tempdir().unwrap();
+        fs::write(ws.path().join("pytest.ini"), "[pytest]").unwrap();
+        let cmd = detect_test_command(ws.path()).expect("应检测到 pytest");
+        assert_eq!(cmd.program, "pytest");
+        assert_eq!(cmd.args, vec!["-q".to_string()]);
+    }
+
+    #[test]
+    fn tester_detects_pytest_when_pyproject_toml_present() {
+        let ws = tempfile::tempdir().unwrap();
+        fs::write(ws.path().join("pyproject.toml"), "[tool.pytest]").unwrap();
+        let cmd = detect_test_command(ws.path()).expect("应检测到 pytest");
+        assert_eq!(cmd.program, "pytest");
+    }
+
+    #[test]
+    fn tester_detects_python_when_test_py_present() {
+        let ws = tempfile::tempdir().unwrap();
+        fs::write(ws.path().join("test.py"), "assert True").unwrap();
+        let cmd = detect_test_command(ws.path()).expect("应检测到 python test.py");
+        // python3 或 python（取决于环境），但参数必然是 test.py。
+        assert!(cmd.program == "python3" || cmd.program == "python");
+        assert_eq!(cmd.args, vec!["test.py".to_string()]);
+    }
+
+    #[test]
+    fn tester_detects_nothing_for_empty_workspace() {
+        let ws = tempfile::tempdir().unwrap();
+        assert!(detect_test_command(ws.path()).is_none());
+    }
+
+    #[test]
+    fn tester_returns_failure_when_no_framework_detected() {
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-1".into(), "x".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = Tester.run(&ctx);
+        assert!(!out.result.success);
+        assert!(out.result.summary.contains("未检测到测试框架"));
+    }
+
+    #[test]
+    fn tester_runs_python_test_py_successfully() {
+        // 这个测试需要环境里有 python3 或 python；没有则跳过。
+        if find_python().is_none() {
+            eprintln!("skipping: no python interpreter on PATH");
+            return;
+        }
+        let ws = tempfile::tempdir().unwrap();
+        // test.py 通过：assert True。
+        fs::write(ws.path().join("test.py"), "assert True\n").unwrap();
+        let task = Task::new("T-1".into(), "x".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = Tester.run(&ctx);
+        assert!(out.result.success, "summary: {}", out.result.summary);
+        assert_eq!(out.artifacts.len(), 1);
+        assert_eq!(out.artifacts[0].artifact_type, ArtifactType::Report);
+    }
+
+    #[test]
+    fn tester_returns_failure_when_test_py_fails() {
+        if find_python().is_none() {
+            eprintln!("skipping: no python interpreter on PATH");
+            return;
+        }
+        let ws = tempfile::tempdir().unwrap();
+        // test.py 失败：assert False，会抛 AssertionError，python 退出码非 0。
+        fs::write(
+            ws.path().join("test.py"),
+            "def test_x():\n    assert False, 'intentional'\n\ntest_x()\n",
+        )
+        .unwrap();
+        let task = Task::new("T-1".into(), "x".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = Tester.run(&ctx);
+        assert!(
+            !out.result.success,
+            "expected failure, got: {:?}",
+            out.result
+        );
+        assert!(out.result.summary.contains("失败"));
+        assert!(out.result.summary.contains("intentional"));
+        assert_eq!(out.artifacts.len(), 1, "失败也应带 artifact");
+    }
+
+    #[test]
+    fn tester_truncates_long_output_in_summary() {
+        let long = "x".repeat(1024);
+        let t = truncate(&long, 512);
+        assert_eq!(t.chars().count(), 512);
+        assert!(t.ends_with('…'));
+    }
+
+    #[test]
+    fn tester_truncate_returns_short_input_unchanged() {
+        let t = truncate("short", 512);
+        assert_eq!(t, "short");
     }
 }

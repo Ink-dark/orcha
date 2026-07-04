@@ -15,4 +15,4 @@ pub use sandbox::{FsSandbox, Sandbox, Workspace};
 pub use state_machine::{is_legal_transition, is_terminal, transition};
 pub use store::{FileTaskStore, TaskStore};
 pub use sub_agent::{mark_running, StepContext, StepOutput, SubAgent};
-pub use sub_agents::{Observer, Planner, Worker};
+pub use sub_agents::{Observer, Planner, Tester, Worker};
