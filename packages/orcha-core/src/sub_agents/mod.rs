@@ -102,14 +102,18 @@ impl SubAgent for Worker {
                 return StepOutput::failure("S-worker", format!("创建目录失败: {e}"));
             }
         }
-        if let Err(e) = fs::write(&target_path, &plan.content) {
+        // unified diff 约定文件末尾需有换行（否则 git apply 会警告 "no newline at end of file"，
+        // 且 apply 后内容会多出一个隐式换行）。这里规范化：写文件时确保以 \n 结尾，
+        // 与 patch 内容保持一致。
+        let normalized = ensure_trailing_newline(&plan.content);
+        if let Err(e) = fs::write(&target_path, &normalized) {
             return StepOutput::failure(
                 "S-worker",
                 format!("写文件失败 {}: {e}", target_path.display()),
             );
         }
 
-        let patch = match make_create_diff(&plan.filename, &plan.content) {
+        let patch = match make_create_diff(&plan.filename, &normalized) {
             Ok(p) => p,
             Err(e) => return StepOutput::failure("S-worker", format!("生成 diff 失败: {e}")),
         };
@@ -241,6 +245,18 @@ fn next_artifact_id(prior: &[Artifact], agent: &str) -> String {
     format!("ART-{agent}-{n:03}")
 }
 
+/// 确保 content 以 `\n` 结尾，与 unified diff 的 git apply 行为保持一致。
+fn ensure_trailing_newline(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    if s.ends_with('\n') {
+        s.to_string()
+    } else {
+        format!("{s}\n")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,10 +314,10 @@ mod tests {
         let out = Worker.run(&ctx);
         assert!(out.result.success, "summary: {}", out.result.summary);
 
-        // 1. 真实产出 hello.py。
+        // 1. 真实产出 hello.py（规范化为以 \n 结尾，与 git apply 行为一致）。
         let hello = ws.path().join("hello.py");
         assert!(hello.is_file(), "hello.py should exist");
-        assert_eq!(fs::read_to_string(&hello).unwrap(), "hello");
+        assert_eq!(fs::read_to_string(&hello).unwrap(), "hello\n");
 
         // 2. 产出 CodeDiff artifact，含可 git apply 的 patch。
         assert_eq!(out.artifacts.len(), 1);
