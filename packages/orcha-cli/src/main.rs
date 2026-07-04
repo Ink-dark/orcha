@@ -22,9 +22,9 @@ struct Cli {
 enum Command {
     /// 导出全部数据模型的 JSON Schema 到 stdout。
     Schema {
-        /// 输出格式，目前仅支持 json。预留扩展。
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// 触发导出。`orcha schema --export > schema.json`。
+        #[arg(long)]
+        export: bool,
     },
 }
 
@@ -32,9 +32,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Command::Schema { format }) => {
-            if format != "json" {
-                anyhow::bail!("unsupported schema format: {format} (only 'json' supported)");
+        Some(Command::Schema { export }) => {
+            if !export {
+                anyhow::bail!("`orcha schema` requires --export");
             }
             let schema = orcha_sdk::schema_for_all();
             println!("{}", serde_json::to_string_pretty(&schema)?);
