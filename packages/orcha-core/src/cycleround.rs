@@ -1,13 +1,14 @@
 //! M3 Cycleround 调度器：闭环执行 `Plan → Code → Test → Review → Fix`。
 //!
-//! **本 commit 范围（M3 Commit 1）**：搭骨架与熔断参数。
+//! **当前进度（M3 Commit 3）**：
 //! - 类型：[`CycleConfig`] / [`CycleOutcome`] / [`FailureReason`] / [`RoundRecord`]。
-//! - 调度：[`Cycleround::run`] 跑 `Observer → Planner → Worker` 单轮链路（复用 M2 实现）。
-//!   Worker 成功即视为该轮成功；任一步失败或解析不出计划则进入下一轮。
+//! - 调度：[`Cycleround::run`] 跑 `Observer → Planner → Worker → Tester → Reviewer` 单轮链路。
+//!   全部成功才视为该轮成功；任一步失败则跳过后续步骤进入下一轮。
 //! - 熔断：触达 `max_rounds` 返回 `Failed(MaxRoundsExceeded)`，**不死循环**。
 //!
-//! 后续 commits 会依次接入 Tester / Reviewer / Fixer 与 history 持久化，
-//! `run()` 的循环体也会随之扩展。
+//! 待办（M3 后续 commits）：
+//! - Commit 4：失败时进入 `Fixer` 重新规划，把 `max_retries` 纳入判定。
+//! - Commit 5：history 持久化（写 `task:{id}:history`）。
 //!
 //! 默认熔断参数对齐报名帖：`max_rounds=10`、`max_retries=3`、`cool_down=60s`。
 
@@ -16,7 +17,7 @@ use std::time::Duration;
 
 use orcha_sdk::{Artifact, Step, StepResult, Task};
 
-use crate::{Observer, Planner, StepContext, SubAgent, Worker};
+use crate::{Observer, Planner, Reviewer, StepContext, SubAgent, Tester, Worker};
 
 /// 熔断参数。
 ///
@@ -103,6 +104,8 @@ pub struct Cycleround {
     observer: Observer,
     planner: Planner,
     worker: Worker,
+    tester: Tester,
+    reviewer: Reviewer,
 }
 
 impl Cycleround {
@@ -113,6 +116,8 @@ impl Cycleround {
             observer: Observer,
             planner: Planner,
             worker: Worker,
+            tester: Tester,
+            reviewer: Reviewer,
         }
     }
 
@@ -128,14 +133,14 @@ impl Cycleround {
 
     /// 跑一轮完整循环。
     ///
-    /// **M3 Commit 1 行为**：
-    /// - 每轮执行 `Observer → Planner → Worker`；
-    /// - 任一步失败（例如 Planner 解析不出计划）则跳过该轮后续步骤，进入下一轮；
-    /// - Worker 成功则返回 `Success { rounds: 当前轮 }`；
+    /// **当前行为（M3 Commit 3）**：
+    /// - 每轮执行 `Observer → Planner → Worker → Tester → Reviewer`；
+    /// - 任一步失败则跳过该轮后续步骤，进入下一轮；
+    /// - 5 步全部成功才返回 `Success { rounds: 当前轮 }`；
     /// - 触达 `max_rounds` 仍未成功则返回 `Failed(MaxRoundsExceeded)`。
     ///
-    /// 后续 commit 会扩展为 `Observer → Planner → Worker → Tester → Reviewer`，
-    /// 失败时进入 `Fixer` 重新规划，并把 `max_retries` 纳入判定。
+    /// 后续 commit 会接入 `Fixer`：失败时不再直接进入下一轮，而是先让 Fixer
+    /// 基于失败上下文产出新计划；并把 `max_retries` 纳入判定。
     pub fn run(&self, task: &Task, workspace: &Path) -> CycleOutcome {
         let mut history: Vec<RoundRecord> = Vec::new();
         let mut artifacts: Vec<Artifact> = Vec::new();
@@ -171,6 +176,46 @@ impl Cycleround {
             steps.push(work_out.result.clone());
             round_artifacts.extend(work_out.artifacts);
 
+            if !work_out.result.success {
+                // Worker 失败：跳过 Tester/Reviewer，进入下一轮。
+                push_round(
+                    &mut history,
+                    round,
+                    started_at,
+                    steps,
+                    round_artifacts.clone(),
+                );
+                artifacts.extend(round_artifacts);
+                continue;
+            }
+
+            // 4. Tester
+            let ctx = StepContext::new(workspace, task.clone())
+                .with_priors(&steps_as_steps(&steps), &round_artifacts);
+            let test_out = self.tester.run(&ctx);
+            steps.push(test_out.result.clone());
+            round_artifacts.extend(test_out.artifacts);
+
+            if !test_out.result.success {
+                // Tester 失败：跳过 Reviewer，进入下一轮。
+                push_round(
+                    &mut history,
+                    round,
+                    started_at,
+                    steps,
+                    round_artifacts.clone(),
+                );
+                artifacts.extend(round_artifacts);
+                continue;
+            }
+
+            // 5. Reviewer
+            let ctx = StepContext::new(workspace, task.clone())
+                .with_priors(&steps_as_steps(&steps), &round_artifacts);
+            let rev_out = self.reviewer.run(&ctx);
+            steps.push(rev_out.result.clone());
+            round_artifacts.extend(rev_out.artifacts);
+
             push_round(
                 &mut history,
                 round,
@@ -180,7 +225,7 @@ impl Cycleround {
             );
             artifacts.extend(round_artifacts);
 
-            if work_out.result.success {
+            if rev_out.result.success {
                 return CycleOutcome::Success {
                     rounds: round,
                     artifacts,
@@ -227,7 +272,6 @@ fn steps_as_steps(_steps: &[StepResult]) -> Vec<Step> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orcha_sdk::TaskStatus;
 
     #[test]
     fn cycle_config_default_matches_registration_post() {
@@ -244,6 +288,13 @@ mod tests {
     #[test]
     fn cycleround_succeeds_on_first_round_for_hello_task() {
         let ws = tempfile::tempdir().unwrap();
+        // 预置 test.py：assert hello.py 内容为 'hello'。
+        // 这样 Worker 写完 hello.py 后 Tester 跑 python3 test.py 才会通过。
+        std::fs::write(
+            ws.path().join("test.py"),
+            "assert open('hello.py').read().strip() == 'hello'\n",
+        )
+        .unwrap();
         let task = Task::new("T-1".into(), "创建 hello.py 输出 hello".into());
         // 单轮即可成功，max_rounds=2 足够。
         let cycle = Cycleround::new(CycleConfig {
@@ -263,6 +314,38 @@ mod tests {
                 assert!(!artifacts.is_empty(), "应产出 artifacts");
                 assert_eq!(history.len(), 1, "history 应有一条 round 记录");
                 assert_eq!(history[0].round, 1);
+                // 5 步全成功：observer / planner / worker / tester / reviewer。
+                assert_eq!(
+                    history[0].steps.len(),
+                    5,
+                    "成功轮应记录 5 个步骤，实际: {:?}",
+                    history[0]
+                        .steps
+                        .iter()
+                        .map(|s| &s.step_id)
+                        .collect::<Vec<_>>()
+                );
+                for (i, step_id) in [
+                    "S-observer",
+                    "S-planner",
+                    "S-worker",
+                    "S-tester",
+                    "S-reviewer",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    assert_eq!(
+                        history[0].steps[i].step_id, *step_id,
+                        "步骤 {} 的 id 应为 {}",
+                        i, step_id
+                    );
+                    assert!(
+                        history[0].steps[i].success,
+                        "步骤 {} 应成功: {}",
+                        step_id, history[0].steps[i].summary
+                    );
+                }
                 // Worker 应真实产出 hello.py（含 trailing newline）。
                 let hello = ws.path().join("hello.py");
                 assert!(hello.is_file());
@@ -305,6 +388,41 @@ mod tests {
     }
 
     #[test]
+    fn cycleround_fails_when_tester_fails_after_worker_succeeds() {
+        // 没有 test.py / Cargo.toml / pytest.ini：Tester 会因「未检测到测试框架」失败。
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-3".into(), "创建 hello.py 输出 hello".into());
+        let cycle = Cycleround::new(CycleConfig {
+            max_rounds: 2,
+            max_retries: 3,
+            cool_down: Duration::from_secs(0),
+        });
+
+        let outcome = cycle.run(&task, ws.path());
+        match outcome {
+            CycleOutcome::Failed {
+                rounds,
+                reason,
+                history,
+            } => {
+                assert_eq!(rounds, 2);
+                assert_eq!(reason, FailureReason::MaxRoundsExceeded);
+                assert_eq!(history.len(), 2);
+                for rec in &history {
+                    // Observer / Planner / Worker 成功，Tester 失败，Reviewer 被跳过。
+                    assert_eq!(rec.steps.len(), 4, "本轮应只有 4 步（Reviewer 被跳过）");
+                    assert!(rec.steps[0].success, "Observer 应成功");
+                    assert!(rec.steps[1].success, "Planner 应成功");
+                    assert!(rec.steps[2].success, "Worker 应成功");
+                    assert!(!rec.steps[3].success, "Tester 应失败");
+                    assert!(rec.steps[3].summary.contains("未检测到测试框架"));
+                }
+            }
+            other => panic!("expected Failed(MaxRoundsExceeded), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn cycleround_default_constructor_uses_registration_post_defaults() {
         let cycle = Cycleround::with_defaults();
         assert_eq!(cycle.config().max_rounds, 10);
@@ -324,11 +442,5 @@ mod tests {
             tokens_used: 0,
         };
         assert!(rec.duration().num_milliseconds() >= 0);
-    }
-
-    // 仅为消除 unused 警告：TaskStatus 在 StepResult 字段中使用，这里引用一下枚举值。
-    #[test]
-    fn task_status_pending_exists() {
-        let _ = TaskStatus::Pending;
     }
 }

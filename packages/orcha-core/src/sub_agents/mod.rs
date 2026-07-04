@@ -300,6 +300,70 @@ fn truncate(s: &str, max: usize) -> String {
     out
 }
 
+// ============================================================
+// Reviewer (M3 Commit 3)
+// ============================================================
+
+/// 审核者：对最新 CodeDiff artifact 做静态检查。
+///
+/// M3 最小实现只做三项检查：
+/// 1. 前序产物里存在 `CodeDiff` artifact，且 `patch` 字段非空。
+/// 2. patch 含 `+++ b/` 行（统一 diff 标记），否则视为格式异常。
+/// 3. patch 不含路径穿越（`../` 或 `..\`）。
+///
+/// 任一不满足则返回 failure 并附 Report artifact 记录问题。
+/// 通过则返回 success。
+///
+/// Reviewer 跑在 Tester 之后；当 Tester 失败时 Cycleround 跳过 Reviewer
+/// 直接进入下一轮（M3 Commit 4 接入 Fixer）。
+pub struct Reviewer;
+
+impl SubAgent for Reviewer {
+    fn name(&self) -> &'static str {
+        "reviewer"
+    }
+
+    fn run(&self, ctx: &StepContext) -> StepOutput {
+        let artifact = Artifact {
+            artifact_id: next_artifact_id(&ctx.prior_artifacts, "reviewer"),
+            artifact_type: ArtifactType::Report,
+            commit_sha: None,
+            patch: None,
+            url: None,
+        };
+
+        let patch = ctx
+            .prior_artifacts
+            .iter()
+            .rev()
+            .find(|a| a.artifact_type == ArtifactType::CodeDiff)
+            .and_then(|a| a.patch.as_deref());
+
+        let Some(patch) = patch else {
+            return StepOutput::failure("S-reviewer", "无可审核的 patch（前序未产出 CodeDiff）")
+                .with_artifacts(vec![artifact]);
+        };
+
+        let mut issues: Vec<String> = Vec::new();
+        if patch.is_empty() {
+            issues.push("patch 为空".into());
+        }
+        if !patch.contains("+++ b/") {
+            issues.push("patch 缺少 `+++ b/` 统一 diff 标记".into());
+        }
+        if patch.contains("../") || patch.contains("..\\") {
+            issues.push("patch 含路径穿越（../）".into());
+        }
+
+        if issues.is_empty() {
+            StepOutput::success("S-reviewer", "patch 通过审核").with_artifacts(vec![artifact])
+        } else {
+            StepOutput::failure("S-reviewer", format!("审核未通过: {}", issues.join("; ")))
+                .with_artifacts(vec![artifact])
+        }
+    }
+}
+
 pub(crate) fn parse_create_plan(desc: &str) -> Result<CreatePlan> {
     let desc = desc.trim();
     // 同时支持 "创建" / "create"，关键词大小写不敏感。
@@ -636,5 +700,118 @@ mod tests {
     fn tester_truncate_returns_short_input_unchanged() {
         let t = truncate("short", 512);
         assert_eq!(t, "short");
+    }
+
+    // ============================================================
+    // Reviewer (M3 Commit 3)
+    // ============================================================
+
+    fn make_diff_artifact(patch: &str) -> Artifact {
+        Artifact {
+            artifact_id: "ART-worker-001".into(),
+            artifact_type: ArtifactType::CodeDiff,
+            commit_sha: None,
+            patch: Some(patch.into()),
+            url: None,
+        }
+    }
+
+    #[test]
+    fn reviewer_returns_failure_when_no_patch_to_review() {
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-1".into(), "x".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = Reviewer.run(&ctx);
+        assert!(!out.result.success);
+        assert!(out.result.summary.contains("无可审核的 patch"));
+        assert_eq!(out.artifacts.len(), 1);
+    }
+
+    #[test]
+    fn reviewer_passes_clean_patch() {
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-1".into(), "x".into());
+        let patch = "diff --git a/hello.py b/hello.py\nnew file mode 100644\n--- /dev/null\n+++ b/hello.py\n@@ -0,0 +1,1 @@\n+hello\n";
+        let ctx = StepContext::new(ws.path(), task).with_prior(
+            orcha_sdk::Step {
+                id: "S-worker".into(),
+                name: "worker".into(),
+                agent: "worker".into(),
+                status: orcha_sdk::StepStatus::Succeeded,
+            },
+            vec![make_diff_artifact(patch)],
+        );
+        let out = Reviewer.run(&ctx);
+        assert!(out.result.success, "summary: {}", out.result.summary);
+        assert!(out.result.summary.contains("通过审核"));
+    }
+
+    #[test]
+    fn reviewer_rejects_patch_with_path_traversal() {
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-1".into(), "x".into());
+        // patch 中 b/ 路径含 ../（构造越界 patch）。
+        let patch = "diff --git a/../evil.py b/../evil.py\nnew file mode 100644\n--- /dev/null\n+++ b/../evil.py\n@@ -0,0 +1,1 @@\n+evil\n";
+        let ctx = StepContext::new(ws.path(), task).with_prior(
+            orcha_sdk::Step {
+                id: "S-worker".into(),
+                name: "worker".into(),
+                agent: "worker".into(),
+                status: orcha_sdk::StepStatus::Succeeded,
+            },
+            vec![make_diff_artifact(patch)],
+        );
+        let out = Reviewer.run(&ctx);
+        assert!(!out.result.success);
+        assert!(out.result.summary.contains("路径穿越"));
+    }
+
+    #[test]
+    fn reviewer_rejects_empty_patch() {
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-1".into(), "x".into());
+        let ctx = StepContext::new(ws.path(), task).with_prior(
+            orcha_sdk::Step {
+                id: "S-worker".into(),
+                name: "worker".into(),
+                agent: "worker".into(),
+                status: orcha_sdk::StepStatus::Succeeded,
+            },
+            vec![make_diff_artifact("")],
+        );
+        let out = Reviewer.run(&ctx);
+        assert!(!out.result.success);
+        assert!(out.result.summary.contains("patch 为空"));
+        assert!(out.result.summary.contains("`+++ b/`"));
+    }
+
+    #[test]
+    fn reviewer_uses_latest_codediff_artifact() {
+        // 同时存在两个 CodeDiff artifact，Reviewer 应使用最新的（最后追加的）。
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-1".into(), "x".into());
+        let clean_patch =
+            "diff --git a/a.py b/a.py\nnew file mode 100644\n--- /dev/null\n+++ b/a.py\n@@ -0,0 +1,1 @@\n+a\n";
+        let bad_patch = "diff --git a/b.py b/b.py\nnew file mode 100644\n--- /dev/null\n+++ b/../b.py\n@@ -0,0 +1,1 @@\n+b\n";
+        let mut artifacts = vec![make_diff_artifact(clean_patch)];
+        // 修改 artifact_id 以区分。
+        let mut second = make_diff_artifact(bad_patch);
+        second.artifact_id = "ART-worker-002".into();
+        artifacts.push(second);
+        let ctx = StepContext::new(ws.path(), task).with_prior(
+            orcha_sdk::Step {
+                id: "S-worker".into(),
+                name: "worker".into(),
+                agent: "worker".into(),
+                status: orcha_sdk::StepStatus::Succeeded,
+            },
+            artifacts,
+        );
+        let out = Reviewer.run(&ctx);
+        assert!(
+            !out.result.success,
+            "应当审核最新的（bad）patch 而非第一个 clean 的"
+        );
+        assert!(out.result.summary.contains("路径穿越"));
     }
 }
