@@ -7,16 +7,18 @@
 
 ### 1. 系统概览 (System Overview)
 
-Orcha 是一个 **Control Plane (控制面)** 与 **Data Plane (数据面)** 分离的自动化 Coding 系统。
+Orcha 是一个**基于命令行的自动化编码操作系统**，采用 **Control Plane (控制面)** 与 **Data Plane (数据面)** 分离架构，通过 Shell 网关接入飞书 / Slack 等 IM 机器人。用户在聊天窗口一句话发起复杂编码任务，系统自动拆解、执行、验证、循环优化，直到真正完成。
+
+**目标用户**：中小团队的技术负责人、独立开发者、开源项目维护者——需要频繁处理"小而杂"的编码任务，但不想在工具切换和重复执行上浪费时间的人。
 
 - **Orcha Core**: 大脑，负责运行 Cycleround 工作流。
-- **Orcha Shell**: 外壳（Gateway），负责对接 IM（Slack/Discord/Telegram）和 API。
+- **Orcha Shell**: 外壳（Gateway），负责对接 IM（飞书 / Slack 等）和 API。
 - **Sub-Agents**: 乐手，负责执行具体的 Plan / Code / Test / Review。
 
 ```
 ┌─────────────────────────────────────────────┐
 │                Orcha Shell                  │
-│  (Slack / API / Webhook / CLI)              │
+│  (飞书 / Slack / API / Webhook / CLI)       │
 └─────────────────────┬───────────────────────┘
                       │ Dispatch
 ┌─────────────────────▼───────────────────────┐
@@ -159,7 +161,10 @@ PENDING -> RUNNING -> (BLOCKED <-> RUNNING) -> DONE
 
 1. **Secrets Management**: 永远不在 Prompt 中泄露 API Keys，通过 Env 注入。
 2. **Sandbox**: Sub-Agent 的代码执行必须在 Docker 容器内。
-3. **Human-in-the-loop**: 涉及 Git Push / Deploy 的操作必须经过 `Reviewer Agent` 或人工确认。
+3. **Human-in-the-loop**: 涉及 Git Push / Deploy 的操作必须经过 `Reviewer Agent` 或人工确认。疑似卡住时即时通知用户，用户可随时终止任意 Agent。
+4. **原子性写入 + 声明式状态管理**: 避免多 Sub-Agent 并发写入冲突，状态变更以声明式提交，杜绝半写。
+5. **Minicommit**: 每步修改独立提交，保证每步都可回退；任一环节出错可精确回滚到上一个 Minicommit。
+6. **熔断机制**: 最多 10 轮 / 每步 3 次重试，防止资源耗尽或死循环（详见 §4.3）。
 
 ---
 
@@ -193,7 +198,7 @@ orcha shell list
 | M3 | Cycleround 闭环 | Phase 1 | ✅ |
 | M4 | 状态持久化 | Phase 2 | — |
 | M5 | Gateway Shell + HTTP/CLI 触发 | Phase 2 | — |
-| M6 | Slack Adapter | Phase 2 | — |
+| M6 | 飞书 Adapter | Phase 2 | — |
 | M7 | Plugin 子代理体系 | Phase 3 | — |
 | M8 | Self-Evolve | Phase 4 | — |
 

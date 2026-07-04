@@ -18,7 +18,7 @@
 | **M3** | [Cycleround 闭环](#m3--cycleround-闭环-mvp-完成) | Phase 1 | ✅ | 闭环修复样例 bug |
 | **M4** | [状态持久化](#m4--状态持久化) | Phase 2 | — | 重启后任务可恢复 |
 | **M5** | [Gateway Shell + HTTP/CLI 触发](#m5--gateway-shell--httpcli-触发) | Phase 2 | — | HTTP API 可触发任务 |
-| **M6** | [Slack Adapter](#m6--slack-adapter) | Phase 2 | — | Slack @Orcha 触发并回传 |
+| **M6** | [飞书 Adapter](#m6--飞书-adapter首选-im-入口) | Phase 2 | — | 飞书 @Orcha 触发并回传 |
 | **M7** | [Plugin 子代理体系](#m7--plugin-子代理体系) | Phase 3 | — | 第三方可注册 Sub-Agent |
 | **M8** | [Self-Evolve](#m8--self-evolve) | Phase 4 | — | Orcha 提交自身调度 PR |
 
@@ -132,15 +132,18 @@
 
 ---
 
-## M6 — Slack Adapter
+## M6 — 飞书 Adapter（首选 IM 入口）
 
-**目标**：真实 IM 接入验证 Shell 抽象。
+**目标**：真实 IM 接入验证 Shell 抽象。按报名帖定位，飞书为首选 IM 渠道；Slack 作为后续扩展。
+
+**交付物**：`LarkShellAdapter`（基于飞书开放平台机器人事件回调）+ 卡片消息渲染
 
 **验收（可验证）**：
-- [ ] Slack 频道 `@Orcha fix <issue>` 触发任务
-- [ ] 流式进度与最终响应回传到原频道
-- [ ] 产物 / Artifact 链接在 Slack 中可点击展开
-- [ ] 私有频道权限校验生效
+- [ ] 飞书群 `@Orcha fix <issue>` 触发任务（事件订阅收到 `im.message.receive_v1`）
+- [ ] 流式进度与最终响应回传到原会话（交互卡片 + 文本消息）
+- [ ] 产物 / Artifact 链接在飞书中可点击展开
+- [ ] 私有群权限校验生效（机器人仅在白名单群内响应）
+- [ ] （可选扩展）Slack Adapter 复用同一 `ShellAdapter` 接口接入
 
 ---
 
