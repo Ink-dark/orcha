@@ -83,8 +83,8 @@
   （`StepOutput::with_artifacts` 自动回填 `artifact_id`，类型 `ArtifactType::CodeDiff`）
 - [x] `git apply` 该 patch 成功
   （`end_to_end_pipeline_produces_file_and_git_applyable_patch` 在真实 git 仓库中 apply 并校验 hello.py 内容）
-- [ ] 每步写入结构化日志到 `task:{id}:history`
-  （推迟至 M3：Cycleround 调度器按 round 写 history，M2 单步执行无调度器）
+- [x] 每步写入结构化日志到 `task:{id}:history`
+  （M3 Commit 5：`Cycleround::run_with_history` 把每轮 `RoundRecord`（含 steps / artifacts / tokens_used）追加写入 `FileHistoryStore`，落盘到 `{home}/history/{task_id}.jsonl`。M2 单步执行无调度器，故推迟到 M3 实现）
 - [x] 断网状态下沙箱仍可执行基础文件操作
   （三个 Sub-Agent 均为确定性最小实现，零网络/LLM 依赖）
 

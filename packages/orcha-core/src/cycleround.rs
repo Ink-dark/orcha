@@ -1,15 +1,16 @@
 //! M3 Cycleround 调度器：闭环执行 `Plan → Code → Test → Review → Fix`。
 //!
-//! **当前进度（M3 Commit 4）**：
+//! **当前进度（M3 Commit 5）**：
 //! - 类型：[`CycleConfig`] / [`CycleOutcome`] / [`FailureReason`] / [`RoundRecord`]。
 //! - 调度：[`Cycleround::run`] 跑 `Observer → Planner → Worker → Tester → Reviewer` 单轮链路。
 //!   全部成功才视为该轮成功；任一步失败则跳过后续步骤，并在该轮末尾调用 `Fixer`
 //!   尝试产出修复（让下一轮可以重新执行）。
 //! - 熔断：触达 `max_rounds` 返回 `Failed(MaxRoundsExceeded)`；触达 `max_retries`
 //!   （Fixer 累计调用次数）返回 `Failed(MaxRetriesExceeded)`。**不死循环**。
-//!
-//! 待办（M3 后续 commits）：
-//! - Commit 5：history 持久化（写 `task:{id}:history`）。
+//! - history 持久化：[`Cycleround::run_with_history`] 把每轮 `RoundRecord` 追加写入
+//!   [`HistoryStore`](crate::history::HistoryStore)（默认
+//!   [`FileHistoryStore`](crate::FileHistoryStore) 落盘到
+//!   `{home}/history/{task_id}.jsonl`，JSONL 格式）。
 //!
 //! 默认熔断参数对齐报名帖：`max_rounds=10`、`max_retries=3`、`cool_down=60s`。
 
@@ -17,7 +18,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use orcha_sdk::{Artifact, Step, StepResult, Task};
+use serde::{Deserialize, Serialize};
 
+use crate::history::HistoryStore;
 use crate::{Fixer, Observer, Planner, Reviewer, StepContext, SubAgent, Tester, Worker};
 
 /// 熔断参数。
@@ -44,7 +47,7 @@ impl Default for CycleConfig {
 }
 
 /// 单轮执行的记录，写入 history 以便追溯。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoundRecord {
     /// 第几轮（从 1 开始）。
     pub round: u32,
@@ -134,9 +137,24 @@ impl Cycleround {
         &self.config
     }
 
-    /// 跑一轮完整循环。
+    /// 跑一轮完整循环（不持久化 history）。
     ///
-    /// **当前行为（M3 Commit 4）**：
+    /// 等价于 [`Self::run_with_history`] 传入 `None`。详见 [`Self::run_with_history`]。
+    pub fn run(&self, task: &Task, workspace: &Path) -> CycleOutcome {
+        self.run_inner(task, workspace, None)
+    }
+
+    /// 跑一轮完整循环，并把每轮 `RoundRecord` 持久化到 `history` store。
+    ///
+    /// **当前行为（M3 Commit 5）**：
+    /// - 调用前先 `clear_history(task.id)`，确保本次执行的历史独立
+    ///   （不与上次运行的残留混合）；清空失败不阻断执行。
+    /// - 每轮结束时把 `RoundRecord` 追加写入 history store；
+    ///   写入失败仅记录到 stderr，不阻断 Cycleround（history 是辅助追溯，
+    ///   不影响主流程的正确性）。
+    /// - 返回的 `CycleOutcome.history` 与持久化的 history 内容一致。
+    ///
+    /// **行为继承自 M3 Commit 4**：
     /// - 每轮依次执行 `Observer → Planner → Worker → Tester → Reviewer`；
     ///   任一步失败则跳过后续步骤（如 Tester 失败则不跑 Reviewer）。
     /// - 5 步全部成功才返回 `Success { rounds: 当前轮 }`。
@@ -147,7 +165,28 @@ impl Cycleround {
     ///   触达 `max_rounds` 仍未成功则返回 `Failed(MaxRoundsExceeded)`。
     ///
     /// Fixer 的修复策略详见 [`crate::Fixer`] 的文档注释。
-    pub fn run(&self, task: &Task, workspace: &Path) -> CycleOutcome {
+    pub fn run_with_history(
+        &self,
+        task: &Task,
+        workspace: &Path,
+        history: &dyn HistoryStore,
+    ) -> CycleOutcome {
+        // 清空旧 history，确保本次执行的历史独立。失败不阻断。
+        if let Err(e) = history.clear_history(&task.id) {
+            eprintln!(
+                "warn: clear_history({}) failed, appending to existing: {}",
+                task.id, e
+            );
+        }
+        self.run_inner(task, workspace, Some(history))
+    }
+
+    fn run_inner(
+        &self,
+        task: &Task,
+        workspace: &Path,
+        history_store: Option<&dyn HistoryStore>,
+    ) -> CycleOutcome {
         let mut history: Vec<RoundRecord> = Vec::new();
         let mut artifacts: Vec<Artifact> = Vec::new();
         let mut fix_attempts: u32 = 0;
@@ -206,13 +245,9 @@ impl Cycleround {
 
             // 全部成功 → 返回 Success
             if planner_succeeded && worker_succeeded && tester_succeeded && reviewer_succeeded {
-                push_round(
-                    &mut history,
-                    round,
-                    started_at,
-                    steps,
-                    round_artifacts.clone(),
-                );
+                let rec = build_round(round, started_at, steps, round_artifacts.clone());
+                persist_round(history_store, &task.id, &rec);
+                history.push(rec);
                 artifacts.extend(round_artifacts);
                 return CycleOutcome::Success {
                     rounds: round,
@@ -232,13 +267,9 @@ impl Cycleround {
                 fix_attempts += 1;
 
                 if fix_attempts >= self.config.max_retries {
-                    push_round(
-                        &mut history,
-                        round,
-                        started_at,
-                        steps,
-                        round_artifacts.clone(),
-                    );
+                    let rec = build_round(round, started_at, steps, round_artifacts.clone());
+                    persist_round(history_store, &task.id, &rec);
+                    history.push(rec);
                     artifacts.extend(round_artifacts);
                     return CycleOutcome::Failed {
                         rounds: round,
@@ -248,13 +279,9 @@ impl Cycleround {
                 }
             }
 
-            push_round(
-                &mut history,
-                round,
-                started_at,
-                steps,
-                round_artifacts.clone(),
-            );
+            let rec = build_round(round, started_at, steps, round_artifacts.clone());
+            persist_round(history_store, &task.id, &rec);
+            history.push(rec);
             artifacts.extend(round_artifacts);
         }
 
@@ -266,30 +293,42 @@ impl Cycleround {
     }
 }
 
-fn push_round(
-    history: &mut Vec<RoundRecord>,
+/// 构造一轮的 `RoundRecord`（不写入任何 store，仅返回值）。
+fn build_round(
     round: u32,
     started_at: chrono::DateTime<chrono::Utc>,
     steps: Vec<StepResult>,
     artifacts: Vec<Artifact>,
-) {
-    history.push(RoundRecord {
+) -> RoundRecord {
+    RoundRecord {
         round,
         started_at,
         finished_at: chrono::Utc::now(),
         steps,
         artifacts,
+        // M3 确定性实现无 LLM，token 消耗恒为 0；LLM 接入后由调用方回填。
         tokens_used: 0,
-    });
+    }
+}
+
+/// 把一轮记录写入 history store（若 `Some`）。写入失败仅打 stderr，不阻断主流程。
+fn persist_round(history_store: Option<&dyn HistoryStore>, task_id: &str, rec: &RoundRecord) {
+    if let Some(hs) = history_store {
+        if let Err(e) = hs.append_round(task_id, rec) {
+            eprintln!(
+                "warn: append_round({}, round={}) failed: {}",
+                task_id, rec.round, e
+            );
+        }
+    }
 }
 
 /// 把 `Vec<StepResult>` 视为 `&[Step]` 用于 StepContext.prior_steps。
 ///
-/// M3 Commit 1 暂不维护独立的 Step 列表；后续 commit 接入 history 持久化时会
-/// 真正构造 Step 列表。这里返回空切片以避免类型不匹配。
+/// M3 当前实现：`StepResult` 不含足够信息重构 `Step`（缺 name / agent 字段），
+/// 因此这里返回空 `Vec`。Sub-Agent 的确定性实现不依赖 `prior_steps`，
+/// 仅依赖 `prior_artifacts` 与 `task`；LLM 接入后会真正构造 Step 列表。
 fn steps_as_steps(_steps: &[StepResult]) -> Vec<Step> {
-    // StepResult 当前不含足够信息重构 Step（id/name/agent/status），
-    // 后续 commit 会用真正的 Step 列表替换此桩。
     Vec::new()
 }
 
@@ -582,5 +621,191 @@ mod tests {
             tokens_used: 0,
         };
         assert!(rec.duration().num_milliseconds() >= 0);
+    }
+
+    // ============================================================
+    // history 持久化 (M3 Commit 5)
+    // ============================================================
+
+    #[test]
+    fn run_with_history_persists_rounds_for_successful_run() {
+        // 成功路径：第一轮 5 步全成功，应写入 1 条 RoundRecord。
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("test.py"),
+            "assert open('hello.py').read().strip() == 'hello'\n",
+        )
+        .unwrap();
+        let task = Task::new("T-hist-1".into(), "创建 hello.py 输出 hello".into());
+
+        let history_dir = tempfile::tempdir().unwrap();
+        let hs = crate::FileHistoryStore::new(history_dir.path());
+        hs.init().unwrap();
+
+        let cycle = Cycleround::with_defaults();
+        let outcome = cycle.run_with_history(&task, ws.path(), &hs);
+
+        match outcome {
+            CycleOutcome::Success {
+                rounds, history, ..
+            } => {
+                assert_eq!(rounds, 1);
+                assert_eq!(history.len(), 1, "in-memory history 应有 1 条");
+                // 持久化的 history 应与 in-memory 一致。
+                let persisted = hs.list_history("T-hist-1").unwrap();
+                assert_eq!(persisted.len(), 1, "应持久化 1 条 RoundRecord");
+                assert_eq!(persisted[0].round, 1);
+                assert_eq!(persisted[0].steps.len(), 5, "应记录 5 步");
+                // 验证 RoundRecord 含耗时 / token / 产物引用（M3 验收项）。
+                assert!(
+                    persisted[0].duration().num_milliseconds() >= 0,
+                    "应有非负耗时"
+                );
+                assert_eq!(persisted[0].tokens_used, 0, "M3 确定性实现 token=0");
+                assert!(!persisted[0].artifacts.is_empty(), "应含产物引用");
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_with_history_persists_failed_rounds_with_fixer() {
+        // 失败路径：Tester 失败 → Fixer 创建 test.py → 第二轮成功。
+        // 应持久化 2 条 RoundRecord，第一条含 Fixer 步骤。
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-hist-2".into(), "创建 hello.py 输出 hello".into());
+
+        let history_dir = tempfile::tempdir().unwrap();
+        let hs = crate::FileHistoryStore::new(history_dir.path());
+        hs.init().unwrap();
+
+        let cycle = Cycleround::new(CycleConfig {
+            max_rounds: 2,
+            max_retries: 3,
+            cool_down: Duration::from_secs(0),
+        });
+        let outcome = cycle.run_with_history(&task, ws.path(), &hs);
+
+        match outcome {
+            CycleOutcome::Success {
+                rounds, history, ..
+            } => {
+                assert_eq!(rounds, 2, "应在第二轮成功");
+                assert_eq!(history.len(), 2);
+                // 持久化应与 in-memory 一致。
+                let persisted = hs.list_history("T-hist-2").unwrap();
+                assert_eq!(persisted.len(), 2, "应持久化 2 条");
+                // 第一轮应含 Fixer 步骤（5 步：Observer/Planner/Worker/Tester/Fixer）。
+                assert_eq!(persisted[0].round, 1);
+                assert_eq!(persisted[0].steps.len(), 5);
+                assert_eq!(persisted[0].steps[4].step_id, "S-fixer");
+                // 第二轮应 5 步全成功（无 Fixer）。
+                assert_eq!(persisted[1].round, 2);
+                assert_eq!(persisted[1].steps.len(), 5);
+                assert!(persisted[1].steps.iter().all(|s| s.success));
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_with_history_clears_old_history_on_rerun() {
+        // 第二次 run_with_history 应清空第一次的 history，不混合。
+        let ws1 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws1.path().join("test.py"),
+            "assert open('hello.py').read().strip() == 'hello'\n",
+        )
+        .unwrap();
+        let task = Task::new("T-hist-3".into(), "创建 hello.py 输出 hello".into());
+
+        let history_dir = tempfile::tempdir().unwrap();
+        let hs = crate::FileHistoryStore::new(history_dir.path());
+        hs.init().unwrap();
+
+        let cycle = Cycleround::with_defaults();
+        // 第一次跑：写入 1 条 history。
+        let _ = cycle.run_with_history(&task, ws1.path(), &hs);
+        assert_eq!(hs.list_history("T-hist-3").unwrap().len(), 1);
+
+        // 第二次跑同一 task：应清空旧 history 后重新写入 1 条。
+        let ws2 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws2.path().join("test.py"),
+            "assert open('hello.py').read().strip() == 'hello'\n",
+        )
+        .unwrap();
+        let _ = cycle.run_with_history(&task, ws2.path(), &hs);
+        let persisted = hs.list_history("T-hist-3").unwrap();
+        assert_eq!(
+            persisted.len(),
+            1,
+            "第二次跑应清空旧 history，不应累积为 2 条"
+        );
+        assert_eq!(persisted[0].round, 1, "新 history 的 round 应重新从 1 开始");
+    }
+
+    #[test]
+    fn run_with_history_persists_max_retries_exceeded_failure() {
+        // 失败路径：Fixer 无法修复，触达 max_retries。
+        // 应持久化 max_retries 条 RoundRecord，每条含失败的 Fixer。
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("test.py"),
+            "assert open('hello.py').read().strip() == 'wrong'\n",
+        )
+        .unwrap();
+        let task = Task::new("T-hist-4".into(), "创建 hello.py 输出 hello".into());
+
+        let history_dir = tempfile::tempdir().unwrap();
+        let hs = crate::FileHistoryStore::new(history_dir.path());
+        hs.init().unwrap();
+
+        let cycle = Cycleround::new(CycleConfig {
+            max_rounds: 10,
+            max_retries: 2,
+            cool_down: Duration::from_secs(0),
+        });
+        let outcome = cycle.run_with_history(&task, ws.path(), &hs);
+
+        match outcome {
+            CycleOutcome::Failed {
+                rounds,
+                reason,
+                history,
+            } => {
+                assert_eq!(rounds, 2);
+                assert_eq!(reason, FailureReason::MaxRetriesExceeded);
+                assert_eq!(history.len(), 2);
+                // 持久化应与 in-memory 一致。
+                let persisted = hs.list_history("T-hist-4").unwrap();
+                assert_eq!(persisted.len(), 2, "应持久化 2 条失败 round");
+                for rec in &persisted {
+                    assert_eq!(rec.steps.len(), 5, "每轮 5 步（含失败 Fixer）");
+                    assert!(!rec.steps[4].success, "Fixer 应失败");
+                }
+            }
+            other => panic!("expected Failed(MaxRetriesExceeded), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_without_history_does_not_create_files() {
+        // 普通 run()（不带 history store）不应在磁盘上创建任何 history 文件。
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ws.path().join("test.py"),
+            "assert open('hello.py').read().strip() == 'hello'\n",
+        )
+        .unwrap();
+        let task = Task::new("T-no-hist".into(), "创建 hello.py 输出 hello".into());
+
+        // 用 ws 自己的目录作为 home（不应被创建 history/ 子目录）。
+        let cycle = Cycleround::with_defaults();
+        let _ = cycle.run(&task, ws.path());
+        assert!(
+            !ws.path().join("history").exists(),
+            "run() 不带 history store 时不应创建 history/ 目录"
+        );
     }
 }
