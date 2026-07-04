@@ -38,7 +38,10 @@ fn help_flag_exits_zero_and_mentions_schema() {
         .expect("failed to spawn orcha --help");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("schema"), "--help should list schema subcommand");
+    assert!(
+        stdout.contains("schema"),
+        "--help should list schema subcommand"
+    );
 }
 
 #[test]
@@ -48,7 +51,10 @@ fn no_subcommand_prints_help_and_exits_zero() {
         .expect("failed to spawn orcha");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(!stdout.is_empty(), "should print something without subcommand");
+    assert!(
+        !stdout.is_empty(),
+        "should print something without subcommand"
+    );
 }
 
 #[test]
@@ -82,7 +88,10 @@ fn schema_export_emits_valid_json_with_all_models() {
         "Artifact",
         "ArtifactType",
     ] {
-        assert!(obj.contains_key(key), "schema --export missing model: {key}");
+        assert!(
+            obj.contains_key(key),
+            "schema --export missing model: {key}"
+        );
     }
     assert_eq!(
         obj["TaskStatus"]["enum"],

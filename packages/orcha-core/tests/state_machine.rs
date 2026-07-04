@@ -8,9 +8,7 @@
 //! ```
 
 use chrono::Utc;
-use orcha_core::{
-    is_legal_transition, is_terminal, transition, CoreError,
-};
+use orcha_core::{is_legal_transition, is_terminal, transition, CoreError};
 use orcha_sdk::{Task, TaskStatus};
 
 fn pending_task() -> Task {
@@ -130,8 +128,14 @@ fn invalid_transition_error_carries_context() {
     };
     let err = transition(&mut task, TaskStatus::Done).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("T-42"), "error msg should contain task id: {msg}");
-    assert!(msg.contains("PENDING"), "error msg should contain from: {msg}");
+    assert!(
+        msg.contains("T-42"),
+        "error msg should contain task id: {msg}"
+    );
+    assert!(
+        msg.contains("PENDING"),
+        "error msg should contain from: {msg}"
+    );
     assert!(msg.contains("DONE"), "error msg should contain to: {msg}");
 }
 
@@ -140,7 +144,7 @@ fn is_legal_transition_table_matches_spec() {
     use TaskStatus::*;
     // `is_legal_transition` 是纯边谓词：仅覆盖 README §4.1 的真实边。
     // 同状态 no-op 由 `transition()` 单独处理，不在此谓词范围内。
-    let legal = vec![
+    let legal = [
         (Pending, Running),
         (Running, Blocked),
         (Running, Done),

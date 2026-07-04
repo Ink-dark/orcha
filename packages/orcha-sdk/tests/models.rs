@@ -2,8 +2,8 @@
 
 use orcha_sdk::{
     schema_for_all, Artifact, ArtifactType, Attachment, EventPayload, EventType, OrchaEvent,
-    OrchaResponse, ResponseArtifact, ResponseArtifactType, ResponseStatus, Step, StepResult,
-    StepStatus, Task, TaskStatus,
+    OrchaResponse, ResponseArtifactType, ResponseStatus, Step, StepResult, StepStatus, Task,
+    TaskStatus,
 };
 use serde_json::json;
 
@@ -44,7 +44,10 @@ fn task_status_round_trips_through_json() {
 #[test]
 fn task_status_display_matches_serde_repr() {
     for &status in TaskStatus::all() {
-        assert_eq!(status.to_string(), serde_json::to_value(status).unwrap().as_str().unwrap());
+        assert_eq!(
+            status.to_string(),
+            serde_json::to_value(status).unwrap().as_str().unwrap()
+        );
     }
 }
 
@@ -189,7 +192,10 @@ fn schema_for_task_enum_matches_spec_values() {
         .as_array()
         .expect("TaskStatus enum missing");
     let values: Vec<&str> = variants.iter().map(|v| v.as_str().unwrap()).collect();
-    assert_eq!(values, vec!["PENDING", "RUNNING", "BLOCKED", "DONE", "FAILED"]);
+    assert_eq!(
+        values,
+        vec!["PENDING", "RUNNING", "BLOCKED", "DONE", "FAILED"]
+    );
 }
 
 #[test]

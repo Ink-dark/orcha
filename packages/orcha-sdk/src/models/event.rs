@@ -38,19 +38,10 @@ pub struct OrchaEvent {
 }
 
 /// `OrchaEvent.payload` 的内容，与 `EventType` 解耦以便后续扩展。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 pub struct EventPayload {
     /// 原始文本，例如 "@Orcha fix the bug in auth.py"。
     pub raw_text: String,
     /// 附件列表，无则为空数组。
     pub attachments: Vec<Attachment>,
-}
-
-impl Default for EventPayload {
-    fn default() -> Self {
-        Self {
-            raw_text: String::new(),
-            attachments: Vec::new(),
-        }
-    }
 }
