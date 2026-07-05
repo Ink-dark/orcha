@@ -131,7 +131,7 @@
 
 ## M5 — Web UI Shell + HTTP API
 
-**目标**：提供可视化 Web UI 与 JSON API，外部可触发任务并观测执行过程，取代早期 Gateway Adapter 抽象。
+**目标**：面向用户的可视化面板与对话窗口。提供 Web UI 与 JSON API 展示任务状态/历史/memory；任务触发主入口见 M6 Gateway，Shell 本身不做 IM 接入。
 
 **交付物**：
 - 基于 `tiny_http` 的同步 Web UI server（`orcha-shell` crate，无异步运行时；CSS/JS 经 `include_str!` 编入二进制，单文件部署）
@@ -154,7 +154,7 @@
 
 ## M6 — IM Gateway（飞书 / QQ 长连接）
 
-**目标**：通过各平台官方 SDK 的**长连接**接入 IM，提供实时交互体验（体感对标 OpenClaw）。@Orcha 触发任务后，进度经长连接实时推送回原会话，无需公网回调地址、无需 HTTP 轮询。
+**目标**：**触发主入口（一等公民）**。通过各平台官方 SDK 的**长连接**接入 IM，提供实时交互体验（体感对标 OpenClaw）。@Orcha 触发任务后，进度经长连接实时推送回原会话，无需公网回调地址、无需 HTTP 轮询。Shell（M5）作为可视化面板观测同一份任务，不做触发。
 
 **交付物**：
 - 飞书 SDK 长连接接入（WebSocket 接收事件，免公网 webhook）
