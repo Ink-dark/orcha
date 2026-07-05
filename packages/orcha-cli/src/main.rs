@@ -485,7 +485,10 @@ fn build_shell(home: &Path, workspace: &Path, api_key: &str) -> Result<Arc<Orcha
 fn run_shell_serve(home: &Path, workspace: &Path, addr: &str, api_key: &str) -> Result<()> {
     let shell = build_shell(home, workspace, api_key)?;
     let server = HttpServer::new(shell, addr);
-    eprintln!("orcha shell serving on http://{addr} (workspace: {})", workspace.display());
+    eprintln!(
+        "orcha shell serving on http://{addr} (workspace: {})",
+        workspace.display()
+    );
     let stop_signal = Arc::new(AtomicBool::new(false));
     Ok(server.bind_and_serve(stop_signal)?)
 }
