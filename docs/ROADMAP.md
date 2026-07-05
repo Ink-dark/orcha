@@ -111,7 +111,8 @@
   （GT-1/2/3 各自断言 `RoundRecord.started_at`/`finished_at`/`tokens_used`/`artifacts` 落盘可读；
   `history.rs` 9 单测覆盖 JSONL 格式 / 跨 task 隔离 / 重启存活）
 - [x] 3 个 golden tasks 全部通过（`cargo test --test m3_golden_tasks`）
-- [ ] `./scripts/mvp-demo.sh` 一键复现完整闭环（M3 Commit 7 实现）
+- [x] `./scripts/mvp-demo.sh` 一键复现完整闭环
+  （脚本跑通 3 条 demo：成功路径 / Fixer 修复 / 熔断不死循环；并校验 JSONL history 落盘可追溯）
 
 ---
 
