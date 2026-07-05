@@ -11,6 +11,8 @@ use orcha_core::{
     transition, CycleConfig, CycleOutcome, Cycleround, FailureReason, FileHistoryStore,
     FileTaskStore, HistoryStore, RecoverStrategy, Recovery, RecoveryReport, RoundRecord, TaskStore,
 };
+#[cfg(feature = "llm")]
+use orcha_core::FileMemoryStore;
 use orcha_sdk::{Artifact, Task, TaskStatus};
 
 /// `orcha` 命令行根定义。
@@ -282,7 +284,11 @@ fn run_fix(
                 .map_err(|e| anyhow::anyhow!("LLM 配置错误: {e}"))?;
             let client: std::sync::Arc<dyn orcha_llm::LlmClient> =
                 std::sync::Arc::new(orcha_llm::OpenAiCompatibleClient::new(cfg));
-            let cycle = orcha_core::LlmCycleround::new(config, client);
+            // LLM 路径启用 memory：让第 N 轮 Planner/Worker/Reviewer 能引用
+            // 前序轮次的失败原因，避免重复犯同样的错。
+            let memory = std::sync::Arc::new(FileMemoryStore::new(home));
+            memory.init()?;
+            let cycle = orcha_core::LlmCycleround::with_memory(config, client, memory);
             cycle.run_with_history(&task, workspace, &history_store)
         }
         #[cfg(not(feature = "llm"))]
