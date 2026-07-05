@@ -306,3 +306,222 @@ fn run_implicitly_initializes_home() {
     assert!(stdout(&out).starts_with("T-"));
     assert!(home.join("store").exists(), "store dir should be created");
 }
+
+// ============================================================
+// M4 acceptance: crash recovery + concurrent writes + 3-class queries
+// ============================================================
+
+/// 把 store 里某 Task 的 JSON 文件 status 字段强制改成 `RUNNING`，
+/// 模拟"进程在 RUNNING 状态崩溃"。
+fn force_task_running(home: &Path, task_id: &str) {
+    let task_file = home.join("store").join(format!("{task_id}.json"));
+    let content = std::fs::read_to_string(&task_file).unwrap();
+    let mut v: Value = serde_json::from_str(&content).unwrap();
+    v["status"] = serde_json::json!("RUNNING");
+    std::fs::write(&task_file, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+}
+
+#[test]
+fn crash_recovery_recovers_running_task_to_blocked_via_subprocess() {
+    // M4 验收项 1：kill 进程后重启，RUNNING 中断的 Task 自动恢复并继续。
+    // 端到端：进程 A 创建 Task + 直接改文件把 status 设 RUNNING（模拟崩溃），
+    // 进程 B 跑 `orcha recover --strategy block`，应把 Task 迁到 BLOCKED。
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+
+    let id = stdout(&run_orcha(home, &["run", "crashed task"]));
+    assert!(id.starts_with("T-"));
+
+    force_task_running(home, &id);
+
+    let recover_out = run_orcha(home, &["recover", "--strategy", "block"]);
+    assert!(
+        recover_out.status.success(),
+        "recover should exit 0, stderr: {}",
+        String::from_utf8_lossy(&recover_out.stderr)
+    );
+    let report: Value =
+        serde_json::from_str(&stdout(&recover_out)).expect("recover output must be JSON");
+    assert_eq!(report["recovered_count"], 1);
+    assert_eq!(report["strategy"], "block");
+    assert_eq!(report["recovered_task_ids"][0], id);
+
+    // 验证 Task 状态已是 BLOCKED。
+    let status_out = run_orcha(home, &["status", &id]);
+    assert!(status_out.status.success());
+    let v: Value = serde_json::from_str(&stdout(&status_out)).unwrap();
+    assert_eq!(v["status"], "BLOCKED");
+}
+
+#[test]
+fn crash_recovery_fail_strategy_moves_running_to_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+
+    let id = stdout(&run_orcha(home, &["run", "crashed fail"]));
+    force_task_running(home, &id);
+
+    let out = run_orcha(home, &["recover", "--strategy", "fail"]);
+    assert!(out.status.success());
+    let report: Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(report["recovered_count"], 1);
+    assert_eq!(report["strategy"], "fail");
+
+    let v: Value = serde_json::from_str(&stdout(&run_orcha(home, &["status", &id]))).unwrap();
+    assert_eq!(v["status"], "FAILED");
+}
+
+#[test]
+fn recover_idempotent_second_run_finds_no_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let id = stdout(&run_orcha(home, &["run", "idempotent"]));
+    force_task_running(home, &id);
+
+    let _ = run_orcha(home, &["recover", "--strategy", "block"]);
+    let out2 = run_orcha(home, &["recover", "--strategy", "block"]);
+    assert!(out2.status.success());
+    let report: Value = serde_json::from_str(&stdout(&out2)).unwrap();
+    assert_eq!(report["recovered_count"], 0, "二次 recover 应无 RUNNING");
+    assert_eq!(report["skipped_count"], 1, "Task 现在是 BLOCKED，被跳过");
+}
+
+#[test]
+fn recover_rejects_invalid_strategy_via_subprocess() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run_orcha(dir.path(), &["recover", "--strategy", "bogus"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("invalid strategy"),
+        "stderr should mention invalid strategy: {stderr}"
+    );
+}
+
+#[test]
+fn concurrent_recover_processes_dont_double_recover() {
+    // M4 验收项 3：并发写入无冲突（带乐观锁/版本号）。
+    // 5 个并发 `orcha recover` 同时跑同一 home（含 1 个 RUNNING Task）。
+    // 由于文件锁 + 状态机校验，只有 1 个进程能 recovered_count=1，
+    // 其余 4 个应 recovered_count=0（Task 已变成 BLOCKED，跳过）。
+    // 最终 Task 状态应是 BLOCKED，文件不损坏。
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+
+    let id = stdout(&run_orcha(home, &["run", "concurrent recover"]));
+    force_task_running(home, &id);
+
+    // 5 个并发进程。
+    let home_clone = home.to_path_buf();
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let h = home_clone.clone();
+        handles.push(std::thread::spawn(move || {
+            run_orcha(&h, &["recover", "--strategy", "block"])
+        }));
+    }
+    let outputs: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+    // 每个 recover 都应 exit 0（即使没 recover 到也不算错误）。
+    for (i, out) in outputs.iter().enumerate() {
+        assert!(
+            out.status.success(),
+            "recover #{i} should exit 0, stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // 统计 recovered_count=1 的进程数（应恰好 1 个）。
+    let recovered_ones = outputs
+        .iter()
+        .filter(|out| {
+            let v: Value = match serde_json::from_str(&stdout(out)) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            v["recovered_count"] == 1
+        })
+        .count();
+    assert_eq!(
+        recovered_ones, 1,
+        "只有 1 个进程应成功 recover，实际 {recovered_ones}"
+    );
+
+    // 最终 Task 状态应是 BLOCKED。
+    let v: Value = serde_json::from_str(&stdout(&run_orcha(home, &["status", &id]))).unwrap();
+    assert_eq!(v["status"], "BLOCKED");
+}
+
+#[test]
+fn three_class_queries_state_history_artifacts() {
+    // M4 验收项 2：`task:{id}:state` / `:history` / `:artifacts` 三类键可查。
+    // 端到端：`orcha run` 创建 Task → 直接写一份 history JSONL（绕开 orcha fix，
+    // 避免 Python 依赖）→ 三个查询命令都应返回预期数据。
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+
+    let id = stdout(&run_orcha(home, &["run", "three classes"]));
+    assert!(id.starts_with("T-"));
+
+    // 直接写一份 history JSONL，模拟 fix 跑了一轮产出 1 个 artifact。
+    let history_dir = home.join("history");
+    std::fs::create_dir_all(&history_dir).unwrap();
+    let history_file = history_dir.join(format!("{id}.jsonl"));
+    let round_record = serde_json::json!({
+        "round": 1,
+        "started_at": "2026-07-05T12:00:00Z",
+        "finished_at": "2026-07-05T12:00:01Z",
+        "steps": [],
+        "artifacts": [{
+            "artifact_id": "ART-test-1",
+            "type": "REPORT",
+            "commit_sha": null,
+            "patch": null,
+            "url": null
+        }],
+        "tokens_used": 100
+    });
+    std::fs::write(&history_file, format!("{round_record}\n")).unwrap();
+
+    // 1. `orcha status` → state 键。
+    let status_out = run_orcha(home, &["status", &id]);
+    assert!(status_out.status.success());
+    let v: Value = serde_json::from_str(&stdout(&status_out)).unwrap();
+    assert_eq!(v["id"], id);
+    assert_eq!(v["status"], "PENDING");
+
+    // 2. `orcha history` → history 键。
+    let history_out = run_orcha(home, &["history", &id]);
+    assert!(history_out.status.success());
+    let arr: Vec<Value> = serde_json::from_str(&stdout(&history_out)).unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["round"], 1);
+    assert_eq!(arr[0]["tokens_used"], 100);
+
+    // 3. `orcha artifacts` → artifacts 键。
+    let artifacts_out = run_orcha(home, &["artifacts", &id]);
+    assert!(artifacts_out.status.success());
+    let arr: Vec<Value> = serde_json::from_str(&stdout(&artifacts_out)).unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["artifact_id"], "ART-test-1");
+    assert_eq!(arr[0]["type"], "REPORT");
+}
+
+#[test]
+fn history_and_artifacts_missing_task_returns_empty_array() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+
+    let history_out = run_orcha(home, &["history", "T-missing"]);
+    assert!(history_out.status.success());
+    let arr: Vec<Value> = serde_json::from_str(&stdout(&history_out)).unwrap();
+    assert!(arr.is_empty(), "missing task history should be empty array");
+
+    let artifacts_out = run_orcha(home, &["artifacts", "T-missing"]);
+    assert!(artifacts_out.status.success());
+    let arr: Vec<Value> = serde_json::from_str(&stdout(&artifacts_out)).unwrap();
+    assert!(
+        arr.is_empty(),
+        "missing task artifacts should be empty array"
+    );
+}
