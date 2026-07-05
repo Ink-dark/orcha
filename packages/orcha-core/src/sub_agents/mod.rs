@@ -531,6 +531,12 @@ pub(crate) fn make_create_diff(filename: &str, content: &str) -> Result<String> 
 }
 
 /// 列出 workspace 下所有相对路径文件（按字典序）。
+/// 仅 `llm` feature 下由 `llm_agents` 模块使用；默认编译时允许 dead_code。
+#[cfg_attr(not(feature = "llm"), allow(dead_code))]
+pub(crate) fn list_workspace_files(root: &Path) -> Vec<String> {
+    list_files(root).unwrap_or_default()
+}
+
 fn list_files(root: &Path) -> Result<Vec<String>> {
     let mut out = Vec::new();
     walk(root, root, &mut out)?;

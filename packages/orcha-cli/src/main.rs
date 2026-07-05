@@ -83,6 +83,13 @@ enum Command {
         /// 最大重试次数（默认 3，对齐报名帖熔断）。
         #[arg(long, default_value_t = 3)]
         max_retries: u32,
+
+        /// 启用 LLM 驱动的 Cycleround（需编译时 `--features llm`，
+        /// 且设置 `ORCHA_LLM_API_KEY` 等环境变量）。
+        ///
+        /// 默认关闭，跑确定性实现（CI/离线可跑）。
+        #[arg(long, default_value_t = false)]
+        llm: bool,
     },
 
     /// 崩溃恢复：扫描 store，把中断的 RUNNING Task 迁移到 BLOCKED 或 FAILED。
@@ -160,6 +167,7 @@ fn main() -> Result<()> {
             workspace,
             max_rounds,
             max_retries,
+            llm,
         }) => {
             let exit_code = run_fix(
                 &resolve_home(cli.home.as_deref()),
@@ -167,6 +175,7 @@ fn main() -> Result<()> {
                 description,
                 max_rounds,
                 max_retries,
+                llm,
             )?;
             // 直接 exit 以保证调用方能区分成功/失败（脚本/CI 用 $? 判断）。
             std::process::exit(exit_code);
@@ -241,6 +250,7 @@ fn run_fix(
     description: String,
     max_rounds: u32,
     max_retries: u32,
+    llm: bool,
 ) -> Result<i32> {
     if !workspace.is_dir() {
         bail!("workspace 不存在或不是目录: {}", workspace.display());
@@ -263,8 +273,26 @@ fn run_fix(
         max_retries,
         cool_down: Duration::from_secs(60),
     };
-    let cycle = Cycleround::new(config);
-    let outcome = cycle.run_with_history(&task, workspace, &history_store);
+
+    // 路径选择：--llm 走 LLM 驱动（需 feature + env）；否则确定性实现。
+    let outcome = if llm {
+        #[cfg(feature = "llm")]
+        {
+            let cfg = orcha_llm::LlmConfig::from_env()
+                .map_err(|e| anyhow::anyhow!("LLM 配置错误: {e}"))?;
+            let client: std::sync::Arc<dyn orcha_llm::LlmClient> =
+                std::sync::Arc::new(orcha_llm::OpenAiCompatibleClient::new(cfg));
+            let cycle = orcha_core::LlmCycleround::new(config, client);
+            cycle.run_with_history(&task, workspace, &history_store)
+        }
+        #[cfg(not(feature = "llm"))]
+        {
+            bail!("`--llm` 需要编译时启用 `--features llm`");
+        }
+    } else {
+        let cycle = Cycleround::new(config);
+        cycle.run_with_history(&task, workspace, &history_store)
+    };
 
     // 按结果迁移 Task 状态。
     let (status, exit_code) = match &outcome {
@@ -419,6 +447,7 @@ mod tests {
             "创建 hello.py 输出 hello".into(),
             5,
             3,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 0, "成功路径退出码应为 0");
@@ -458,6 +487,7 @@ mod tests {
             "创建 greet.txt 输出 hi".into(),
             5,
             3,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 0);
@@ -491,6 +521,7 @@ mod tests {
             "创建 hello.py 输出 hello".into(),
             5,
             2,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 1, "失败路径退出码应为 1");
@@ -518,6 +549,7 @@ mod tests {
             "x".into(),
             5,
             3,
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("workspace 不存在"));
@@ -839,6 +871,7 @@ mod tests {
             "创建 hello.py 输出 hello".into(),
             5,
             3,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 0);
