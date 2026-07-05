@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use orcha_core::{
     transition, CycleConfig, CycleOutcome, Cycleround, FailureReason, FileHistoryStore,
-    FileTaskStore, TaskStore,
+    FileTaskStore, RecoverStrategy, Recovery, RecoveryReport, TaskStore,
 };
 use orcha_sdk::{Artifact, Task, TaskStatus};
 
@@ -84,6 +84,16 @@ enum Command {
         #[arg(long, default_value_t = 3)]
         max_retries: u32,
     },
+
+    /// 崩溃恢复：扫描 store，把中断的 RUNNING Task 迁移到 BLOCKED 或 FAILED。
+    ///
+    /// 用于进程被 kill -9 / 崩溃 / 断电后的重启恢复。
+    /// PENDING / BLOCKED / DONE / FAILED 状态的 Task 不受影响。
+    Recover {
+        /// 恢复策略：block（RUNNING → BLOCKED，等待人工恢复）或 fail（RUNNING → FAILED）。
+        #[arg(long, default_value = "block")]
+        strategy: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -140,6 +150,10 @@ fn main() -> Result<()> {
             )?;
             // 直接 exit 以保证调用方能区分成功/失败（脚本/CI 用 $? 判断）。
             std::process::exit(exit_code);
+        }
+        Some(Command::Recover { strategy }) => {
+            let report = run_recover(&resolve_home(cli.home.as_deref()), &strategy)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         None => {
             // 无子命令时打印简短帮助；clap 在 --help 时已自行处理。
@@ -294,6 +308,32 @@ fn build_fix_result(
         "history_file": history_file.to_string_lossy(),
         "history_rounds": history_len,
     })
+}
+
+// ============================================================
+// `orcha recover` 实现（M4-3）
+// ============================================================
+
+/// 执行 `orcha recover` 崩溃恢复。
+///
+/// 步骤：
+/// 1. 解析 `strategy` 字符串（`block` / `fail`，大小写不敏感）。
+/// 2. 初始化 `FileTaskStore`（不会清空已有数据）。
+/// 3. 跑 [`Recovery::scan_and_recover`]，把中断的 RUNNING Task 按策略迁移。
+///
+/// 返回 [`RecoveryReport`]；main 会把它 pretty-print 到 stdout（JSON）。
+/// 调用方按 `recovered_count` 决定后续动作（如重试、人工检查）。
+fn run_recover(home: &Path, strategy: &str) -> Result<RecoveryReport> {
+    let strat = match strategy.to_ascii_lowercase().as_str() {
+        "block" => RecoverStrategy::Block,
+        "fail" => RecoverStrategy::Fail,
+        other => bail!("invalid strategy: {other} (expected 'block' or 'fail')"),
+    };
+    let store = FileTaskStore::new(home);
+    store.init()?;
+    let recovery = Recovery::new(&store, strat);
+    let report = recovery.scan_and_recover()?;
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -474,5 +514,148 @@ mod tests {
         let v2 = build_fix_result("T-test-f", &outcome2, &hs2);
         assert_eq!(v2["outcome"], "Failed");
         assert_eq!(v2["reason"], "MaxRetriesExceeded");
+    }
+
+    // ------------------------------------------------------------
+    // `orcha recover`（M4-3）测试
+    // ------------------------------------------------------------
+
+    /// 把 task 强制设为 RUNNING（绕过状态机，用于测试 setup）。
+    /// 与 recovery.rs 的同名 helper 同语义，仅供 CLI 测试用。
+    fn force_running_cli(store: &FileTaskStore, id: &str) -> Task {
+        let mut task = Task::new(id.into(), "test".into());
+        transition(&mut task, TaskStatus::Running).unwrap();
+        store.insert(&task).unwrap();
+        task
+    }
+
+    /// `run_recover` 默认 strategy=block：把 RUNNING Task 迁到 BLOCKED，
+    /// 第二次跑（幂等）应恢复 0 个。
+    #[test]
+    fn recover_cli_default_block_moves_running_to_blocked() {
+        let home = tempdir().unwrap();
+        let store = FileTaskStore::new(home.path());
+        store.init().unwrap();
+        force_running_cli(&store, "T-1");
+        force_running_cli(&store, "T-2");
+
+        let report = run_recover(home.path(), "block").expect("run_recover block");
+        assert_eq!(report.recovered_count, 2);
+        assert_eq!(report.skipped_count, 0);
+        assert_eq!(report.strategy, RecoverStrategy::Block);
+        assert_eq!(
+            report.recovered_task_ids,
+            vec!["T-1".to_string(), "T-2".to_string()]
+        );
+
+        // 落盘验证：两个 Task 都到 BLOCKED。
+        assert_eq!(
+            store.get("T-1").unwrap().unwrap().status,
+            TaskStatus::Blocked
+        );
+        assert_eq!(
+            store.get("T-2").unwrap().unwrap().status,
+            TaskStatus::Blocked
+        );
+    }
+
+    /// `run_recover --strategy fail`：把 RUNNING Task 迁到 FAILED。
+    #[test]
+    fn recover_cli_fail_strategy_moves_running_to_failed() {
+        let home = tempdir().unwrap();
+        let store = FileTaskStore::new(home.path());
+        store.init().unwrap();
+        force_running_cli(&store, "T-1");
+
+        let report = run_recover(home.path(), "fail").expect("run_recover fail");
+        assert_eq!(report.recovered_count, 1);
+        assert_eq!(report.strategy, RecoverStrategy::Fail);
+
+        assert_eq!(
+            store.get("T-1").unwrap().unwrap().status,
+            TaskStatus::Failed
+        );
+    }
+
+    /// strategy 大小写不敏感：`BLOCK` / `Fail` 都接受。
+    #[test]
+    fn recover_cli_strategy_is_case_insensitive() {
+        let home = tempdir().unwrap();
+        let store = FileTaskStore::new(home.path());
+        store.init().unwrap();
+        force_running_cli(&store, "T-1");
+
+        let report = run_recover(home.path(), "BLOCK").expect("BLOCK upper");
+        assert_eq!(report.recovered_count, 1);
+
+        let report2 = run_recover(home.path(), "Fail").expect("Fail mixed");
+        // T-1 已是 BLOCKED，第二次跑应跳过。
+        assert_eq!(report2.recovered_count, 0);
+        assert_eq!(report2.skipped_count, 1);
+    }
+
+    /// 非法 strategy 应返回 Err，且不修改任何 Task。
+    #[test]
+    fn recover_cli_rejects_invalid_strategy() {
+        let home = tempdir().unwrap();
+        let store = FileTaskStore::new(home.path());
+        store.init().unwrap();
+        force_running_cli(&store, "T-1");
+
+        let err = run_recover(home.path(), "bogus").unwrap_err();
+        assert!(err.to_string().contains("invalid strategy"), "err = {err}");
+        // RUNNING Task 不应被改动。
+        assert_eq!(
+            store.get("T-1").unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+    }
+
+    /// 空store 上跑 recover 应返回 0 报告，不报错。
+    #[test]
+    fn recover_cli_empty_store_returns_zero_report() {
+        let home = tempdir().unwrap();
+        let report = run_recover(home.path(), "block").expect("empty store");
+        assert_eq!(report.recovered_count, 0);
+        assert_eq!(report.skipped_count, 0);
+        assert!(!report.has_recovered());
+    }
+
+    /// 模拟"崩溃 → 重启 → recover"：
+    /// 进程 A 创建 RUNNING Task 后"崩溃"（drop store），
+    /// 进程 B 用同 home 重建 store 跑 recover，应恢复成 BLOCKED。
+    #[test]
+    fn recover_cli_after_simulated_crash_restores_blocked() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+
+        // 进程 A：创建 RUNNING Task 后"崩溃"（不做 update / 清理）。
+        {
+            let store = FileTaskStore::new(&path);
+            store.init().unwrap();
+            let mut task = Task::new("T-crash".into(), "crashed".into());
+            transition(&mut task, TaskStatus::Running).unwrap();
+            store.insert(&task).unwrap();
+        }
+
+        // 进程 B：重启，跑 recover。
+        let report = run_recover(&path, "block").expect("recover after crash");
+        assert_eq!(report.recovered_count, 1);
+        assert_eq!(report.recovered_task_ids, vec!["T-crash".to_string()]);
+
+        let store = FileTaskStore::new(&path);
+        let got = store.get("T-crash").unwrap().unwrap();
+        assert_eq!(got.status, TaskStatus::Blocked);
+    }
+
+    /// `run_recover` 在 store 未 init 时应自动 init（不报错），并返回空报告。
+    #[test]
+    fn recover_cli_inits_store_if_missing() {
+        let home = tempdir().unwrap();
+        // 不手动 init，直接跑 recover——run_recover 内部应 init。
+        let report = run_recover(home.path(), "block").expect("auto init");
+        assert_eq!(report.recovered_count, 0);
+        // home/store 目录应已被创建。
+        assert!(home.path().join("store").is_dir());
     }
 }

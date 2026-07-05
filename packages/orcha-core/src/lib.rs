@@ -4,6 +4,7 @@
 pub mod cycleround;
 pub mod error;
 pub mod history;
+pub mod recovery;
 pub mod sandbox;
 pub mod state_machine;
 pub mod store;
@@ -13,6 +14,7 @@ pub mod sub_agents;
 pub use cycleround::{CycleConfig, CycleOutcome, Cycleround, FailureReason, RoundRecord};
 pub use error::CoreError;
 pub use history::{FileHistoryStore, HistoryStore};
+pub use recovery::{RecoverStrategy, Recovery, RecoveryReport};
 pub use sandbox::{FsSandbox, Sandbox, Workspace};
 pub use state_machine::{is_legal_transition, is_terminal, transition};
 pub use store::{FileTaskStore, TaskStore};
