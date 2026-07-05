@@ -16,7 +16,7 @@
 | **M1** | [Task 模型与本地 CLI](#m1--task-模型与本地-cli) | Phase 1 | ✅ | `orcha status` 可查询 |
 | **M2** | [单步 Sub-Agent 执行](#m2--单步-sub-agent-执行) | Phase 1 | ✅ | 单任务跑通并产出 diff |
 | **M3** | [Cycleround 闭环](#m3--cycleround-闭环-mvp-完成) | Phase 1 | ✅ | 闭环修复样例 bug |
-| **M4** | [状态持久化](#m4--状态持久化) | Phase 2 | — | 重启后任务可恢复 |
+| **M4** | [状态持久化](#m4--状态持久化) | Phase 2 | ✅ | 重启后任务可恢复 |
 | **M5** | [Gateway Shell + HTTP/CLI 触发](#m5--gateway-shell--httpcli-触发) | Phase 2 | — | HTTP API 可触发任务 |
 | **M6** | [飞书 Adapter](#m6--飞书-adapter首选-im-入口) | Phase 2 | — | 飞书 @Orcha 触发并回传 |
 | **M7** | [Plugin 子代理体系](#m7--plugin-子代理体系) | Phase 3 | — | 第三方可注册 Sub-Agent |
@@ -123,9 +123,9 @@
 **交付物**：Redis/Postgres 后端抽象 + 迁移脚本
 
 **验收（可验证）**：
-- [ ] kill 进程后重启，`RUNNING` 中断的 Task 自动恢复并继续
-- [ ] `task:{id}:state` / `:history` / `:artifacts` 三类键在 Redis/PG 中可查
-- [ ] 并发写入无冲突（带乐观锁/版本号）
+- [x] kill 进程后重启，`RUNNING` 中断的 Task 自动恢复并继续
+- [x] `task:{id}:state` / `:history` / `:artifacts` 三类键在 Redis/PG 中可查
+- [x] 并发写入无冲突（带乐观锁/版本号）
 
 ---
 
