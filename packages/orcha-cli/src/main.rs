@@ -3,18 +3,16 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use orcha_core::{
     transition, CycleConfig, CycleOutcome, Cycleround, FailureReason, FileHistoryStore,
-    FileTaskStore, HistoryStore, RecoverStrategy, Recovery, RecoveryReport, RoundRecord, TaskStore,
+    FileMemoryStore, FileTaskStore, HistoryStore, RecoverStrategy, Recovery, RecoveryReport,
+    RoundRecord, TaskStore,
 };
 use orcha_sdk::{Artifact, Task, TaskStatus};
-use orcha_shell::{AdapterInfo, CliAdapter, HttpServer, OrchaShell};
 
 /// `orcha` 命令行根定义。
 #[derive(Parser, Debug)]
@@ -86,6 +84,13 @@ enum Command {
         /// 最大重试次数（默认 3，对齐报名帖熔断）。
         #[arg(long, default_value_t = 3)]
         max_retries: u32,
+
+        /// 启用 LLM 驱动的 Cycleround（需编译时 `--features llm`，
+        /// 且设置 `ORCHA_LLM_API_KEY` 等环境变量）。
+        ///
+        /// 默认关闭，跑确定性实现（CI/离线可跑）。
+        #[arg(long, default_value_t = false)]
+        llm: bool,
     },
 
     /// 崩溃恢复：扫描 store，把中断的 RUNNING Task 迁移到 BLOCKED 或 FAILED。
@@ -118,48 +123,14 @@ enum Command {
         id: String,
     },
 
-    /// Shell 网关：HTTP/CLI 触发 Orcha 闭环（M5）。
+    /// 启动 Orcha Web UI / HTTP 服务器（D3：tiny_http 同步，无异步运行时）。
     ///
-    /// 对应 ROADMAP M5：`orcha shell serve` 启动 HTTP server 接收 OrchaEvent，
-    /// `orcha shell list` 列出已注册 Adapter。
+    /// 浏览器打开 `http://127.0.0.1:{port}` 即可看到任务列表 / 详情 / history 时间线 / LLM memory。
+    /// 阻塞运行，Ctrl-C 退出。
     Shell {
-        #[command(subcommand)]
-        sub: ShellSub,
-    },
-}
-
-/// `orcha shell` 的二级子命令。
-#[derive(Subcommand, Debug)]
-enum ShellSub {
-    /// 启动 HTTP 服务器，监听 `POST /run` 与 `GET /status/{id}`。
-    ///
-    /// 同步阻塞直到进程被 Ctrl+C / SIGTERM 终止（M5 MVP 不引入信号库，
-    /// OS 默认行为已足够）。
-    Serve {
-        /// 监听地址，默认 `127.0.0.1:8080`。
-        #[arg(long, default_value = "127.0.0.1:8080")]
-        addr: String,
-
-        /// API Key。所有 HTTP 请求必须携带 `Authorization: Bearer <api_key>`。
-        #[arg(long, env = "ORCHA_API_KEY")]
-        api_key: String,
-
-        /// workspace 路径（Cycleround 原地修改该目录）。
-        #[arg(long, default_value = ".")]
-        workspace: PathBuf,
-    },
-
-    /// 列出已注册 Adapter，输出 JSON 数组。
-    ///
-    /// 对应 ROADMAP M5 验收项「`orcha shell list` 列出已注册 Adapter」。
-    List {
-        /// API Key（OrchaShell 初始化需要，仅用于构造，不用于校验请求）。
-        #[arg(long, env = "ORCHA_API_KEY")]
-        api_key: String,
-
-        /// workspace 路径（CliAdapter 构造需要，不会真跑 Cycleround）。
-        #[arg(long, default_value = ".")]
-        workspace: PathBuf,
+        /// HTTP 监听端口（默认 7421）。
+        #[arg(long, default_value_t = 7421)]
+        port: u16,
     },
 }
 
@@ -207,6 +178,7 @@ fn main() -> Result<()> {
             workspace,
             max_rounds,
             max_retries,
+            llm,
         }) => {
             let exit_code = run_fix(
                 &resolve_home(cli.home.as_deref()),
@@ -214,6 +186,7 @@ fn main() -> Result<()> {
                 description,
                 max_rounds,
                 max_retries,
+                llm,
             )?;
             // 直接 exit 以保证调用方能区分成功/失败（脚本/CI 用 $? 判断）。
             std::process::exit(exit_code);
@@ -230,25 +203,9 @@ fn main() -> Result<()> {
             let artifacts = run_artifacts(&resolve_home(cli.home.as_deref()), &id)?;
             println!("{}", serde_json::to_string_pretty(&artifacts)?);
         }
-        Some(Command::Shell { sub }) => match sub {
-            ShellSub::Serve {
-                addr,
-                api_key,
-                workspace,
-            } => {
-                run_shell_serve(
-                    &resolve_home(cli.home.as_deref()),
-                    &workspace,
-                    &addr,
-                    &api_key,
-                )?;
-            }
-            ShellSub::List { api_key, workspace } => {
-                let adapters =
-                    run_shell_list(&resolve_home(cli.home.as_deref()), &workspace, &api_key)?;
-                println!("{}", serde_json::to_string_pretty(&adapters)?);
-            }
-        },
+        Some(Command::Shell { port }) => {
+            run_shell(&resolve_home(cli.home.as_deref()), port)?;
+        }
         None => {
             // 无子命令时打印简短帮助；clap 在 --help 时已自行处理。
             Cli::command().print_help()?;
@@ -307,6 +264,7 @@ fn run_fix(
     description: String,
     max_rounds: u32,
     max_retries: u32,
+    llm: bool,
 ) -> Result<i32> {
     if !workspace.is_dir() {
         bail!("workspace 不存在或不是目录: {}", workspace.display());
@@ -329,8 +287,30 @@ fn run_fix(
         max_retries,
         cool_down: Duration::from_secs(60),
     };
-    let cycle = Cycleround::new(config);
-    let outcome = cycle.run_with_history(&task, workspace, &history_store);
+
+    // 路径选择：--llm 走 LLM 驱动（需 feature + env）；否则确定性实现。
+    let outcome = if llm {
+        #[cfg(feature = "llm")]
+        {
+            let cfg = orcha_llm::LlmConfig::from_env()
+                .map_err(|e| anyhow::anyhow!("LLM 配置错误: {e}"))?;
+            let client: std::sync::Arc<dyn orcha_llm::LlmClient> =
+                std::sync::Arc::new(orcha_llm::OpenAiCompatibleClient::new(cfg));
+            // LLM 路径启用 memory：让第 N 轮 Planner/Worker/Reviewer 能引用
+            // 前序轮次的失败原因，避免重复犯同样的错。
+            let memory = std::sync::Arc::new(FileMemoryStore::new(home));
+            memory.init()?;
+            let cycle = orcha_core::LlmCycleround::with_memory(config, client, memory);
+            cycle.run_with_history(&task, workspace, &history_store)
+        }
+        #[cfg(not(feature = "llm"))]
+        {
+            bail!("`--llm` 需要编译时启用 `--features llm`");
+        }
+    } else {
+        let cycle = Cycleround::new(config);
+        cycle.run_with_history(&task, workspace, &history_store)
+    };
 
     // 按结果迁移 Task 状态。
     let (status, exit_code) = match &outcome {
@@ -456,50 +436,18 @@ fn run_artifacts(home: &Path, task_id: &str) -> Result<Vec<Artifact>> {
     Ok(all)
 }
 
-// ============================================================
-// `orcha shell serve / list` 实现（M5-4）
-// ============================================================
-
-/// 构造 OrchaShell 并注册一个 CliAdapter（以 `home` 为 orcha home、
-/// `workspace` 为 Cycleround 工作目录）。
+/// 执行 `orcha shell --port {N}`：启动 Web UI HTTP 服务器（D3）。
 ///
-/// `serve` 与 `list` 共用此 setup：建 shell、注册 adapter、返回 shell。
-/// 不在此跑任何 Cycleround；只有 `POST /run` 到达时才同步执行。
-fn build_shell(home: &Path, workspace: &Path, api_key: &str) -> Result<Arc<OrchaShell>> {
-    if !workspace.is_dir() {
-        bail!("workspace 不存在或不是目录: {}", workspace.display());
-    }
-    // CliAdapter 会在 handle_event 时 init store/history，这里不预先 init。
-    let shell = Arc::new(OrchaShell::new(api_key));
-    let adapter = Arc::new(CliAdapter::new(home, workspace));
-    shell.register_adapter(adapter);
-    Ok(shell)
-}
-
-/// 执行 `orcha shell serve`：构造 shell + adapter，启动 HTTP server 阻塞监听。
+/// - 初始化 store / history / memory 三个目录（幂等）。
+/// - 构造 [`orcha_shell::HttpServer`] 并阻塞 serve。
 ///
-/// 同步阻塞直到进程被外部信号终止（Ctrl+C / SIGTERM）。M5 MVP 不引入
-/// 信号处理库，OS 默认行为足以让 `bind_and_serve` 退出。
-///
-/// 启动前打印一行到 stderr，便于排查：`orcha shell serving on <addr> ...`。
-fn run_shell_serve(home: &Path, workspace: &Path, addr: &str, api_key: &str) -> Result<()> {
-    let shell = build_shell(home, workspace, api_key)?;
-    let server = HttpServer::new(shell, addr);
-    eprintln!(
-        "orcha shell serving on http://{addr} (workspace: {})",
-        workspace.display()
-    );
-    let stop_signal = Arc::new(AtomicBool::new(false));
-    Ok(server.bind_and_serve(stop_signal)?)
-}
-
-/// 执行 `orcha shell list`：构造 shell + adapter，返回已注册 AdapterInfo 列表。
-///
-/// 不启动 HTTP server，也不跑 Cycleround；仅验证 setup 正常并打印 adapter 注册表。
-/// 对应 ROADMAP M5 验收项「`orcha shell list` 列出已注册 Adapter」。
-fn run_shell_list(home: &Path, workspace: &Path, api_key: &str) -> Result<Vec<AdapterInfo>> {
-    let shell = build_shell(home, workspace, api_key)?;
-    Ok(shell.list_adapters())
+/// 阻塞运行，Ctrl-C（SIGINT）后 tiny_http 的 incoming_requests 迭代器退出。
+fn run_shell(home: &Path, port: u16) -> Result<()> {
+    FileTaskStore::new(home).init()?;
+    FileHistoryStore::new(home).init()?;
+    FileMemoryStore::new(home).init()?;
+    let server = orcha_shell::HttpServer::new(home, port);
+    server.serve()
 }
 
 #[cfg(test)]
@@ -531,6 +479,7 @@ mod tests {
             "创建 hello.py 输出 hello".into(),
             5,
             3,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 0, "成功路径退出码应为 0");
@@ -570,6 +519,7 @@ mod tests {
             "创建 greet.txt 输出 hi".into(),
             5,
             3,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 0);
@@ -603,6 +553,7 @@ mod tests {
             "创建 hello.py 输出 hello".into(),
             5,
             2,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 1, "失败路径退出码应为 1");
@@ -630,6 +581,7 @@ mod tests {
             "x".into(),
             5,
             3,
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("workspace 不存在"));
@@ -951,6 +903,7 @@ mod tests {
             "创建 hello.py 输出 hello".into(),
             5,
             3,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 0);
@@ -973,76 +926,5 @@ mod tests {
         // 三类键齐全：state（store）+ history + artifacts 都可查。
         let state = store.get(task_id).unwrap().unwrap();
         assert_eq!(state.status, TaskStatus::Done, "state 应为 DONE");
-    }
-
-    // ------------------------------------------------------------
-    // `orcha shell serve / list`（M5-4）测试
-    // ------------------------------------------------------------
-
-    /// `build_shell` 应注册恰好一个 CliAdapter（M5 MVP 只挂一个 adapter）。
-    #[test]
-    fn shell_build_registers_single_cli_adapter() {
-        let home = tempdir().unwrap();
-        let ws = tempdir().unwrap();
-        let shell = build_shell(home.path(), ws.path(), "test-key").expect("build_shell");
-        let adapters = shell.list_adapters();
-        assert_eq!(adapters.len(), 1, "应恰好注册 1 个 adapter");
-        assert_eq!(adapters[0].name, "cli");
-        assert_eq!(adapters[0].source, "cli");
-        assert!(!adapters[0].description.is_empty());
-    }
-
-    /// `build_shell` API Key 校验：传入 `Bearer test-key` 应通过。
-    /// 这覆盖 OrchaShell 的 api_key 字段正确传到了 shell。
-    #[test]
-    fn shell_build_api_key_is_enforced() {
-        let home = tempdir().unwrap();
-        let ws = tempdir().unwrap();
-        let shell = build_shell(home.path(), ws.path(), "secret-key").expect("build_shell");
-        // 正确 key 通过。
-        assert!(shell.check_api_key(Some("Bearer secret-key")).is_ok());
-        // 错误 key 拒绝。
-        assert!(shell.check_api_key(Some("Bearer wrong")).is_err());
-        // 缺失 key 拒绝。
-        assert!(shell.check_api_key(None).is_err());
-    }
-
-    /// `build_shell` workspace 不存在时应返回 Err，不构造 shell。
-    #[test]
-    fn shell_build_rejects_missing_workspace() {
-        let home = tempdir().unwrap();
-        let missing = home.path().join("does-not-exist");
-        // OrchaShell 未实现 Debug，无法用 unwrap_err；手动 match。
-        let err = match build_shell(home.path(), &missing, "k") {
-            Ok(_) => panic!("expected Err for missing workspace"),
-            Err(e) => e,
-        };
-        assert!(err.to_string().contains("workspace 不存在"));
-    }
-
-    /// `run_shell_list` 返回的 AdapterInfo 列表应可序列化为合法 JSON，
-    /// 且包含 cli adapter 的三个字段。
-    #[test]
-    fn shell_list_returns_serializable_adapter_info() {
-        let home = tempdir().unwrap();
-        let ws = tempdir().unwrap();
-        let adapters = run_shell_list(home.path(), ws.path(), "k").expect("run_shell_list");
-        assert_eq!(adapters.len(), 1);
-
-        // 序列化为 JSON 应包含 name/source/description 三字段。
-        let v = serde_json::to_value(&adapters[0]).unwrap();
-        assert_eq!(v["name"], "cli");
-        assert_eq!(v["source"], "cli");
-        assert!(v["description"].as_str().unwrap().contains("CLI"));
-    }
-
-    /// `run_shell_serve` 在 workspace 不存在时应直接返回 Err，不进入 bind。
-    /// （覆盖最易触发的错误路径；正常路径会阻塞，无法在单测里直接跑。）
-    #[test]
-    fn shell_serve_rejects_missing_workspace() {
-        let home = tempdir().unwrap();
-        let missing = home.path().join("no-such-dir");
-        let err = run_shell_serve(home.path(), &missing, "127.0.0.1:0", "k").unwrap_err();
-        assert!(err.to_string().contains("workspace 不存在"));
     }
 }

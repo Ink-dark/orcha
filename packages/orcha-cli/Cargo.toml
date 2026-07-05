@@ -16,9 +16,15 @@ path = "src/main.rs"
 orcha-sdk = { path = "../orcha-sdk", version = "0.1.0" }
 orcha-core = { path = "../orcha-core", version = "0.1.0" }
 orcha-shell = { path = "../orcha-shell", version = "0.1.0" }
+orcha-llm = { path = "../orcha-llm", version = "0.1.0", optional = true }
 clap.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
+
+[features]
+default = []
+# 启用 LLM 驱动的 Cycleround（`orcha fix --llm` / `orcha shell serve --llm`）。
+llm = ["orcha-core/llm", "dep:orcha-llm"]
 
 [dev-dependencies]
 tempfile = "3"

@@ -7,18 +7,19 @@
 
 ### 1. 系统概览 (System Overview)
 
-Orcha 是一个**基于命令行的自动化编码操作系统**，采用 **Control Plane (控制面)** 与 **Data Plane (数据面)** 分离架构，通过 Shell 网关接入飞书 / Slack 等 IM 机器人。用户在聊天窗口一句话发起复杂编码任务，系统自动拆解、执行、验证、循环优化，直到真正完成。
+Orcha 是一个**基于命令行的自动化编码操作系统**，采用 **Control Plane (控制面)** 与 **Data Plane (数据面)** 分离架构。**Gateway 是触发主入口（一等公民）**，通过各 IM 平台官方 SDK 长连接接入飞书 / QQ（M6，体感对标 OpenClaw，实时交互非轮询）；**Shell 是面向用户的可视化面板与对话窗口**（M5，已实现 Web UI + HTTP API）。用户在聊天窗口一句话发起复杂编码任务，系统自动拆解、执行、验证、循环优化，直到真正完成。
 
 **目标用户**：中小团队的技术负责人、独立开发者、开源项目维护者——需要频繁处理"小而杂"的编码任务，但不想在工具切换和重复执行上浪费时间的人。
 
+- **IM Gateway**: 触发主入口（一等公民）。通过飞书 / QQ 官方 SDK 长连接接入 IM，实时收发消息（M6，体感对标 OpenClaw）。
+- **Orcha Shell**: 面向用户的可视化面板与对话窗口。Web UI + HTTP API，展示任务状态/历史/memory（M5，已实现）。
 - **Orcha Core**: 大脑，负责运行 Cycleround 工作流。
-- **Orcha Shell**: 外壳（Gateway），负责对接 IM（飞书 / Slack 等）和 API。
 - **Sub-Agents**: 乐手，负责执行具体的 Plan / Code / Test / Review。
 
 ```
 ┌─────────────────────────────────────────────┐
-│                Orcha Shell                  │
-│  (飞书 / Slack / API / Webhook / CLI)       │
+│  IM Gateway (M6)         一等公民/主入口      │
+│  飞书/QQ SDK 长连接                          │
 └─────────────────────┬───────────────────────┘
                       │ Dispatch
 ┌─────────────────────▼───────────────────────┐
@@ -32,6 +33,11 @@ Orcha 是一个**基于命令行的自动化编码操作系统**，采用 **Cont
 │            │   Orcha State   │              │
 │            │ (Artifacts/Logs)│              │
 │            └─────────────────┘              │
+└─────────────────────┬───────────────────────┘
+                      │ 可视化/观测
+┌─────────────────────▼───────────────────────┐
+│  Orcha Shell (M5)        可视化面板/对话窗口  │
+│  Web UI + HTTP API                          │
 └─────────────────────────────────────────────┘
 ```
 
@@ -64,52 +70,27 @@ LOOP:
 
 ---
 
-### 3. Orcha Shell 网关规范 (Gateway Spec)
+### 3. Orcha Shell Web UI 规范 (Web UI Spec)
 
-为了让机器人接入更省事，Shell 必须标准化输入与输出。
+Shell 以 `tiny_http` 同步 HTTP server 提供可视化 Web UI 与 JSON API，无异步运行时；CSS/JS 经 `include_str!` 编入二进制，实现单文件部署。本节描述 Shell（M5）的对外接口；IM 接入（飞书 / QQ 长连接）见 [M6](docs/ROADMAP.md#m6--im-gateway飞书--qq-长连接)，走各平台官方 SDK 长连接，不走本节 JSON API。
 
-#### 3.1 事件模型 (Event Model)
-所有进入 Orcha 的消息必须转换为 `OrchaEvent`。
+#### 3.1 页面路由
 
-```json
-{
-  "event_id": "EVT-xxxx",
-  "source": "slack",
-  "user_id": "U123",
-  "timestamp": 1700000000,
-  "type": "USER_PROMPT",
-  "payload": {
-    "raw_text": "@Orcha fix the bug in auth.py",
-    "attachments": []
-  }
-}
-```
+| 路径 | 页面 |
+| :--- | :--- |
+| `/` | 任务列表（含状态统计） |
+| `/tasks/:id` | 任务详情（Artifacts / History / Memory 标签页） |
+| `/tasks/:id/history` | history 时间线（按轮次展示 steps / artifacts / tokens） |
 
-#### 3.2 响应模型 (Response Model)
-```json
-{
-  "event_id": "EVT-xxxx",
-  "status": "STREAMING | FINAL | ERROR",
-  "content": "正在修复 auth.py...",
-  "artifacts": [
-    { "type": "diff", "url": "..." }
-  ]
-}
-```
+#### 3.2 JSON API
 
-#### 3.3 Adapter 接口 (伪代码)
-所有机器人只需实现此接口：
-
-```python
-class ShellAdapter:
-    def normalize_incoming(self, raw_event) -> OrchaEvent:
-        """将外部消息转为 OrchaEvent"""
-        pass
-
-    def dispatch_outgoing(self, response: OrchaResponse):
-        """将 Orcha 结果发回给用户"""
-        pass
-```
+| 端点 | 返回 |
+| :--- | :--- |
+| `GET /api/tasks` | `[{ id, description, status, created_at }]` |
+| `GET /api/tasks/summary` | `{ total, pending, running, blocked, done, failed }` |
+| `GET /api/tasks/:id` | `{ task, history_count, artifacts }` |
+| `GET /api/tasks/:id/history` | `Vec<RoundRecord>`（每轮 steps / artifacts / tokens） |
+| `GET /api/tasks/:id/memory` | `Vec<MemoryEntry>`（LLM 对话历史，仅 `--llm` 路径有数据） |
 
 ---
 
@@ -172,16 +153,23 @@ PENDING -> RUNNING -> (BLOCKED <-> RUNNING) -> DONE
 
 ```bash
 # 系统管理
-orcha init <repo>
-orcha status [task_id]
+orcha init                          # 初始化 ./orcha home
+orcha status [task_id]              # 查看任务状态（JSON）
+orcha list [--status <STATUS>]      # 列出任务
+orcha schema --export > schema.json # 导出全部数据模型 JSON Schema
 
-# 任务触发
-orcha run "Implement user login"
-orcha fix <issue_url>
+# 任务执行
+orcha run "<desc>"                  # 创建任务（不执行）
+orcha fix "<desc>" [--workspace <dir>] [--max-rounds N] [--max-retries N] [--llm]
+                                    # 跑 Cycleround 闭环（--llm 走 LLM 驱动路径）
+orcha recover [--strategy block|fail]  # 崩溃恢复：中断的 RUNNING Task
 
-# Shell 管理
-orcha shell add slack --token xxx
-orcha shell list
+# 观测
+orcha history <id>                  # 查看某 Task 的全部 RoundRecord
+orcha artifacts <id>                # 聚合某 Task 的全部 Artifact
+
+# Web UI
+orcha shell --port 7421             # 启动 Web UI / HTTP 服务器（D3）
 ```
 
 ---
@@ -197,10 +185,54 @@ orcha shell list
 | M2 | 单步 Sub-Agent 执行 | Phase 1 | ✅ |
 | M3 | Cycleround 闭环 | Phase 1 | ✅ |
 | M4 | 状态持久化 | Phase 2 | — |
-| M5 | Gateway Shell + HTTP/CLI 触发 | Phase 2 | — |
-| M6 | 飞书 Adapter | Phase 2 | — |
+| M5 | Web UI Shell + HTTP API | Phase 2 | — |
+| M6 | IM Gateway（飞书/QQ 长连接） | Phase 2 | — |
 | M7 | Plugin 子代理体系 | Phase 3 | — |
 | M8 | Self-Evolve | Phase 4 | — |
 
 > 各 Milestone 的目标、交付物、可验证验收清单及 DoD/追踪约定见 **[docs/ROADMAP.md](docs/ROADMAP.md)**。
+
+---
+
+### 9. Quick Start（D3 Web UI demo）
+
+**前置依赖**：Rust 1.75+、Bash、Python 3（用于 Cycleround 确定性 Tester 子代理）。
+
+**一键跑起来**：
+
+```bash
+./scripts/web-demo.sh
+# 或指定端口 / release 构建：
+./scripts/web-demo.sh --port 8000 --release
+```
+
+脚本会自动：
+1. `cargo build --bin orcha`（首次约 1~2 分钟）
+2. 在临时 home 跑两遍 `orcha fix` 确定性闭环（一个单轮成功、一个 Fixer 第 2 轮修复），种出 2 个 DONE task + history + artifacts
+3. 启动 `orcha shell` Web UI 服务器（默认端口 7421）
+
+浏览器打开 `http://127.0.0.1:7421/` 即可看到任务列表 → 任务详情 → history 时间线 / LLM memory 标签页。Ctrl-C 退出后自动清理临时目录。
+
+**LLM 路径（可选，需 OpenAI 兼容 API Key）**：
+
+```bash
+export ORCHA_LLM_BASE_URL=https://api.openai.com/v1
+export ORCHA_LLM_API_KEY=sk-...
+export ORCHA_LLM_MODEL=gpt-4o-mini
+./scripts/web-demo.sh --llm
+```
+
+`--llm` 会用 `--features orcha-cli/llm` 重编译，再追加一个 `orcha fix --llm` 任务；该任务的 **Memory 标签页**会展示 D2 注入 LLM prompt 的对话历史（per-agent / per-round）。
+
+**手动跑（不用 demo 脚本）**：
+
+```bash
+cargo build --bin orcha
+./target/debug/orcha init                 # 初始化 ./orcha home
+./target/debug/orcha fix --workspace /tmp/ws \
+    "创建 hello.py 输出 hello"             # 跑一遍 Cycleround
+./target/debug/orcha shell --port 7421    # 启动 Web UI
+```
+
+**JSON API**：端点清单见 [§3.2](#32-json-api)。
 

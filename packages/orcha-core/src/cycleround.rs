@@ -294,7 +294,7 @@ impl Cycleround {
 }
 
 /// 构造一轮的 `RoundRecord`（不写入任何 store，仅返回值）。
-fn build_round(
+pub(crate) fn build_round(
     round: u32,
     started_at: chrono::DateTime<chrono::Utc>,
     steps: Vec<StepResult>,
@@ -312,7 +312,11 @@ fn build_round(
 }
 
 /// 把一轮记录写入 history store（若 `Some`）。写入失败仅打 stderr，不阻断主流程。
-fn persist_round(history_store: Option<&dyn HistoryStore>, task_id: &str, rec: &RoundRecord) {
+pub(crate) fn persist_round(
+    history_store: Option<&dyn HistoryStore>,
+    task_id: &str,
+    rec: &RoundRecord,
+) {
     if let Some(hs) = history_store {
         if let Err(e) = hs.append_round(task_id, rec) {
             eprintln!(
