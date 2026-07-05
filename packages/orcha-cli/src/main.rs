@@ -9,10 +9,9 @@ use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use orcha_core::{
     transition, CycleConfig, CycleOutcome, Cycleround, FailureReason, FileHistoryStore,
-    FileTaskStore, HistoryStore, RecoverStrategy, Recovery, RecoveryReport, RoundRecord, TaskStore,
+    FileMemoryStore, FileTaskStore, HistoryStore, RecoverStrategy, Recovery, RecoveryReport,
+    RoundRecord, TaskStore,
 };
-#[cfg(feature = "llm")]
-use orcha_core::FileMemoryStore;
 use orcha_sdk::{Artifact, Task, TaskStatus};
 
 /// `orcha` 命令行根定义。
@@ -123,6 +122,16 @@ enum Command {
         /// 任务 id，形如 `T-...`。
         id: String,
     },
+
+    /// 启动 Orcha Web UI / HTTP 服务器（D3：tiny_http 同步，无异步运行时）。
+    ///
+    /// 浏览器打开 `http://127.0.0.1:{port}` 即可看到任务列表 / 详情 / history 时间线 / LLM memory。
+    /// 阻塞运行，Ctrl-C 退出。
+    Shell {
+        /// HTTP 监听端口（默认 7421）。
+        #[arg(long, default_value_t = 7421)]
+        port: u16,
+    },
 }
 
 fn main() -> Result<()> {
@@ -193,6 +202,9 @@ fn main() -> Result<()> {
         Some(Command::Artifacts { id }) => {
             let artifacts = run_artifacts(&resolve_home(cli.home.as_deref()), &id)?;
             println!("{}", serde_json::to_string_pretty(&artifacts)?);
+        }
+        Some(Command::Shell { port }) => {
+            run_shell(&resolve_home(cli.home.as_deref()), port)?;
         }
         None => {
             // 无子命令时打印简短帮助；clap 在 --help 时已自行处理。
@@ -422,6 +434,20 @@ fn run_artifacts(home: &Path, task_id: &str) -> Result<Vec<Artifact>> {
         all.extend(rec.artifacts.iter().cloned());
     }
     Ok(all)
+}
+
+/// 执行 `orcha shell --port {N}`：启动 Web UI HTTP 服务器（D3）。
+///
+/// - 初始化 store / history / memory 三个目录（幂等）。
+/// - 构造 [`orcha_shell::HttpServer`] 并阻塞 serve。
+///
+/// 阻塞运行，Ctrl-C（SIGINT）后 tiny_http 的 incoming_requests 迭代器退出。
+fn run_shell(home: &Path, port: u16) -> Result<()> {
+    FileTaskStore::new(home).init()?;
+    FileHistoryStore::new(home).init()?;
+    FileMemoryStore::new(home).init()?;
+    let server = orcha_shell::HttpServer::new(home, port);
+    server.serve()
 }
 
 #[cfg(test)]

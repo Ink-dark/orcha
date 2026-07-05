@@ -26,6 +26,7 @@ thiserror = "1.0"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
 ureq = { version = "2.12", features = ["json"] }
+tiny_http = "0.12"
 
 [profile.release]
 lto = true
