@@ -3,6 +3,8 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
@@ -12,6 +14,7 @@ use orcha_core::{
     FileTaskStore, HistoryStore, RecoverStrategy, Recovery, RecoveryReport, RoundRecord, TaskStore,
 };
 use orcha_sdk::{Artifact, Task, TaskStatus};
+use orcha_shell::{AdapterInfo, CliAdapter, HttpServer, OrchaShell};
 
 /// `orcha` 命令行根定义。
 #[derive(Parser, Debug)]
@@ -114,6 +117,50 @@ enum Command {
         /// 任务 id，形如 `T-...`。
         id: String,
     },
+
+    /// Shell 网关：HTTP/CLI 触发 Orcha 闭环（M5）。
+    ///
+    /// 对应 ROADMAP M5：`orcha shell serve` 启动 HTTP server 接收 OrchaEvent，
+    /// `orcha shell list` 列出已注册 Adapter。
+    Shell {
+        #[command(subcommand)]
+        sub: ShellSub,
+    },
+}
+
+/// `orcha shell` 的二级子命令。
+#[derive(Subcommand, Debug)]
+enum ShellSub {
+    /// 启动 HTTP 服务器，监听 `POST /run` 与 `GET /status/{id}`。
+    ///
+    /// 同步阻塞直到进程被 Ctrl+C / SIGTERM 终止（M5 MVP 不引入信号库，
+    /// OS 默认行为已足够）。
+    Serve {
+        /// 监听地址，默认 `127.0.0.1:8080`。
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+
+        /// API Key。所有 HTTP 请求必须携带 `Authorization: Bearer <api_key>`。
+        #[arg(long, env = "ORCHA_API_KEY")]
+        api_key: String,
+
+        /// workspace 路径（Cycleround 原地修改该目录）。
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+    },
+
+    /// 列出已注册 Adapter，输出 JSON 数组。
+    ///
+    /// 对应 ROADMAP M5 验收项「`orcha shell list` 列出已注册 Adapter」。
+    List {
+        /// API Key（OrchaShell 初始化需要，仅用于构造，不用于校验请求）。
+        #[arg(long, env = "ORCHA_API_KEY")]
+        api_key: String,
+
+        /// workspace 路径（CliAdapter 构造需要，不会真跑 Cycleround）。
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -183,6 +230,25 @@ fn main() -> Result<()> {
             let artifacts = run_artifacts(&resolve_home(cli.home.as_deref()), &id)?;
             println!("{}", serde_json::to_string_pretty(&artifacts)?);
         }
+        Some(Command::Shell { sub }) => match sub {
+            ShellSub::Serve {
+                addr,
+                api_key,
+                workspace,
+            } => {
+                run_shell_serve(
+                    &resolve_home(cli.home.as_deref()),
+                    &workspace,
+                    &addr,
+                    &api_key,
+                )?;
+            }
+            ShellSub::List { api_key, workspace } => {
+                let adapters =
+                    run_shell_list(&resolve_home(cli.home.as_deref()), &workspace, &api_key)?;
+                println!("{}", serde_json::to_string_pretty(&adapters)?);
+            }
+        },
         None => {
             // 无子命令时打印简短帮助；clap 在 --help 时已自行处理。
             Cli::command().print_help()?;
@@ -388,6 +454,49 @@ fn run_artifacts(home: &Path, task_id: &str) -> Result<Vec<Artifact>> {
         all.extend(rec.artifacts.iter().cloned());
     }
     Ok(all)
+}
+
+// ============================================================
+// `orcha shell serve / list` 实现（M5-4）
+// ============================================================
+
+/// 构造 OrchaShell 并注册一个 CliAdapter（以 `home` 为 orcha home、
+/// `workspace` 为 Cycleround 工作目录）。
+///
+/// `serve` 与 `list` 共用此 setup：建 shell、注册 adapter、返回 shell。
+/// 不在此跑任何 Cycleround；只有 `POST /run` 到达时才同步执行。
+fn build_shell(home: &Path, workspace: &Path, api_key: &str) -> Result<Arc<OrchaShell>> {
+    if !workspace.is_dir() {
+        bail!("workspace 不存在或不是目录: {}", workspace.display());
+    }
+    // CliAdapter 会在 handle_event 时 init store/history，这里不预先 init。
+    let shell = Arc::new(OrchaShell::new(api_key));
+    let adapter = Arc::new(CliAdapter::new(home, workspace));
+    shell.register_adapter(adapter);
+    Ok(shell)
+}
+
+/// 执行 `orcha shell serve`：构造 shell + adapter，启动 HTTP server 阻塞监听。
+///
+/// 同步阻塞直到进程被外部信号终止（Ctrl+C / SIGTERM）。M5 MVP 不引入
+/// 信号处理库，OS 默认行为足以让 `bind_and_serve` 退出。
+///
+/// 启动前打印一行到 stderr，便于排查：`orcha shell serving on <addr> ...`。
+fn run_shell_serve(home: &Path, workspace: &Path, addr: &str, api_key: &str) -> Result<()> {
+    let shell = build_shell(home, workspace, api_key)?;
+    let server = HttpServer::new(shell, addr);
+    eprintln!("orcha shell serving on http://{addr} (workspace: {})", workspace.display());
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    Ok(server.bind_and_serve(stop_signal)?)
+}
+
+/// 执行 `orcha shell list`：构造 shell + adapter，返回已注册 AdapterInfo 列表。
+///
+/// 不启动 HTTP server，也不跑 Cycleround；仅验证 setup 正常并打印 adapter 注册表。
+/// 对应 ROADMAP M5 验收项「`orcha shell list` 列出已注册 Adapter」。
+fn run_shell_list(home: &Path, workspace: &Path, api_key: &str) -> Result<Vec<AdapterInfo>> {
+    let shell = build_shell(home, workspace, api_key)?;
+    Ok(shell.list_adapters())
 }
 
 #[cfg(test)]
@@ -861,5 +970,76 @@ mod tests {
         // 三类键齐全：state（store）+ history + artifacts 都可查。
         let state = store.get(task_id).unwrap().unwrap();
         assert_eq!(state.status, TaskStatus::Done, "state 应为 DONE");
+    }
+
+    // ------------------------------------------------------------
+    // `orcha shell serve / list`（M5-4）测试
+    // ------------------------------------------------------------
+
+    /// `build_shell` 应注册恰好一个 CliAdapter（M5 MVP 只挂一个 adapter）。
+    #[test]
+    fn shell_build_registers_single_cli_adapter() {
+        let home = tempdir().unwrap();
+        let ws = tempdir().unwrap();
+        let shell = build_shell(home.path(), ws.path(), "test-key").expect("build_shell");
+        let adapters = shell.list_adapters();
+        assert_eq!(adapters.len(), 1, "应恰好注册 1 个 adapter");
+        assert_eq!(adapters[0].name, "cli");
+        assert_eq!(adapters[0].source, "cli");
+        assert!(!adapters[0].description.is_empty());
+    }
+
+    /// `build_shell` API Key 校验：传入 `Bearer test-key` 应通过。
+    /// 这覆盖 OrchaShell 的 api_key 字段正确传到了 shell。
+    #[test]
+    fn shell_build_api_key_is_enforced() {
+        let home = tempdir().unwrap();
+        let ws = tempdir().unwrap();
+        let shell = build_shell(home.path(), ws.path(), "secret-key").expect("build_shell");
+        // 正确 key 通过。
+        assert!(shell.check_api_key(Some("Bearer secret-key")).is_ok());
+        // 错误 key 拒绝。
+        assert!(shell.check_api_key(Some("Bearer wrong")).is_err());
+        // 缺失 key 拒绝。
+        assert!(shell.check_api_key(None).is_err());
+    }
+
+    /// `build_shell` workspace 不存在时应返回 Err，不构造 shell。
+    #[test]
+    fn shell_build_rejects_missing_workspace() {
+        let home = tempdir().unwrap();
+        let missing = home.path().join("does-not-exist");
+        // OrchaShell 未实现 Debug，无法用 unwrap_err；手动 match。
+        let err = match build_shell(home.path(), &missing, "k") {
+            Ok(_) => panic!("expected Err for missing workspace"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("workspace 不存在"));
+    }
+
+    /// `run_shell_list` 返回的 AdapterInfo 列表应可序列化为合法 JSON，
+    /// 且包含 cli adapter 的三个字段。
+    #[test]
+    fn shell_list_returns_serializable_adapter_info() {
+        let home = tempdir().unwrap();
+        let ws = tempdir().unwrap();
+        let adapters = run_shell_list(home.path(), ws.path(), "k").expect("run_shell_list");
+        assert_eq!(adapters.len(), 1);
+
+        // 序列化为 JSON 应包含 name/source/description 三字段。
+        let v = serde_json::to_value(&adapters[0]).unwrap();
+        assert_eq!(v["name"], "cli");
+        assert_eq!(v["source"], "cli");
+        assert!(v["description"].as_str().unwrap().contains("CLI"));
+    }
+
+    /// `run_shell_serve` 在 workspace 不存在时应直接返回 Err，不进入 bind。
+    /// （覆盖最易触发的错误路径；正常路径会阻塞，无法在单测里直接跑。）
+    #[test]
+    fn shell_serve_rejects_missing_workspace() {
+        let home = tempdir().unwrap();
+        let missing = home.path().join("no-such-dir");
+        let err = run_shell_serve(home.path(), &missing, "127.0.0.1:0", "k").unwrap_err();
+        assert!(err.to_string().contains("workspace 不存在"));
     }
 }

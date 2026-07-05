@@ -333,9 +333,11 @@ name = "orcha-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "orcha-core",
  "orcha-sdk",
+ "orcha-shell",
  "serde_json",
  "tempfile",
 ]
@@ -369,10 +371,15 @@ dependencies = [
 name = "orcha-shell"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "chrono",
+ "orcha-core",
  "orcha-sdk",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
