@@ -5,6 +5,7 @@ members = [
     "packages/orcha-core",
     "packages/orcha-shell",
     "packages/orcha-cli",
+    "packages/orcha-llm",
 ]
 
 [workspace.package]
@@ -24,6 +25,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "1.0"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive", "env"] }
+ureq = { version = "2.12", features = ["json"] }
 
 [profile.release]
 lto = true
