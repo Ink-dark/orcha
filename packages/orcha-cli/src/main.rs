@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use orcha_core::{
     transition, CycleConfig, CycleOutcome, Cycleround, FailureReason, FileHistoryStore,
-    FileTaskStore, RecoverStrategy, Recovery, RecoveryReport, TaskStore,
+    FileTaskStore, HistoryStore, RecoverStrategy, Recovery, RecoveryReport, RoundRecord, TaskStore,
 };
 use orcha_sdk::{Artifact, Task, TaskStatus};
 
@@ -94,6 +94,26 @@ enum Command {
         #[arg(long, default_value = "block")]
         strategy: String,
     },
+
+    /// 查看某 Task 的全部 RoundRecord 历史，输出 JSON 数组。
+    ///
+    /// 对应 ROADMAP M4 验收项「`task:{id}:history` 三类键可查」中的 history 键。
+    /// 数据来自 `{home}/history/{task_id}.jsonl`（JSONL，每行一条 RoundRecord）。
+    /// 不存在时返回空数组（不视为错误）。
+    History {
+        /// 任务 id，形如 `T-...`。
+        id: String,
+    },
+
+    /// 查看某 Task 的全部 Artifact，输出 JSON 数组。
+    ///
+    /// 对应 ROADMAP M4 验收项「`task:{id}:artifacts` 三类键可查」中的 artifacts 键。
+    /// 从 history 各轮的 `artifacts` 字段聚合（按 round 顺序展开）。
+    /// 不存在时返回空数组（不视为错误）。
+    Artifacts {
+        /// 任务 id，形如 `T-...`。
+        id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -154,6 +174,14 @@ fn main() -> Result<()> {
         Some(Command::Recover { strategy }) => {
             let report = run_recover(&resolve_home(cli.home.as_deref()), &strategy)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        Some(Command::History { id }) => {
+            let records = run_history(&resolve_home(cli.home.as_deref()), &id)?;
+            println!("{}", serde_json::to_string_pretty(&records)?);
+        }
+        Some(Command::Artifacts { id }) => {
+            let artifacts = run_artifacts(&resolve_home(cli.home.as_deref()), &id)?;
+            println!("{}", serde_json::to_string_pretty(&artifacts)?);
         }
         None => {
             // 无子命令时打印简短帮助；clap 在 --help 时已自行处理。
@@ -336,10 +364,36 @@ fn run_recover(home: &Path, strategy: &str) -> Result<RecoveryReport> {
     Ok(report)
 }
 
+/// 执行 `orcha history {id}`：读取某 Task 的全部 RoundRecord。
+///
+/// 返回 `Vec<RoundRecord>`，按 round 升序。Task 不存在或无 history 时返回空 Vec
+/// （不视为错误——调用方可能只是想确认"还没跑过"）。
+fn run_history(home: &Path, task_id: &str) -> Result<Vec<RoundRecord>> {
+    let history = FileHistoryStore::new(home);
+    history.init()?;
+    let records = history.list_history(task_id)?;
+    Ok(records)
+}
+
+/// 执行 `orcha artifacts {id}`：聚合某 Task 的全部 Artifact。
+///
+/// 从 history 各轮的 `artifacts` 字段按 round 顺序展开成扁平 `Vec<Artifact>`。
+/// Task 不存在或无 history 时返回空 Vec。
+fn run_artifacts(home: &Path, task_id: &str) -> Result<Vec<Artifact>> {
+    let history = FileHistoryStore::new(home);
+    history.init()?;
+    let records = history.list_history(task_id)?;
+    let mut all = Vec::new();
+    for rec in records {
+        all.extend(rec.artifacts.iter().cloned());
+    }
+    Ok(all)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orcha_core::{find_python, HistoryStore};
+    use orcha_core::find_python;
     use std::fs;
     use tempfile::tempdir;
 
@@ -657,5 +711,155 @@ mod tests {
         assert_eq!(report.recovered_count, 0);
         // home/store 目录应已被创建。
         assert!(home.path().join("store").is_dir());
+    }
+
+    // ------------------------------------------------------------
+    // `orcha history` / `orcha artifacts`（M4-4）测试
+    // ------------------------------------------------------------
+
+    /// 构造一个最小 RoundRecord 用于 history 测试。
+    fn sample_round(round: u32, artifact_ids: &[&str]) -> RoundRecord {
+        let now = chrono::Utc::now();
+        let artifacts: Vec<Artifact> = artifact_ids
+            .iter()
+            .map(|id| Artifact {
+                artifact_id: (*id).into(),
+                artifact_type: orcha_sdk::ArtifactType::Report,
+                commit_sha: None,
+                patch: None,
+                url: None,
+            })
+            .collect();
+        RoundRecord {
+            round,
+            started_at: now,
+            finished_at: now,
+            steps: Vec::new(),
+            artifacts,
+            tokens_used: round * 100,
+        }
+    }
+
+    /// `run_history` 返回 JSONL 里的全部 RoundRecord，按 round 升序。
+    #[test]
+    fn history_cli_returns_all_rounds_in_order() {
+        let home = tempdir().unwrap();
+        let hs = FileHistoryStore::new(home.path());
+        hs.init().unwrap();
+        hs.append_round("T-hist", &sample_round(1, &["ART-1"]))
+            .unwrap();
+        hs.append_round("T-hist", &sample_round(2, &["ART-2", "ART-3"]))
+            .unwrap();
+
+        let records = run_history(home.path(), "T-hist").expect("run_history");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].round, 1);
+        assert_eq!(records[1].round, 2);
+        assert_eq!(records[1].tokens_used, 200);
+    }
+
+    /// `run_history` 对不存在的 task 返回空 Vec（不报错）。
+    #[test]
+    fn history_cli_missing_task_returns_empty_vec() {
+        let home = tempdir().unwrap();
+        let records = run_history(home.path(), "T-missing").expect("run_history missing");
+        assert!(records.is_empty());
+    }
+
+    /// `run_history` 在 store 未 init 时应自动 init（不报错）。
+    #[test]
+    fn history_cli_inits_store_if_missing() {
+        let home = tempdir().unwrap();
+        let records = run_history(home.path(), "T-1").expect("auto init");
+        assert!(records.is_empty());
+        assert!(home.path().join("history").is_dir());
+    }
+
+    /// `run_artifacts` 把各轮 artifacts 聚合成扁平 Vec，按 round 顺序。
+    #[test]
+    fn artifacts_cli_aggregates_across_rounds() {
+        let home = tempdir().unwrap();
+        let hs = FileHistoryStore::new(home.path());
+        hs.init().unwrap();
+        hs.append_round("T-art", &sample_round(1, &["ART-1", "ART-2"]))
+            .unwrap();
+        hs.append_round("T-art", &sample_round(2, &["ART-3"]))
+            .unwrap();
+
+        let arts = run_artifacts(home.path(), "T-art").expect("run_artifacts");
+        assert_eq!(arts.len(), 3, "应聚合 3 个 artifact");
+        assert_eq!(arts[0].artifact_id, "ART-1");
+        assert_eq!(arts[1].artifact_id, "ART-2");
+        assert_eq!(arts[2].artifact_id, "ART-3");
+    }
+
+    /// `run_artifacts` 对无 history 的 task 返回空 Vec。
+    #[test]
+    fn artifacts_cli_missing_task_returns_empty_vec() {
+        let home = tempdir().unwrap();
+        let arts = run_artifacts(home.path(), "T-missing").expect("run_artifacts missing");
+        assert!(arts.is_empty());
+    }
+
+    /// `run_artifacts` 对有 history 但无 artifact 的 round 也能处理（应跳过空轮）。
+    #[test]
+    fn artifacts_cli_handles_rounds_without_artifacts() {
+        let home = tempdir().unwrap();
+        let hs = FileHistoryStore::new(home.path());
+        hs.init().unwrap();
+        // round 1 无 artifact，round 2 有 1 个。
+        hs.append_round("T-art2", &sample_round(1, &[])).unwrap();
+        hs.append_round("T-art2", &sample_round(2, &["ART-x"]))
+            .unwrap();
+
+        let arts = run_artifacts(home.path(), "T-art2").expect("run_artifacts");
+        assert_eq!(arts.len(), 1);
+        assert_eq!(arts[0].artifact_id, "ART-x");
+    }
+
+    /// 端到端：跑一遍 `orcha fix` 后，`run_history` / `run_artifacts` 都应非空。
+    /// 这模拟真实「fix 落地后查三类键」的场景。
+    #[test]
+    fn history_and_artifacts_cli_after_fix_end_to_end() {
+        if find_python().is_none() {
+            eprintln!("skipping: no python interpreter on PATH");
+            return;
+        }
+        let home = tempdir().unwrap();
+        let ws = tempdir().unwrap();
+        fs::write(
+            ws.path().join("test.py"),
+            "assert open('hello.py').read().strip() == 'hello'\n",
+        )
+        .unwrap();
+
+        let exit = run_fix(
+            home.path(),
+            ws.path(),
+            "创建 hello.py 输出 hello".into(),
+            5,
+            3,
+        )
+        .expect("run_fix should not error");
+        assert_eq!(exit, 0);
+
+        // 拿到 task_id（list 唯一一个）。
+        let store = FileTaskStore::new(home.path());
+        let tasks = store.list(None).unwrap();
+        assert_eq!(tasks.len(), 1);
+        let task_id = &tasks[0].id;
+
+        // history 应有记录。
+        let history = run_history(home.path(), task_id).expect("history after fix");
+        assert!(!history.is_empty(), "fix 后 history 应非空");
+        assert_eq!(history[0].round, 1);
+
+        // artifacts 也应有（Cycleround 成功路径产出 patch artifact）。
+        let arts = run_artifacts(home.path(), task_id).expect("artifacts after fix");
+        assert!(!arts.is_empty(), "fix 后 artifacts 应非空");
+
+        // 三类键齐全：state（store）+ history + artifacts 都可查。
+        let state = store.get(task_id).unwrap().unwrap();
+        assert_eq!(state.status, TaskStatus::Done, "state 应为 DONE");
     }
 }
