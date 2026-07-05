@@ -4,9 +4,11 @@
 pub mod adapter;
 pub mod cli_adapter;
 pub mod error;
+pub mod http;
 pub mod shell;
 
 pub use adapter::{AdapterInfo, ShellAdapter};
 pub use cli_adapter::CliAdapter;
 pub use error::{Result, ShellError};
+pub use http::HttpServer;
 pub use shell::OrchaShell;
