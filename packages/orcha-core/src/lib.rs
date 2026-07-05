@@ -17,4 +17,4 @@ pub use sandbox::{FsSandbox, Sandbox, Workspace};
 pub use state_machine::{is_legal_transition, is_terminal, transition};
 pub use store::{FileTaskStore, TaskStore};
 pub use sub_agent::{mark_running, StepContext, StepOutput, SubAgent};
-pub use sub_agents::{Fixer, Observer, Planner, Reviewer, Tester, Worker};
+pub use sub_agents::{find_python, Fixer, Observer, Planner, Reviewer, Tester, Worker};

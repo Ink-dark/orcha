@@ -2,7 +2,6 @@
 //! 并用真实 `git apply` 验证 Worker 产出的 patch 可应用。
 
 use std::fs;
-use std::path::Path;
 use std::process::Command;
 
 use orcha_core::{FsSandbox, Observer, Planner, Sandbox, StepContext, SubAgent, Worker};
@@ -115,6 +114,9 @@ fn apply_patch_in_fresh_git_repo(patch: &str) -> std::io::Result<std::path::Path
     git(&["init", "-q"])?;
     git(&["config", "user.name", "orcha-test"])?;
     git(&["config", "user.email", "test@orcha.local"])?;
+    // 禁用 autocrlf：Windows 默认 core.autocrlf=true 会把 LF 转为 CRLF，
+    // 导致 apply 后文件内容变成 "hello\r\n"，与 patch 中 "hello\n" 不一致。
+    git(&["config", "core.autocrlf", "false"])?;
 
     // 把 patch 写到临时文件后用 `git apply --check` 预校验，再真正 apply。
     let patch_path = repo_dir.join("worker.patch");
@@ -175,14 +177,24 @@ fn planner_handles_empty_description_gracefully() {
 /// Worker 写入失败（workspace 路径不可写）应返回 failure 而非 panic。
 #[test]
 fn worker_returns_failure_when_workspace_unwritable() {
-    // 用一个不存在且无法创建的路径模拟不可写。
-    let bogus = Path::new("/proc/cannot/exist/workspace");
+    // 用一个已存在的**文件**路径模拟不可写：
+    // Worker 会对目标文件的父目录调用 create_dir_all，
+    // 而父路径是一个已存在的文件时（不是目录），create_dir_all 在所有平台都会失败
+    // （Linux 报 ENOTDIR，Windows 报 "The directory name is invalid"）。
+    // 之前用 `/proc/...` 模拟不可写，只在 Linux 有效（Windows 会把 /proc 当作
+    // 相对路径成功创建目录），跨平台做法是利用"路径上存在文件"这一矛盾。
+    let tmp = tempfile::NamedTempFile::new().expect("NamedTempFile::new");
+    let bogus_file = tmp.path().to_path_buf();
+    // workspace 指向该文件下的子路径，即父目录是一个文件而非目录。
+    let bogus = bogus_file.join("workspace");
     let task = Task::new(Task::generate_id(), "创建 hello.py 输出 hello".into());
-    let ctx = StepContext::new(bogus, task);
+    let ctx = StepContext::new(&bogus, task);
     let out = Worker.run(&ctx);
     assert!(!out.result.success, "should fail on unwritable workspace");
     assert!(
-        out.result.summary.contains("写文件失败") || out.result.summary.contains("创建目录失败")
+        out.result.summary.contains("写文件失败") || out.result.summary.contains("创建目录失败"),
+        "summary should mention write/create-dir failure, got: {}",
+        out.result.summary
     );
 }
 

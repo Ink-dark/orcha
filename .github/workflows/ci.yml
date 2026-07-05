@@ -30,6 +30,14 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # M3 golden tasks / Tester Agent 需要 python 来跑 test.py。
+      # Windows runner 默认不自带 Python，必须显式安装；Linux runner 通常带 python3，
+      # 但也统一用 setup-python 保证版本一致。
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
       - name: Print toolchain
         run: |
           rustc --version

@@ -299,7 +299,7 @@ fn build_fix_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orcha_core::HistoryStore;
+    use orcha_core::{find_python, HistoryStore};
     use std::fs;
     use tempfile::tempdir;
 
@@ -307,6 +307,10 @@ mod tests {
     /// Task 落到 DONE，history 文件非空，退出码 0。
     #[test]
     fn fix_cli_succeeds_and_marks_task_done() {
+        if find_python().is_none() {
+            eprintln!("skipping: no python interpreter on PATH");
+            return;
+        }
         let home = tempdir().unwrap();
         let ws = tempdir().unwrap();
         fs::write(
@@ -346,6 +350,10 @@ mod tests {
     /// GT-CLI-2: workspace 空白，Fixer 第 1 轮创建 test.py，第 2 轮才成功。
     #[test]
     fn fix_cli_succeeds_via_fixer_in_round_2() {
+        if find_python().is_none() {
+            eprintln!("skipping: no python interpreter on PATH");
+            return;
+        }
         let home = tempdir().unwrap();
         let ws = tempdir().unwrap();
         // workspace 完全空。
@@ -424,6 +432,10 @@ mod tests {
     /// build_fix_result 在 Success / Failed 两种路径都应产出合法 JSON。
     #[test]
     fn build_fix_result_serializes_both_outcomes() {
+        if find_python().is_none() {
+            eprintln!("skipping: no python interpreter on PATH");
+            return;
+        }
         // Success path：构造一个最小 outcome。
         // 由于 CycleOutcome 字段较多，这里通过真实跑一遍来拿。
         let home = tempdir().unwrap();

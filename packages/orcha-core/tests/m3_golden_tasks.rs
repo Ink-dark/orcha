@@ -16,7 +16,8 @@ use std::fs;
 use std::time::Duration;
 
 use orcha_core::{
-    CycleConfig, CycleOutcome, Cycleround, FailureReason, FileHistoryStore, HistoryStore,
+    find_python, CycleConfig, CycleOutcome, Cycleround, FailureReason, FileHistoryStore,
+    HistoryStore,
 };
 use orcha_sdk::Task;
 
@@ -28,6 +29,10 @@ use orcha_sdk::Task;
 /// Cycleround 单轮即闭环成功，且 history 落盘可追溯。
 #[test]
 fn golden_task_1_create_with_preexisting_test_succeeds_in_round_1() {
+    if find_python().is_none() {
+        eprintln!("skipping: no python interpreter on PATH");
+        return;
+    }
     let ws = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
 
@@ -119,6 +124,10 @@ fn golden_task_1_create_with_preexisting_test_succeeds_in_round_1() {
 /// 这条路径验证 Cycleround 的多轮迭代能力 + Fixer 的修复效果。
 #[test]
 fn golden_task_2_fixer_creates_test_py_succeeds_in_round_2() {
+    if find_python().is_none() {
+        eprintln!("skipping: no python interpreter on PATH");
+        return;
+    }
     let ws = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
 

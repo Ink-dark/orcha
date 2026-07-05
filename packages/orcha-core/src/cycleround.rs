@@ -335,6 +335,13 @@ fn steps_as_steps(_steps: &[StepResult]) -> Vec<Step> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sub_agents::find_python;
+
+    /// 测试辅助：作为测试的第一条语句调用。若环境无 Python 解释器则提前 return
+    /// （避免在无 Python 的机器上 Tester 执行失败导致本该 Success 的测试变成 Failed）。
+    /// 调用处写成 `if find_python().is_none() { eprintln!("skipping: ..."); return; }`，
+    /// 保留内联形式是因为 Rust 测试函数的 return 类型是 `()`，无法用 helper 统一 return。
+    fn _require_python_guard_note() {}
 
     #[test]
     fn cycle_config_default_matches_registration_post() {
@@ -350,6 +357,10 @@ mod tests {
 
     #[test]
     fn cycleround_succeeds_on_first_round_for_hello_task() {
+        if find_python().is_none() {
+            eprintln!("skipping: no python interpreter on PATH");
+            return;
+        }
         let ws = tempfile::tempdir().unwrap();
         // 预置 test.py：assert hello.py 内容为 'hello'。
         // 这样 Worker 写完 hello.py 后 Tester 跑 python3 test.py 才会通过。
@@ -452,6 +463,10 @@ mod tests {
 
     #[test]
     fn cycleround_succeeds_after_fixer_creates_test_framework() {
+        if find_python().is_none() {
+            eprintln!("skipping: no python interpreter on PATH");
+            return;
+        }
         // 没有 test.py / Cargo.toml / pytest.ini：第一轮 Tester 会因「未检测到测试框架」失败。
         // Fixer 应在第一轮末尾创建 test.py，第二轮 Tester 通过、Reviewer 通过、任务成功。
         let ws = tempfile::tempdir().unwrap();
@@ -629,6 +644,10 @@ mod tests {
 
     #[test]
     fn run_with_history_persists_rounds_for_successful_run() {
+        if find_python().is_none() {
+            eprintln!("skipping: no python interpreter on PATH");
+            return;
+        }
         // 成功路径：第一轮 5 步全成功，应写入 1 条 RoundRecord。
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -670,6 +689,10 @@ mod tests {
 
     #[test]
     fn run_with_history_persists_failed_rounds_with_fixer() {
+        if find_python().is_none() {
+            eprintln!("skipping: no python interpreter on PATH");
+            return;
+        }
         // 失败路径：Tester 失败 → Fixer 创建 test.py → 第二轮成功。
         // 应持久化 2 条 RoundRecord，第一条含 Fixer 步骤。
         let ws = tempfile::tempdir().unwrap();
@@ -710,6 +733,10 @@ mod tests {
 
     #[test]
     fn run_with_history_clears_old_history_on_rerun() {
+        if find_python().is_none() {
+            eprintln!("skipping: no python interpreter on PATH");
+            return;
+        }
         // 第二次 run_with_history 应清空第一次的 history，不混合。
         let ws1 = tempfile::tempdir().unwrap();
         std::fs::write(

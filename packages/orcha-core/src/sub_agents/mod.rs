@@ -280,7 +280,9 @@ pub(crate) fn detect_test_command(workspace: &Path) -> Option<TestCommand> {
 }
 
 /// 在 PATH 中寻找可用的 Python 解释器。M3 确定性实现：依次试 `python3` / `python`。
-pub(crate) fn find_python() -> Option<String> {
+///
+/// `pub` 以便集成测试与 CLI 层复用（判定环境是否支持运行 test.py）。
+pub fn find_python() -> Option<String> {
     for cmd in ["python3", "python"] {
         let ok = Command::new(cmd)
             .arg("--version")
