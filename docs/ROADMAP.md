@@ -18,7 +18,7 @@
 | **M3** | [Cycleround 闭环](#m3--cycleround-闭环-mvp-完成) | Phase 1 | ✅ | 闭环修复样例 bug |
 | **M4** | [状态持久化](#m4--状态持久化) | Phase 2 | ✅ | 重启后任务可恢复 |
 | **M5** | [Web UI Shell + HTTP API](#m5--web-ui-shell--http-api) | Phase 2 | — | Web UI + JSON API 可观测任务 |
-| **M6** | [飞书 Adapter](#m6--飞书-adapter首选-im-入口) | Phase 2 | — | 飞书 @Orcha 触发并回传 |
+| **M6** | [IM Gateway（飞书 / QQ 长连接）](#m6--im-gateway飞书--qq-长连接) | Phase 2 | — | 飞书/QQ @Orcha 长连接触发并实时回传 |
 | **M7** | [Plugin 子代理体系](#m7--plugin-子代理体系) | Phase 3 | — | 第三方可注册 Sub-Agent |
 | **M8** | [Self-Evolve](#m8--self-evolve) | Phase 4 | — | Orcha 提交自身调度 PR |
 
@@ -152,18 +152,24 @@
 
 ---
 
-## M6 — 飞书 Adapter（首选 IM 入口）
+## M6 — IM Gateway（飞书 / QQ 长连接）
 
-**目标**：真实 IM 接入，验证 Web UI HTTP API 对外的可用性。按报名帖定位，飞书为首选 IM 渠道；Slack 作为后续扩展。
+**目标**：通过各平台官方 SDK 的**长连接**接入 IM，提供实时交互体验（体感对标 OpenClaw）。@Orcha 触发任务后，进度经长连接实时推送回原会话，无需公网回调地址、无需 HTTP 轮询。
 
-**交付物**：飞书机器人事件回调 → 转发到 Web UI HTTP API（`POST /api/tasks`）触发任务；执行进度通过交互卡片回传原会话。
+**交付物**：
+- 飞书 SDK 长连接接入（WebSocket 接收事件，免公网 webhook）
+- QQ SDK 长连接接入
+- 会话级状态管理：@Orcha 触发 Cycleround，进度/产物经长连接回传原会话
+- 鉴权与白名单群校验
 
 **验收（可验证）**：
-- [ ] 飞书群 `@Orcha fix <issue>` 触发任务（事件订阅收到 `im.message.receive_v1`，转为 `POST /api/tasks`）
-- [ ] 流式进度与最终响应回传到原会话（交互卡片 + 文本消息）
-- [ ] 产物 / Artifact 链接在飞书中可点击展开
+- [ ] 飞书通过 SDK 长连接接收 `@Orcha fix <issue>` 并触发 Cycleround
+- [ ] QQ 通过 SDK 长连接接收并触发任务
+- [ ] 执行进度经长连接实时回传原会话（非 HTTP 轮询，体感对标 OpenClaw）
+- [ ] 产物 / Artifact 链接在 IM 中可点击展开
 - [ ] 私有群权限校验生效（机器人仅在白名单群内响应）
-- [ ] （可选扩展）Slack 复用同一 HTTP API 接入路径
+- [ ] 多会话并发互不干扰
+- [ ] （可选扩展）Slack 等其他 IM 复用同一长连接接入模式
 
 ---
 

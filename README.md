@@ -7,18 +7,19 @@
 
 ### 1. 系统概览 (System Overview)
 
-Orcha 是一个**基于命令行的自动化编码操作系统**，采用 **Control Plane (控制面)** 与 **Data Plane (数据面)** 分离架构，通过 Shell 网关接入飞书 / Slack 等 IM 机器人。用户在聊天窗口一句话发起复杂编码任务，系统自动拆解、执行、验证、循环优化，直到真正完成。
+Orcha 是一个**基于命令行的自动化编码操作系统**，采用 **Control Plane (控制面)** 与 **Data Plane (数据面)** 分离架构。Shell 层提供 Web UI + HTTP API（M5，已实现），Gateway 层通过各 IM 平台官方 SDK 长连接接入飞书 / QQ（M6，体感对标 OpenClaw，实时交互非轮询）。用户在聊天窗口一句话发起复杂编码任务，系统自动拆解、执行、验证、循环优化，直到真正完成。
 
 **目标用户**：中小团队的技术负责人、独立开发者、开源项目维护者——需要频繁处理"小而杂"的编码任务，但不想在工具切换和重复执行上浪费时间的人。
 
 - **Orcha Core**: 大脑，负责运行 Cycleround 工作流。
-- **Orcha Shell**: Web UI + HTTP API 服务器，提供任务可视化与 JSON API（飞书 / Slack 等 IM 经 HTTP API 接入）。
+- **Orcha Shell**: Web UI + HTTP API 服务器，提供任务可视化与 JSON API（M5，已实现）。
+- **IM Gateway**: 通过飞书 / QQ 官方 SDK 长连接接入 IM，实时收发消息（M6，体感对标 OpenClaw）。
 - **Sub-Agents**: 乐手，负责执行具体的 Plan / Code / Test / Review。
 
 ```
 ┌─────────────────────────────────────────────┐
-│                Orcha Shell                  │
-│  (飞书 / Slack / API / Webhook / CLI)       │
+│  IM Gateway (M6)  /  Orcha Shell (M5)       │
+│  飞书/QQ SDK 长连接   |   Web UI + HTTP API │
 └─────────────────────┬───────────────────────┘
                       │ Dispatch
 ┌─────────────────────▼───────────────────────┐
@@ -66,7 +67,7 @@ LOOP:
 
 ### 3. Orcha Shell Web UI 规范 (Web UI Spec)
 
-Shell 以 `tiny_http` 同步 HTTP server 提供可视化 Web UI 与 JSON API，无异步运行时；CSS/JS 经 `include_str!` 编入二进制，实现单文件部署。外部 IM（飞书 / Slack）接入时通过 JSON API 触发任务并轮询状态，无需实现额外 Adapter 接口。
+Shell 以 `tiny_http` 同步 HTTP server 提供可视化 Web UI 与 JSON API，无异步运行时；CSS/JS 经 `include_str!` 编入二进制，实现单文件部署。本节描述 Shell（M5）的对外接口；IM 接入（飞书 / QQ 长连接）见 [M6](docs/ROADMAP.md#m6--im-gateway飞书--qq-长连接)，走各平台官方 SDK 长连接，不走本节 JSON API。
 
 #### 3.1 页面路由
 
@@ -180,7 +181,7 @@ orcha shell --port 7421             # 启动 Web UI / HTTP 服务器（D3）
 | M3 | Cycleround 闭环 | Phase 1 | ✅ |
 | M4 | 状态持久化 | Phase 2 | — |
 | M5 | Web UI Shell + HTTP API | Phase 2 | — |
-| M6 | 飞书 Adapter | Phase 2 | — |
+| M6 | IM Gateway（飞书/QQ 长连接） | Phase 2 | — |
 | M7 | Plugin 子代理体系 | Phase 3 | — |
 | M8 | Self-Evolve | Phase 4 | — |
 
