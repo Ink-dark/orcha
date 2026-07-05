@@ -34,6 +34,7 @@ fn task_status_round_trips_through_json() {
             status,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            version: 0,
         };
         let j = serde_json::to_string(&task).unwrap();
         let back: Task = serde_json::from_str(&j).unwrap();

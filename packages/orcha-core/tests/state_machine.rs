@@ -125,6 +125,7 @@ fn invalid_transition_error_carries_context() {
         status: TaskStatus::Pending,
         created_at: Utc::now(),
         updated_at: Utc::now(),
+        version: 0,
     };
     let err = transition(&mut task, TaskStatus::Done).unwrap_err();
     let msg = err.to_string();

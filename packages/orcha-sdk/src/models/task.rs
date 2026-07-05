@@ -57,10 +57,17 @@ pub struct Task {
     pub created_at: DateTime<Utc>,
     /// 最近一次状态变更时间（UTC）。
     pub updated_at: DateTime<Utc>,
+    /// 乐观锁版本号（M4 持久化引入）。
+    ///
+    /// 每次 `update_with_version` 会校验落盘版本号与调用方持有的版本号一致，
+    /// 一致才写入并把版本号 +1；不一致返回 `VersionConflict` 错误。
+    /// 新建 Task 时初始化为 0；旧文件无此字段时反序列化默认为 0（向后兼容）。
+    #[serde(default)]
+    pub version: u64,
 }
 
 impl Task {
-    /// 以给定 id 与描述构造一个 `Pending` 任务，时间戳取当前 UTC。
+    /// 以给定 id 与描述构造一个 `Pending` 任务，时间戳取当前 UTC，version=0。
     pub fn new(id: String, description: String) -> Self {
         let now = Utc::now();
         Self {
@@ -69,6 +76,7 @@ impl Task {
             status: TaskStatus::Pending,
             created_at: now,
             updated_at: now,
+            version: 0,
         }
     }
 

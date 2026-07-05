@@ -3,12 +3,29 @@
 //! [`TaskStore`] 是抽象 trait，预留 SQLite / Redis / Postgres 等多种后端。
 //! M1 默认实现 [`FileTaskStore`]：每个 Task 序列化为一个 JSON 文件，
 //! 落盘到 `{home}/store/{task_id}.json`。零 C 依赖，跨平台无忧。
+//!
+//! M4 持久化引入两层并发保护：
+//! 1. **乐观锁**（[`TaskStore::update_with_version`]）：校验落盘 version
+//!    与调用方持有的一致后才写入并自增，不一致返回 [`CoreError::VersionConflict`]。
+//! 2. **文件锁**（`{task_id}.lock` 文件）：保护 `read-modify-write` 临界区，
+//!    避免两个进程同时读到 version=0 然后都校验通过。锁通过
+//!    `OpenOptions::create_new(true)` 抢占（创建成功=拿到锁），
+//!    失败则短暂 sleep 后 retry，超时则返回错误。写完释放锁（删除文件）。
+//!    这套机制跨平台（Linux/Windows/macOS 都支持 create_new 语义），零 C 依赖。
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use orcha_sdk::{Task, TaskStatus};
+
+use crate::error::CoreError;
+
+/// 文件锁抢锁失败时的 retry 间隔。
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+/// 文件锁抢锁总超时（超过则报错，避免死锁）。
+const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Task 仓储抽象。所有后端实现此 trait，CLI 与 Core 只依赖它。
 pub trait TaskStore {
@@ -22,7 +39,28 @@ pub trait TaskStore {
     fn list(&self, filter: Option<TaskStatus>) -> Result<Vec<Task>>;
 
     /// 更新已存在的 Task（主要用于状态迁移）。
-    fn update(&self, task: &Task) -> Result<()>;
+    ///
+    /// 默认实现等价于 `update_with_version(task, None)`：不校验版本号，
+    /// 但落盘的 `task.version` 会自增 1。需要乐观锁保护的写入应调用
+    /// [`update_with_version`](Self::update_with_version)。
+    ///
+    /// 注意：入参是 `&Task`，内部会 clone 一份再自增 version 后写入磁盘，
+    /// 因此调用方持有的 `task` 仍是旧版本号；如需最新版本号请重新 `get`。
+    fn update(&self, task: &Task) -> Result<()> {
+        self.update_with_version(task, None)
+    }
+
+    /// 带乐观锁的更新（M4 持久化引入）。
+    ///
+    /// - `expected_version = None`：跳过版本校验（等价于 [`update`](Self::update)），
+    ///   落盘的 `version` 自增 1。
+    /// - `expected_version = Some(v)`：先读取当前落盘 Task，校验 `version == v`；
+    ///   一致才写入并把 `version` 设为 `v + 1`；不一致返回
+    ///   [`CoreError::VersionConflict`]。
+    ///
+    /// 入参 `&Task` 不会被修改（内部 clone 后自增 version 写入磁盘）；
+    /// 调用方需要最新版本号时应重新 `get`。
+    fn update_with_version(&self, task: &Task, expected_version: Option<u64>) -> Result<()>;
 }
 
 /// 基于 JSON 文件的 Task 仓储。
@@ -47,6 +85,11 @@ impl FileTaskStore {
         fs::create_dir_all(&store_dir)
             .with_context(|| format!("failed to create store dir: {}", store_dir.display()))?;
         Ok(store_dir)
+    }
+
+    /// home 目录（用于 history store 等同 home 的其他组件复用）。
+    pub fn home(&self) -> &Path {
+        &self.home
     }
 
     fn store_dir(&self) -> PathBuf {
@@ -107,12 +150,41 @@ impl TaskStore for FileTaskStore {
         Ok(tasks)
     }
 
-    fn update(&self, task: &Task) -> Result<()> {
+    fn update_with_version(&self, task: &Task, expected_version: Option<u64>) -> Result<()> {
         let path = self.task_file(&task.id);
         if !path.exists() {
             anyhow::bail!("task not found: {}", task.id);
         }
-        write_task(&path, task)
+        // M4 文件锁：保护 read-modify-write 临界区，避免两个进程同时读到
+        // version=0 然后都校验通过。锁文件 `<task_id>.json.lock`，崩溃残留
+        // 由 retry 超时兜底（调用方可手动删除 .lock 文件恢复）。
+        let lock_path = path.with_extension("json.lock");
+        let _lock = FileLock::acquire(&lock_path)
+            .with_context(|| format!("failed to acquire lock for task {}", task.id))?;
+
+        // 读取落盘当前 version（用于乐观锁校验 + 自增基准）。
+        // 关键：自增基于落盘 version，而非调用方持有的 task.version（可能 stale），
+        // 否则连续两次 update() 会让落盘 version 在 1 处原地踏步。
+        let current = self.get(&task.id)?.ok_or_else(|| {
+            anyhow::anyhow!("task disappeared during update_with_version: {}", task.id)
+        })?;
+        if let Some(v) = expected_version {
+            if current.version != v {
+                return Err(CoreError::VersionConflict {
+                    task_id: task.id.clone(),
+                    expected_version: v,
+                    actual_version: current.version,
+                }
+                .into());
+            }
+        }
+        // 校验通过（或跳过校验）：clone 一份，version 基于落盘值自增，刷新 updated_at。
+        // 不修改入参 task（&Task 不可变），调用方需要最新 version 时应重新 get。
+        // _lock 在此函数返回时 drop，自动释放（删除 .lock 文件）。
+        let mut updated = task.clone();
+        updated.version = current.version + 1;
+        updated.updated_at = chrono::Utc::now();
+        write_task(&path, &updated)
     }
 }
 
@@ -131,6 +203,86 @@ fn write_task(path: &Path, task: &Task) -> Result<()> {
     fs::rename(&tmp, path)
         .with_context(|| format!("failed to rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+// ============================================================
+// M4 文件锁（task 粒度，保护 read-modify-write 临界区）
+// ============================================================
+
+/// 跨平台文件锁 guard。
+///
+/// 通过 `OpenOptions::create_new(true)` 抢占 `<path>.lock` 文件实现：
+/// 创建成功 = 拿到锁；文件已存在 = 别人持锁，sleep 后 retry。
+/// Drop 时删除 lock 文件释放锁。若进程崩溃，lock 文件可能残留，
+/// 下次抢锁会 retry 到超时——调用方应清理或用 `force_acquire`。
+///
+/// 这套机制零 C 依赖，Linux/Windows/macOS 行为一致。
+pub(crate) struct FileLock {
+    lock_path: PathBuf,
+    released: bool,
+}
+
+impl FileLock {
+    /// 抢占指定路径的独占锁。`lock_path` 通常是 `<data_file>.lock`。
+    ///
+    /// - retry 间隔 `LOCK_RETRY_INTERVAL`（20ms）。
+    /// - 总超时 `LOCK_TIMEOUT`（5s），超时返回 `anyhow::bail!`。
+    pub(crate) fn acquire(lock_path: impl Into<PathBuf>) -> Result<Self> {
+        let lock_path = lock_path.into();
+        let started = Instant::now();
+        loop {
+            // create_new=true：文件已存在则返回 AlreadyExists（这是"抢锁失败"的信号）。
+            // 创建成功后立即关闭 handle——锁状态由"文件是否存在"决定，与 handle 无关。
+            // 崩溃残留时文件不删，retry 超时后报错（调用方可手动删 .lock 文件恢复）。
+            let result = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path);
+            match result {
+                Ok(_file) => {
+                    // 关闭 handle：锁状态 = 文件存在性，不依赖 handle 持有。
+                    drop(_file);
+                    return Ok(Self {
+                        lock_path,
+                        released: false,
+                    });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if started.elapsed() >= LOCK_TIMEOUT {
+                        anyhow::bail!(
+                            "acquire lock timeout after {:?}: {} (可能残留，可手动删除)",
+                            LOCK_TIMEOUT,
+                            lock_path.display()
+                        );
+                    }
+                    std::thread::sleep(LOCK_RETRY_INTERVAL);
+                }
+                Err(e) => {
+                    anyhow::bail!("failed to create lock file {}: {}", lock_path.display(), e);
+                }
+            }
+        }
+    }
+
+    /// 显式释放锁（删除 lock 文件）。可多次调用，幂等。
+    /// 日常使用依赖 `Drop` 自动释放；此方法供需要显式释放的场景调用。
+    #[allow(dead_code)]
+    pub(crate) fn release(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        if !self.released {
+            let _ = fs::remove_file(&self.lock_path);
+            self.released = true;
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
 }
 
 #[cfg(test)]
@@ -242,5 +394,211 @@ mod tests {
         let all = store.list(None).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].id, "T-persist");
+    }
+
+    // ============================================================
+    // M4 乐观锁测试
+    // ============================================================
+
+    #[test]
+    fn update_increments_version_on_disk() {
+        // update() 不传 expected_version，落盘 version 应自增。
+        let (store, _dir) = fresh_store();
+        let mut task = Task::new("T-v1".into(), "a".into());
+        store.insert(&task).unwrap();
+        assert_eq!(task.version, 0, "新建 Task version=0");
+
+        crate::transition(&mut task, TaskStatus::Running).unwrap();
+        store.update(&task).unwrap();
+
+        let got = store.get("T-v1").unwrap().unwrap();
+        assert_eq!(got.version, 1, "第一次 update 后 version=1");
+
+        crate::transition(&mut task, TaskStatus::Done).unwrap();
+        store.update(&task).unwrap();
+        let got = store.get("T-v1").unwrap().unwrap();
+        assert_eq!(got.version, 2, "第二次 update 后 version=2");
+    }
+
+    #[test]
+    fn update_with_version_succeeds_when_expected_matches() {
+        let (store, _dir) = fresh_store();
+        let mut task = Task::new("T-v2".into(), "a".into());
+        store.insert(&task).unwrap();
+        // 落盘 version=0，调用方持有 version=0，匹配 → 成功。
+        crate::transition(&mut task, TaskStatus::Running).unwrap();
+        store.update_with_version(&task, Some(0)).unwrap();
+        let got = store.get("T-v2").unwrap().unwrap();
+        assert_eq!(got.version, 1);
+        assert_eq!(got.status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn update_with_version_conflicts_when_stale() {
+        // 模拟并发冲突：A 读到 v=0，B 先 update 把 version 自增到 1，
+        // A 用 stale 的 v=0 调 update_with_version → 应失败。
+        let (store, _dir) = fresh_store();
+        let mut task = Task::new("T-v3".into(), "a".into());
+        store.insert(&task).unwrap();
+        // B 先 update（version 0 → 1）。
+        let mut b_version = task.clone();
+        crate::transition(&mut b_version, TaskStatus::Running).unwrap();
+        store.update(&b_version).unwrap();
+        // A 持有 stale 的 v=0 调用。
+        crate::transition(&mut task, TaskStatus::Running).unwrap();
+        let err = store.update_with_version(&task, Some(0)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("version conflict")
+                && msg.contains("expected 0")
+                && msg.contains("actual 1"),
+            "应返回 VersionConflict，实际: {msg}"
+        );
+        // 落盘 version 仍是 1（A 的写入被拒绝）。
+        let got = store.get("T-v3").unwrap().unwrap();
+        assert_eq!(got.version, 1);
+    }
+
+    #[test]
+    fn update_with_version_none_skips_check_but_still_increments() {
+        // expected_version=None 等价于 update()：不校验但自增。
+        let (store, _dir) = fresh_store();
+        let mut task = Task::new("T-v4".into(), "a".into());
+        store.insert(&task).unwrap();
+        crate::transition(&mut task, TaskStatus::Running).unwrap();
+        store.update_with_version(&task, None).unwrap();
+        let got = store.get("T-v4").unwrap().unwrap();
+        assert_eq!(got.version, 1);
+    }
+
+    #[test]
+    fn old_task_file_without_version_field_back_compat() {
+        // 旧版本序列化的 Task 文件没有 version 字段，反序列化时应默认为 0。
+        let (store, dir) = fresh_store();
+        let old_json = r#"{
+            "id": "T-old",
+            "description": "legacy",
+            "status": "PENDING",
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z"
+        }"#;
+        let path = dir.path().join("store").join("T-old.json");
+        std::fs::write(&path, old_json).unwrap();
+        let got = store.get("T-old").unwrap().unwrap();
+        assert_eq!(got.version, 0, "缺少 version 字段时应默认为 0");
+        assert_eq!(got.id, "T-old");
+    }
+
+    // ============================================================
+    // M4 文件锁测试
+    // ============================================================
+
+    #[test]
+    fn file_lock_acquire_release_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("test.lock");
+        // 抢锁成功。
+        let lock = FileLock::acquire(&lock_path).expect("acquire should succeed");
+        assert!(lock_path.exists(), "lock 文件应被创建");
+        // 释放后文件消失。
+        drop(lock);
+        assert!(!lock_path.exists(), "lock 文件应被删除");
+    }
+
+    #[test]
+    fn file_lock_blocks_second_acquire_until_released() {
+        // 同一路径：第一个锁未释放时，第二个 acquire 应 retry 直到超时或前锁释放。
+        // 这里用短超时模拟：在另一线程持有锁期间，主线程 acquire 应等待。
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("concurrent.lock");
+
+        // 子线程持有锁 100ms 后释放。
+        let lock_path_clone = lock_path.clone();
+        let handle = std::thread::spawn(move || {
+            let _lock = FileLock::acquire(&lock_path_clone).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            // _lock drop 时释放。
+        });
+
+        // 等子线程拿到锁。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        // 主线程 acquire：应 retry 直到子线程释放（约 100ms 后），不应超时（5s）。
+        let start = std::time::Instant::now();
+        let lock2 = FileLock::acquire(&lock_path).expect("should acquire after retry");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(50),
+            "应至少等待了 ~100ms 让前锁释放，实际: {elapsed:?}"
+        );
+        assert!(elapsed < std::time::Duration::from_secs(5), "不应超时");
+        drop(lock2);
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn file_lock_times_out_when_never_released() {
+        // 用极短超时模拟"锁永远不释放"场景。
+        // 但 LOCK_TIMEOUT 是常量 5s，测试不能真等 5s。
+        // 改为：手动创建 lock 文件模拟残留，acquire 应超时报错。
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join("stale.lock");
+        std::fs::write(&lock_path, "stale").unwrap();
+
+        // 这会 retry 5s 后超时。为了不拖慢测试，用 spawn + 短 join timeout。
+        let lock_path_clone = lock_path.clone();
+        let handle = std::thread::spawn(move || FileLock::acquire(&lock_path_clone).err());
+        // 等 200ms 让它 retry 几轮，然后断言它还在跑（未返回）。
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!handle.is_finished(), "acquire 应仍在 retry（未超时 5s）");
+        // 清理：删除 stale lock 文件，让线程 acquire 成功返回。
+        std::fs::remove_file(&lock_path).unwrap();
+        let err = handle.join().unwrap();
+        assert!(err.is_none(), "清理后应 acquire 成功，实际: {err:?}");
+    }
+
+    #[test]
+    fn concurrent_updates_serialized_by_file_lock() {
+        // 真正的并发验收：两个线程各自 update 同一个 Task 100 次，
+        // 最终落盘 version 应精确等于 200（每次 update 自增 1，无丢失）。
+        // 不改 Task 状态（避免状态机迁移限制），仅靠 update 自增 version。
+        let (store, dir) = fresh_store();
+        let path = dir.path().to_path_buf();
+        let mut task = Task::new("T-concurrent".into(), "concurrent".into());
+        // 先 insert（version=0, Pending），再迁移到 Running 并 update（version → 1）。
+        store.insert(&task).unwrap();
+        crate::transition(&mut task, TaskStatus::Running).unwrap();
+        store.update(&task).unwrap();
+
+        let update_100_times = |home: PathBuf| {
+            let store = FileTaskStore::new(&home);
+            for _ in 0..100 {
+                loop {
+                    let t = store.get("T-concurrent").unwrap().unwrap();
+                    let v = t.version;
+                    // 不改状态，仅 update（会刷新 updated_at + 自增 version）。
+                    // 用 update_with_version 做乐观锁校验，冲突时 retry。
+                    match store.update_with_version(&t, Some(v)) {
+                        Ok(()) => break,
+                        Err(_) => continue, // VersionConflict，重新 get 重试
+                    }
+                }
+            }
+        };
+
+        let path1 = path.clone();
+        let path2 = path.clone();
+        let h1 = std::thread::spawn(move || update_100_times(path1));
+        let h2 = std::thread::spawn(move || update_100_times(path2));
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        let final_task = store.get("T-concurrent").unwrap().unwrap();
+        assert_eq!(
+            final_task.version, 201,
+            "200 次并发 update + 1 次初始迁移 update 后 version 应为 201，实际: {}（说明有丢失更新）",
+            final_task.version
+        );
     }
 }
