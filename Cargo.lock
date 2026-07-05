@@ -333,6 +333,7 @@ name = "orcha-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "orcha-core",
  "orcha-sdk",
