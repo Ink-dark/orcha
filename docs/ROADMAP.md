@@ -17,7 +17,7 @@
 | **M2** | [单步 Sub-Agent 执行](#m2--单步-sub-agent-执行) | Phase 1 | ✅ | 单任务跑通并产出 diff |
 | **M3** | [Cycleround 闭环](#m3--cycleround-闭环-mvp-完成) | Phase 1 | ✅ | 闭环修复样例 bug |
 | **M4** | [状态持久化](#m4--状态持久化) | Phase 2 | ✅ | 重启后任务可恢复 |
-| **M5** | [Gateway Shell + HTTP/CLI 触发](#m5--gateway-shell--httpcli-触发) | Phase 2 | — | HTTP API 可触发任务 |
+| **M5** | [Gateway Shell + HTTP/CLI 触发](#m5--gateway-shell--httpcli-触发) | Phase 2 | ✅ | HTTP API 可触发任务 |
 | **M6** | [飞书 Adapter](#m6--飞书-adapter首选-im-入口) | Phase 2 | — | 飞书 @Orcha 触发并回传 |
 | **M7** | [Plugin 子代理体系](#m7--plugin-子代理体系) | Phase 3 | — | 第三方可注册 Sub-Agent |
 | **M8** | [Self-Evolve](#m8--self-evolve) | Phase 4 | — | Orcha 提交自身调度 PR |
@@ -136,11 +136,11 @@
 **交付物**：`orcha-shell` HTTP server + `ShellAdapter` 接口 + 鉴权中间件
 
 **验收（可验证）**：
-- [ ] `POST /run`（携带 API Key）接收 `OrchaEvent`，返回 `event_id`
-- [ ] `GET /status/{event_id}` 返回 `OrchaResponse`（`STREAMING | FINAL | ERROR`）
-- [ ] 无 API Key 请求返回 `401`
-- [ ] 至少一个 Adapter（CLI 适配器）端到端跑通
-- [ ] `orcha shell list` 列出已注册 Adapter
+- [x] `POST /run`（携带 API Key）接收 `OrchaEvent`，返回 `event_id`
+- [x] `GET /status/{event_id}` 返回 `OrchaResponse`（`STREAMING | FINAL | ERROR`）
+- [x] 无 API Key 请求返回 `401`
+- [x] 至少一个 Adapter（CLI 适配器）端到端跑通
+- [x] `orcha shell list` 列出已注册 Adapter
 
 ---
 
