@@ -17,7 +17,7 @@
 | **M2** | [单步 Sub-Agent 执行](#m2--单步-sub-agent-执行) | Phase 1 | ✅ | 单任务跑通并产出 diff |
 | **M3** | [Cycleround 闭环](#m3--cycleround-闭环-mvp-完成) | Phase 1 | ✅ | 闭环修复样例 bug |
 | **M4** | [状态持久化](#m4--状态持久化) | Phase 2 | ✅ | 重启后任务可恢复 |
-| **M5** | [Gateway Shell + HTTP/CLI 触发](#m5--gateway-shell--httpcli-触发) | Phase 2 | — | HTTP API 可触发任务 |
+| **M5** | [Web UI Shell + HTTP API](#m5--web-ui-shell--http-api) | Phase 2 | — | Web UI + JSON API 可观测任务 |
 | **M6** | [飞书 Adapter](#m6--飞书-adapter首选-im-入口) | Phase 2 | — | 飞书 @Orcha 触发并回传 |
 | **M7** | [Plugin 子代理体系](#m7--plugin-子代理体系) | Phase 3 | — | 第三方可注册 Sub-Agent |
 | **M8** | [Self-Evolve](#m8--self-evolve) | Phase 4 | — | Orcha 提交自身调度 PR |
@@ -129,33 +129,41 @@
 
 ---
 
-## M5 — Gateway Shell + HTTP/CLI 触发
+## M5 — Web UI Shell + HTTP API
 
-**目标**：标准化外部入口，与 IM 解耦。
+**目标**：提供可视化 Web UI 与 JSON API，外部可触发任务并观测执行过程，取代早期 Gateway Adapter 抽象。
 
-**交付物**：`orcha-shell` HTTP server + `ShellAdapter` 接口 + 鉴权中间件
+**交付物**：
+- 基于 `tiny_http` 的同步 Web UI server（`orcha-shell` crate，无异步运行时；CSS/JS 经 `include_str!` 编入二进制，单文件部署）
+- 多页面前端（任务列表 / 任务详情 / history 时间线 / LLM memory 标签页，原生 JS 无构建）
+- JSON API 端点（`/api/tasks`、`/api/tasks/summary`、`/api/tasks/:id`、`/api/tasks/:id/history`、`/api/tasks/:id/memory`）
+- `orcha shell --port` 一键启动 + `scripts/web-demo.sh` 一键演示脚本
 
 **验收（可验证）**：
-- [ ] `POST /run`（携带 API Key）接收 `OrchaEvent`，返回 `event_id`
-- [ ] `GET /status/{event_id}` 返回 `OrchaResponse`（`STREAMING | FINAL | ERROR`）
-- [ ] 无 API Key 请求返回 `401`
-- [ ] 至少一个 Adapter（CLI 适配器）端到端跑通
-- [ ] `orcha shell list` 列出已注册 Adapter
+- [x] `orcha shell --port 7421` 启动后浏览器可访问任务列表 / 任务详情 / history 时间线
+  （`packages/orcha-shell/src/server.rs` 路由 `/`、`/tasks/:id`、`/tasks/:id/history`）
+- [x] `GET /api/tasks` 返回任务列表 JSON，`GET /api/tasks/summary` 返回状态统计
+  （`server::tests::list_tasks_serializes_rows`、`server::tests::stats_counts_by_status` 单测覆盖）
+- [x] `GET /api/tasks/:id/history` 返回 `Vec<RoundRecord>`，`GET /api/tasks/:id/memory` 返回 LLM 对话历史
+  （`server::tests::memory_endpoint_returns_empty_for_unknown_task` 覆盖空 task 不报错路径）
+- [x] 未知路由返回 404
+  （`server::tests::route_returns_404_for_unknown_path` 单测覆盖）
+- [x] `./scripts/web-demo.sh` 一键跑起 Web UI 并种出 2 个 DONE task + history + artifacts
 
 ---
 
 ## M6 — 飞书 Adapter（首选 IM 入口）
 
-**目标**：真实 IM 接入验证 Shell 抽象。按报名帖定位，飞书为首选 IM 渠道；Slack 作为后续扩展。
+**目标**：真实 IM 接入，验证 Web UI HTTP API 对外的可用性。按报名帖定位，飞书为首选 IM 渠道；Slack 作为后续扩展。
 
-**交付物**：`LarkShellAdapter`（基于飞书开放平台机器人事件回调）+ 卡片消息渲染
+**交付物**：飞书机器人事件回调 → 转发到 Web UI HTTP API（`POST /api/tasks`）触发任务；执行进度通过交互卡片回传原会话。
 
 **验收（可验证）**：
-- [ ] 飞书群 `@Orcha fix <issue>` 触发任务（事件订阅收到 `im.message.receive_v1`）
+- [ ] 飞书群 `@Orcha fix <issue>` 触发任务（事件订阅收到 `im.message.receive_v1`，转为 `POST /api/tasks`）
 - [ ] 流式进度与最终响应回传到原会话（交互卡片 + 文本消息）
 - [ ] 产物 / Artifact 链接在飞书中可点击展开
 - [ ] 私有群权限校验生效（机器人仅在白名单群内响应）
-- [ ] （可选扩展）Slack Adapter 复用同一 `ShellAdapter` 接口接入
+- [ ] （可选扩展）Slack 复用同一 HTTP API 接入路径
 
 ---
 

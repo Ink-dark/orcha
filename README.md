@@ -12,7 +12,7 @@ Orcha 是一个**基于命令行的自动化编码操作系统**，采用 **Cont
 **目标用户**：中小团队的技术负责人、独立开发者、开源项目维护者——需要频繁处理"小而杂"的编码任务，但不想在工具切换和重复执行上浪费时间的人。
 
 - **Orcha Core**: 大脑，负责运行 Cycleround 工作流。
-- **Orcha Shell**: 外壳（Gateway），负责对接 IM（飞书 / Slack 等）和 API。
+- **Orcha Shell**: Web UI + HTTP API 服务器，提供任务可视化与 JSON API（飞书 / Slack 等 IM 经 HTTP API 接入）。
 - **Sub-Agents**: 乐手，负责执行具体的 Plan / Code / Test / Review。
 
 ```
@@ -64,52 +64,27 @@ LOOP:
 
 ---
 
-### 3. Orcha Shell 网关规范 (Gateway Spec)
+### 3. Orcha Shell Web UI 规范 (Web UI Spec)
 
-为了让机器人接入更省事，Shell 必须标准化输入与输出。
+Shell 以 `tiny_http` 同步 HTTP server 提供可视化 Web UI 与 JSON API，无异步运行时；CSS/JS 经 `include_str!` 编入二进制，实现单文件部署。外部 IM（飞书 / Slack）接入时通过 JSON API 触发任务并轮询状态，无需实现额外 Adapter 接口。
 
-#### 3.1 事件模型 (Event Model)
-所有进入 Orcha 的消息必须转换为 `OrchaEvent`。
+#### 3.1 页面路由
 
-```json
-{
-  "event_id": "EVT-xxxx",
-  "source": "slack",
-  "user_id": "U123",
-  "timestamp": 1700000000,
-  "type": "USER_PROMPT",
-  "payload": {
-    "raw_text": "@Orcha fix the bug in auth.py",
-    "attachments": []
-  }
-}
-```
+| 路径 | 页面 |
+| :--- | :--- |
+| `/` | 任务列表（含状态统计） |
+| `/tasks/:id` | 任务详情（Artifacts / History / Memory 标签页） |
+| `/tasks/:id/history` | history 时间线（按轮次展示 steps / artifacts / tokens） |
 
-#### 3.2 响应模型 (Response Model)
-```json
-{
-  "event_id": "EVT-xxxx",
-  "status": "STREAMING | FINAL | ERROR",
-  "content": "正在修复 auth.py...",
-  "artifacts": [
-    { "type": "diff", "url": "..." }
-  ]
-}
-```
+#### 3.2 JSON API
 
-#### 3.3 Adapter 接口 (伪代码)
-所有机器人只需实现此接口：
-
-```python
-class ShellAdapter:
-    def normalize_incoming(self, raw_event) -> OrchaEvent:
-        """将外部消息转为 OrchaEvent"""
-        pass
-
-    def dispatch_outgoing(self, response: OrchaResponse):
-        """将 Orcha 结果发回给用户"""
-        pass
-```
+| 端点 | 返回 |
+| :--- | :--- |
+| `GET /api/tasks` | `[{ id, description, status, created_at }]` |
+| `GET /api/tasks/summary` | `{ total, pending, running, blocked, done, failed }` |
+| `GET /api/tasks/:id` | `{ task, history_count, artifacts }` |
+| `GET /api/tasks/:id/history` | `Vec<RoundRecord>`（每轮 steps / artifacts / tokens） |
+| `GET /api/tasks/:id/memory` | `Vec<MemoryEntry>`（LLM 对话历史，仅 `--llm` 路径有数据） |
 
 ---
 
@@ -172,17 +147,23 @@ PENDING -> RUNNING -> (BLOCKED <-> RUNNING) -> DONE
 
 ```bash
 # 系统管理
-orcha init <repo>
-orcha status [task_id]
+orcha init                          # 初始化 ./orcha home
+orcha status [task_id]              # 查看任务状态（JSON）
+orcha list [--status <STATUS>]      # 列出任务
+orcha schema --export > schema.json # 导出全部数据模型 JSON Schema
 
-# 任务触发
-orcha run "Implement user login"
-orcha fix <issue_url>
+# 任务执行
+orcha run "<desc>"                  # 创建任务（不执行）
+orcha fix "<desc>" [--workspace <dir>] [--max-rounds N] [--max-retries N] [--llm]
+                                    # 跑 Cycleround 闭环（--llm 走 LLM 驱动路径）
+orcha recover [--strategy block|fail]  # 崩溃恢复：中断的 RUNNING Task
 
-# Shell 管理
-orcha shell add slack --token xxx
-orcha shell list
-orcha shell serve [--port 7421]   # 启动 Web UI（D3）
+# 观测
+orcha history <id>                  # 查看某 Task 的全部 RoundRecord
+orcha artifacts <id>                # 聚合某 Task 的全部 Artifact
+
+# Web UI
+orcha shell --port 7421             # 启动 Web UI / HTTP 服务器（D3）
 ```
 
 ---
@@ -198,7 +179,7 @@ orcha shell serve [--port 7421]   # 启动 Web UI（D3）
 | M2 | 单步 Sub-Agent 执行 | Phase 1 | ✅ |
 | M3 | Cycleround 闭环 | Phase 1 | ✅ |
 | M4 | 状态持久化 | Phase 2 | — |
-| M5 | Gateway Shell + HTTP/CLI 触发 | Phase 2 | — |
+| M5 | Web UI Shell + HTTP API | Phase 2 | — |
 | M6 | 飞书 Adapter | Phase 2 | — |
 | M7 | Plugin 子代理体系 | Phase 3 | — |
 | M8 | Self-Evolve | Phase 4 | — |
@@ -247,13 +228,5 @@ cargo build --bin orcha
 ./target/debug/orcha shell --port 7421    # 启动 Web UI
 ```
 
-**JSON API（供脚本 / 外部集成消费）**：
-
-| 端点 | 返回 |
-| :--- | :--- |
-| `GET /api/tasks` | `[{ id, description, status, created_at }]` |
-| `GET /api/tasks/summary` | `{ total, pending, running, blocked, done, failed }` |
-| `GET /api/tasks/:id` | `{ task, history_count, artifacts }` |
-| `GET /api/tasks/:id/history` | `Vec<RoundRecord>`（每轮 steps / artifacts / tokens） |
-| `GET /api/tasks/:id/memory` | `Vec<MemoryEntry>`（D2 LLM 对话历史，仅 `--llm` 路径有数据） |
+**JSON API**：端点清单见 [§3.2](#32-json-api)。
 
