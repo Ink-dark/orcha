@@ -182,6 +182,7 @@ orcha fix <issue_url>
 # Shell 管理
 orcha shell add slack --token xxx
 orcha shell list
+orcha shell serve [--port 7421]   # 启动 Web UI（D3）
 ```
 
 ---
@@ -203,4 +204,56 @@ orcha shell list
 | M8 | Self-Evolve | Phase 4 | — |
 
 > 各 Milestone 的目标、交付物、可验证验收清单及 DoD/追踪约定见 **[docs/ROADMAP.md](docs/ROADMAP.md)**。
+
+---
+
+### 9. Quick Start（D3 Web UI demo）
+
+**前置依赖**：Rust 1.75+、Bash、Python 3（用于 Cycleround 确定性 Tester 子代理）。
+
+**一键跑起来**：
+
+```bash
+./scripts/web-demo.sh
+# 或指定端口 / release 构建：
+./scripts/web-demo.sh --port 8000 --release
+```
+
+脚本会自动：
+1. `cargo build --bin orcha`（首次约 1~2 分钟）
+2. 在临时 home 跑两遍 `orcha fix` 确定性闭环（一个单轮成功、一个 Fixer 第 2 轮修复），种出 2 个 DONE task + history + artifacts
+3. 启动 `orcha shell` Web UI 服务器（默认端口 7421）
+
+浏览器打开 `http://127.0.0.1:7421/` 即可看到任务列表 → 任务详情 → history 时间线 / LLM memory 标签页。Ctrl-C 退出后自动清理临时目录。
+
+**LLM 路径（可选，需 OpenAI 兼容 API Key）**：
+
+```bash
+export ORCHA_LLM_BASE_URL=https://api.openai.com/v1
+export ORCHA_LLM_API_KEY=sk-...
+export ORCHA_LLM_MODEL=gpt-4o-mini
+./scripts/web-demo.sh --llm
+```
+
+`--llm` 会用 `--features orcha-cli/llm` 重编译，再追加一个 `orcha fix --llm` 任务；该任务的 **Memory 标签页**会展示 D2 注入 LLM prompt 的对话历史（per-agent / per-round）。
+
+**手动跑（不用 demo 脚本）**：
+
+```bash
+cargo build --bin orcha
+./target/debug/orcha init                 # 初始化 ./orcha home
+./target/debug/orcha fix --workspace /tmp/ws \
+    "创建 hello.py 输出 hello"             # 跑一遍 Cycleround
+./target/debug/orcha shell --port 7421    # 启动 Web UI
+```
+
+**JSON API（供脚本 / 外部集成消费）**：
+
+| 端点 | 返回 |
+| :--- | :--- |
+| `GET /api/tasks` | `[{ id, description, status, created_at }]` |
+| `GET /api/tasks/summary` | `{ total, pending, running, blocked, done, failed }` |
+| `GET /api/tasks/:id` | `{ task, history_count, artifacts }` |
+| `GET /api/tasks/:id/history` | `Vec<RoundRecord>`（每轮 steps / artifacts / tokens） |
+| `GET /api/tasks/:id/memory` | `Vec<MemoryEntry>`（D2 LLM 对话历史，仅 `--llm` 路径有数据） |
 
