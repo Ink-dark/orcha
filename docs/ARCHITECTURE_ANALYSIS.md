@@ -235,11 +235,40 @@ pub trait LlmClient: Send + Sync {
 - **目标**：飞书/QQ SDK 长连接，Gateway 是触发主入口（一等公民）。
 - **影响**：M6 需新建 crate，技术选型（SDK 直连 vs 统一抽象）你已确认暂不定。
 
+### Gap 9：Reviewer 无跨轮记忆，可被"换写法蒙混"
+- **现状**：[Reviewer](file:///workspace/packages/orcha-core/src/sub_agents/mod.rs) 每轮独立审核，不记得上一轮拒了哪几点。AI 可换种写法绕过同样的拒绝理由。
+- **目标**：Test & QA 是"带状态闸门"——多轮循环中记住上一轮拒了哪几点，AI 不能靠换写法蒙混。
+- **影响**：Reviewer 需注入前序拒绝记录（从 history/memory 读），审核时比对"是否重复犯同一类错"。
+
+### Gap 10：无双向守护与自愈，单点崩全崩
+- **现状**：`orcha-cli` 跑 Cycleround 是单进程，崩了就崩了，无 watchdog、无自动恢复。
+- **目标**：Core ↔ Gateway 互为 watchdog；Gateway AI 常驻做智能诊断（读 crash log → 针对性恢复）；LLM 超时 → IM 通知 → 预设脚本 restart → 恢复再通知的 fallback 降级链。
+- **影响**：M6 需加 watchdog 机制 + 降级链，当前完全没有。
+
+---
+
+## 7.5 底层依据：OpenClaw 反面教材对标
+
+架构决策的底层依据来自 OpenClaw 的 8 个坑（反面教材），每条都映射到 Orcha 的规避设计：
+
+| OpenClaw 坑 | 现象 | Orcha 规避 |
+|-------------|------|-----------|
+| 1. 单进程一崩全崩 | IM 连接和任务执行同进程，任务 panic 带崩 IM 连接 | Core ↔ Gateway 分进程 + 双向 watchdog（决策 5） |
+| 2. npm 原子性 | `npm install` 中断留坏 node_modules，后续全错 | Minicommit + 回滚机制（Cycleround 已有） |
+| 3. Markdown 记忆 | 用 .md 文件记上下文，解析易错且无结构 | JSONL MemoryStore（结构化，已实现） |
+| 4. 盲跑 | 不测试就提交，AI 自欺"搞定了" | Test&QA 带状态闸门，多轮记拒绝点（决策 7） |
+| 5. 路径错乱 | workspace 和执行目录不一致，改错文件 | FsSandbox 隔离 + workspace 绝对路径（M2 已有） |
+| 6. reconnect loop | WS 断线疯狂重连被限流，雪崩 | Gateway 长连接退避 + 降级链（决策 5） |
+| 7. 国产 IM 水土不服 | 飞书/QQ 非 Slack，协议差异大 | Feishu Adapter 独立 TS 进程 fork 官方插件（决策 6） |
+| 8. token 雪崩 | LLM 超时不断重试，token 烧爆 | LLM 超时 → IM 通知 → restart 降级链（决策 5） |
+
+**一句话**：Orcha 的每个架构选择都能在 OpenClaw 的失败案例里找到对应的"如果不这么做会怎样"。
+
 ---
 
 ## 8. 待定问题 → 已决策（2026-07-06）
 
-4 个关键问题已定，M6 执行依据：
+7 项关键决策已定，M6 执行依据：
 
 ### 决策 1：进程模型 → 分进程，存储换 SQLite
 
@@ -306,20 +335,52 @@ pub trait LlmClient: Send + Sync {
   ```
 - **对应 Gap**：Gap 1（部分——调度解耦做了，权限维度后置）
 
+### 决策 5：双向守护与自愈 → Core ↔ Gateway 互为 watchdog + 降级链
+
+- **结论**：Core ↔ Gateway 互为 watchdog；Gateway AI 常驻做智能诊断；LLM 超时触发降级链。
+- **降级链**：LLM 超时 → IM 通知用户"AI 卡住，正在恢复" → 预设脚本 restart → 恢复后再通知"已恢复"。
+- **启动顺序**：外层 init 保进程 → Core 先起 → Gateway 后起（Gateway 依赖 Core 的 Unix Socket 就绪）。
+- **理由**：OpenClaw 单进程一崩全崩（坑 1）+ reconnect loop 雪崩（坑 6）+ token 雪崩（坑 8）的教训。分进程隔离故障域 + watchdog 自愈 + 降级链防雪崩。
+- **对应 Gap**：Gap 10
+
+### 决策 6：Feishu Adapter → 独立 TS 进程，fork 官方插件
+
+- **结论**：飞书接入不 Rust 重撸 WS，而是 fork OpenClaw 官方插件（`larksuite/openclaw-lark`，MIT）当独立 Node/TS 进程，通过 Unix Socket / localhost TCP 接 Rust Gateway。
+- **理由**：OpenClaw "国产 IM 水土不服"（坑 7）的教训——飞书/QQ 非 Slack，协议差异大，Rust 生态缺成熟 SDK，重撸风险高。fork 官方插件复用其 WS 重连/事件解析逻辑，Rust 侧只管业务。
+- **架构**：
+  ```
+  飞书 WS ←→ Feishu Adapter (TS, fork openclaw-lark)
+                     ↓ Unix Socket / localhost TCP
+                orcha-gateway (Rust)
+                     ↓
+                orcha-core (Cycleround)
+  ```
+- **对应 Gap**：Gap 8（Gateway crate 仍要建，但飞书 SDK 接入改为 Adapter 进程）
+
+### 决策 7：Test&QA 带状态闸门 → Reviewer 注入跨轮拒绝记忆
+
+- **结论**：Reviewer 多轮循环中记住上一轮拒了哪几点，AI 不能靠换写法蒙混。
+- **实现方向**：Reviewer 从 history/memory 读前序拒绝记录，审核时比对"是否重复犯同一类错"；重复犯错加重拒绝权重或触发 Fixer。
+- **理由**：OpenClaw "盲跑"（坑 4）的教训——不测试就提交、AI 自欺"搞定了"。带状态闸门强制 AI 真正解决上次的问题，而非绕过。
+- **对应 Gap**：Gap 9
+
 ---
 
 ## 9. M6 执行优先级
 
-| 优先级 | 事项 | 对应 Gap |
+| 优先级 | 事项 | 对应 Gap / 决策 |
 |--------|------|----------|
-| P0 | 新建 `orcha-gateway` crate + Unix Socket 接 Adapter | Gap 8 |
-| P0 | Cycleround 改为 AI 驱动调度 + 事件流 | Gap 2, Gap 4 |
-| P1 | SQLite 替换 FileTaskStore | Gap 6 |
+| P0 | 新建 `orcha-gateway` crate + Unix Socket 接 Feishu Adapter（TS） | Gap 8 / 决策 6 |
+| P0 | Cycleround 改为 AI 驱动调度 + 事件流 | Gap 2, Gap 4 / 决策 2, 3 |
+| P0 | Feishu Adapter TS 进程（fork `openclaw-lark`）接 Gateway | 决策 6 |
+| P0 | 双向 watchdog + 降级链（LLM 超时 → 通知 → restart → 恢复） | Gap 10 / 决策 5 |
+| P1 | SQLite 替换 FileTaskStore | Gap 6 / 决策 1 |
 | P1 | Gateway 任务队列 + worker 池（非阻塞） | Gap 5 |
+| P1 | Reviewer 跨轮拒绝记忆（带状态闸门） | Gap 9 / 决策 7 |
+| P2 | 飞书卡片实时更新（patch card） | Gap 4(消费端) |
 | P2 | SubAgent 调度解耦（trait 不改，调用方改） | Gap 1(部分) |
-| P2 | 飞书卡片实时更新 | Gap 4(消费端) |
 
-**一句话**：M6 的核心是让 Core 能"说话"（事件流）和"听话"（AI 调度），其余都是支撑设施。
+**一句话**：M6 的核心是让 Core 能"说话"（事件流）和"听话"（AI 调度），外加"不崩"（双向守护）和"不蒙混"（状态闸门），其余都是支撑设施。
 
 ---
 
