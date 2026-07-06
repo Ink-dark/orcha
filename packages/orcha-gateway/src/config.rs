@@ -42,9 +42,7 @@ pub struct GatewayConfig {
 }
 
 fn default_home() -> PathBuf {
-    PathBuf::from(
-        std::env::var("ORCHA_HOME").unwrap_or_else(|_| ".orcha".to_string()),
-    )
+    PathBuf::from(std::env::var("ORCHA_HOME").unwrap_or_else(|_| ".orcha".to_string()))
 }
 
 fn default_workers() -> usize {

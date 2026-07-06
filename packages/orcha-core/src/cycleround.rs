@@ -23,7 +23,9 @@ use orcha_sdk::{Artifact, Step, StepResult, Task};
 use serde::{Deserialize, Serialize};
 
 use crate::history::HistoryStore;
-use crate::{Fixer, Observer, Planner, Reviewer, StepContext, StepOutput, SubAgent, Tester, Worker};
+use crate::{
+    Fixer, Observer, Planner, Reviewer, StepContext, StepOutput, SubAgent, Tester, Worker,
+};
 
 /// 熔断参数。
 ///
@@ -256,11 +258,7 @@ impl Cycleround {
     /// **`&mut self` 的语义**：当前 M3 实现下 Sub-Agent 是无状态 unit struct，
     /// 故 `run_streaming` 实际不修改 `self`；保留 `&mut self` 为 M7 AI 驱动调度
     /// （可能需要在调度中调整内部状态）留出扩展位。
-    pub fn run_streaming(
-        &mut self,
-        task: &Task,
-        workspace: &Path,
-    ) -> mpsc::Receiver<RoundEvent> {
+    pub fn run_streaming(&mut self, task: &Task, workspace: &Path) -> mpsc::Receiver<RoundEvent> {
         let (tx, rx) = mpsc::channel::<RoundEvent>();
         // 复制必要数据到独立线程：Sub-Agent 是无状态 unit struct，直接在新线程构造；
         // config / task / workspace 均 Clone，可安全 move 进 'static 闭包。
@@ -1261,7 +1259,12 @@ mod streaming_tests {
         let first_round_agents: Vec<String> = events
             .iter()
             .filter_map(|ev| match ev {
-                RoundEvent::AgentFinished { round, agent, success, .. } if *round == 1 => {
+                RoundEvent::AgentFinished {
+                    round,
+                    agent,
+                    success,
+                    ..
+                } if *round == 1 => {
                     assert!(*success, "成功路径下第一轮每步都应 success=true");
                     Some(agent.clone())
                 }
@@ -1290,7 +1293,11 @@ mod streaming_tests {
             })
             .expect("应有 TaskCompleted 事件");
         match outcome {
-            CycleOutcome::Success { rounds, artifacts, history } => {
+            CycleOutcome::Success {
+                rounds,
+                artifacts,
+                history,
+            } => {
                 assert_eq!(rounds, 1, "应在第一轮就成功");
                 assert!(!artifacts.is_empty(), "应产出 artifacts");
                 assert_eq!(history.len(), 1, "history 应有一条 round 记录");
@@ -1317,7 +1324,10 @@ mod streaming_tests {
         // - RoundFinished 数等于 max_rounds；
         // - TaskCompleted.outcome 是 Failed(MaxRoundsExceeded)。
         let ws = tempfile::tempdir().unwrap();
-        let task = Task::new("T-stream-fail".into(), "this is not a parseable plan".into());
+        let task = Task::new(
+            "T-stream-fail".into(),
+            "this is not a parseable plan".into(),
+        );
         let max_rounds = 3;
         let mut cycle = Cycleround::new(CycleConfig {
             max_rounds,
@@ -1333,9 +1343,12 @@ mod streaming_tests {
             let agents: Vec<(&str, bool)> = events
                 .iter()
                 .filter_map(|ev| match ev {
-                    RoundEvent::AgentFinished { round: r, agent, success, .. } if *r == round => {
-                        Some((agent.as_str(), *success))
-                    }
+                    RoundEvent::AgentFinished {
+                        round: r,
+                        agent,
+                        success,
+                        ..
+                    } if *r == round => Some((agent.as_str(), *success)),
                     _ => None,
                 })
                 .collect();
@@ -1369,7 +1382,11 @@ mod streaming_tests {
             })
             .expect("应有 TaskCompleted 事件");
         match outcome {
-            CycleOutcome::Failed { rounds, reason, history } => {
+            CycleOutcome::Failed {
+                rounds,
+                reason,
+                history,
+            } => {
                 assert_eq!(rounds, max_rounds, "应跑满 {max_rounds} 轮");
                 assert_eq!(
                     reason,

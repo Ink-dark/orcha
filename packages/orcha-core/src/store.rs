@@ -726,19 +726,18 @@ mod sqlite_backend {
                 {
                     anyhow::bail!("task already exists: {}", task.id);
                 }
-                Err(e) => Err(anyhow::Error::new(e)
-                    .context(format!("failed to insert task {}", task.id))),
+                Err(e) => {
+                    Err(anyhow::Error::new(e).context(format!("failed to insert task {}", task.id)))
+                }
             }
         }
 
         fn get(&self, id: &str) -> Result<Option<Task>> {
             let conn = self.lock();
             let data: Option<String> = conn
-                .query_row(
-                    "SELECT data FROM tasks WHERE id = ?1",
-                    params![id],
-                    |row| row.get(0),
-                )
+                .query_row("SELECT data FROM tasks WHERE id = ?1", params![id], |row| {
+                    row.get(0)
+                })
                 .optional()?;
             match data {
                 Some(s) => {

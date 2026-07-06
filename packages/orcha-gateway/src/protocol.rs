@@ -53,10 +53,7 @@ pub enum AdapterToGateway {
         session: String,
     },
     /// Adapter 启动时询问 Gateway 当前用户/群是否在白名单。
-    AuthCheck {
-        user: String,
-        group: Option<String>,
-    },
+    AuthCheck { user: String, group: Option<String> },
     /// 心跳，Adapter 每 30s 发一次。
     Heartbeat { ts_ms: u64 },
 }
