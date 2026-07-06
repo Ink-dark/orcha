@@ -98,6 +98,12 @@ enum Command {
         /// （不再是循环次数），建议设为 20~30 才够 Plan→Code→Test→Review→exit 链路。
         #[arg(long, default_value_t = false)]
         ai: bool,
+
+        /// 启用人工审批（M7 P1）：Worker 写文件 / Tester 跑命令前，在终端询问 y/n。
+        /// 需配合 `--ai --llm` 使用。无 stdin（后台进程）时一律拒绝（fail-closed）。
+        /// 默认关闭（CI / 自动化路径用 NullApprovalHook 直接放行）。
+        #[arg(long, default_value_t = false)]
+        approve: bool,
     },
 
     /// 崩溃恢复：扫描 store，把中断的 RUNNING Task 迁移到 BLOCKED 或 FAILED。
@@ -187,6 +193,7 @@ fn main() -> Result<()> {
             max_retries,
             llm,
             ai,
+            approve,
         }) => {
             let exit_code = run_fix(
                 &resolve_home(cli.home.as_deref()),
@@ -196,6 +203,7 @@ fn main() -> Result<()> {
                 max_retries,
                 llm,
                 ai,
+                approve,
             )?;
             // 直接 exit 以保证调用方能区分成功/失败（脚本/CI 用 $? 判断）。
             std::process::exit(exit_code);
@@ -267,6 +275,7 @@ fn parse_status(s: &str) -> Result<TaskStatus> {
 ///
 /// 报名帖熔断参数：`max_rounds=10` / `max_retries=3` / `cool_down=60s`。
 /// 调用方可通过 CLI 覆盖前两项；`cool_down` 当前确定性实现不真睡。
+#[allow(clippy::too_many_arguments)]
 fn run_fix(
     home: &Path,
     workspace: &Path,
@@ -275,9 +284,13 @@ fn run_fix(
     max_retries: u32,
     llm: bool,
     ai: bool,
+    approve: bool,
 ) -> Result<i32> {
     if !workspace.is_dir() {
         bail!("workspace 不存在或不是目录: {}", workspace.display());
+    }
+    if approve && !(ai && llm) {
+        bail!("`--approve` 需配合 `--ai --llm` 使用");
     }
 
     let task_store = FileTaskStore::new(home);
@@ -299,7 +312,7 @@ fn run_fix(
     };
 
     // 路径选择：
-    // - `--ai --llm`：AI 驱动调度，每步由 LLM 决定调哪个 SubAgent（M7）
+    // - `--ai --llm [--approve]`：AI 驱动调度，每步由 LLM 决定调哪个 SubAgent（M7）
     // - `--llm`：固定 5 步链路 LLM Cycleround
     // - 默认：确定性 Cycleround
     let outcome = if ai {
@@ -314,7 +327,18 @@ fn run_fix(
                 std::sync::Arc::new(orcha_llm::OpenAiCompatibleClient::new(cfg));
             let memory = std::sync::Arc::new(FileMemoryStore::new(home));
             memory.init()?;
-            let cycle = orcha_core::AiDrivenCycleround::with_memory(config, client, memory);
+            // M7 P1：注入审批 hook。`--approve` 时走 stdin y/n 询问；否则 NullApprovalHook 放行。
+            let approval: std::sync::Arc<dyn orcha_core::ApprovalHook> = if approve {
+                std::sync::Arc::new(orcha_core::StdinApprovalHook::new())
+            } else {
+                std::sync::Arc::new(orcha_core::NullApprovalHook)
+            };
+            let cycle = orcha_core::AiDrivenCycleround::with_approval(
+                config,
+                client,
+                Some(memory),
+                approval,
+            );
             cycle.run_with_history(&task, workspace, &history_store)
         }
         #[cfg(not(feature = "llm"))]
@@ -514,6 +538,7 @@ mod tests {
             3,
             false,
             false,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 0, "成功路径退出码应为 0");
@@ -555,6 +580,7 @@ mod tests {
             3,
             false,
             false,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 0);
@@ -590,6 +616,7 @@ mod tests {
             2,
             false,
             false,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 1, "失败路径退出码应为 1");
@@ -617,6 +644,7 @@ mod tests {
             "x".into(),
             5,
             3,
+            false,
             false,
             false,
         )
@@ -940,6 +968,7 @@ mod tests {
             "创建 hello.py 输出 hello".into(),
             5,
             3,
+            false,
             false,
             false,
         )

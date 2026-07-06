@@ -1,6 +1,7 @@
 // Orcha Core - Cycleround loop and task orchestration.
 // See docs/ROADMAP.md M0/M1/M2/M3 for the contract this crate fulfills.
 
+pub mod approval;
 pub mod audit;
 pub mod cycleround;
 pub mod error;
@@ -25,6 +26,9 @@ pub mod tools;
 #[cfg(feature = "llm")]
 pub mod ai_cycleround;
 
+pub use approval::{
+    ApprovalAction, ApprovalDecision, ApprovalHook, NullApprovalHook, StdinApprovalHook,
+};
 pub use audit::{AuditAction, AuditEntry, AuditLogger, NoopAuditLogger};
 pub use cycleround::{
     CycleConfig, CycleOutcome, Cycleround, FailureReason, RoundEvent, RoundRecord,

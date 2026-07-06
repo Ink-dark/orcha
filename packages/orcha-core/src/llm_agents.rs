@@ -234,6 +234,22 @@ impl LlmWorker {
                     return StepOutput::failure("S-worker", format!("写边界拒绝 {path}: {e}"));
                 }
             };
+            // M7 P1：PathGuard 之后、写文件之前调人工审批 hook。
+            // 默认 NullApprovalHook 直接放行；--approve 时走 StdinApprovalHook。
+            let preview: String = content.chars().take(200).collect();
+            let action = crate::approval::ApprovalAction::WriteFile {
+                path: path.clone(),
+                content_preview: preview,
+            };
+            match ctx.approval.request(&action) {
+                crate::approval::ApprovalDecision::Approved => {}
+                crate::approval::ApprovalDecision::Rejected(reason) => {
+                    return StepOutput::failure(
+                        "S-worker",
+                        format!("人工审批拒绝写 {path}: {reason}"),
+                    );
+                }
+            }
             // validate_write 已校验路径，但仍走 create_dir_all + write 流程（保留 M2 行为）。
             if let Some(parent) = resolved.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {

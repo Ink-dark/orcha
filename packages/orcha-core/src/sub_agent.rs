@@ -4,11 +4,19 @@
 //! M2 只实现单步链路，不闭环；M3 才接 Cycleround 调度器与真实 LLM。
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use orcha_sdk::{Artifact, Step, StepResult, StepStatus, Task};
 
+use crate::approval::{ApprovalHook, NullApprovalHook};
+
 /// 单步执行上下文。Sub-Agent 通过它读写任务相关数据。
-#[derive(Debug, Clone)]
+///
+/// `approval` 字段（M7 P1）持有一个 [`ApprovalHook`]，Worker 写文件 /
+/// Tester 跑命令前会调它做人工审批。默认是 [`NullApprovalHook`]（直接放行，
+/// CI / 旧路径兼容）；调用方可通过 [`StepContext::with_approval`] 注入
+/// 真实 hook（如 [`crate::StdinApprovalHook`]）。
+#[derive(Clone)]
 pub struct StepContext {
     /// 任务工作区根目录（隔离的 tempdir），Sub-Agent 在此读写文件。
     pub workspace: PathBuf,
@@ -18,16 +26,31 @@ pub struct StepContext {
     pub prior_artifacts: Vec<Artifact>,
     /// 前序步骤的 DAG 节点定义。
     pub prior_steps: Vec<Step>,
+    /// 人工审批 hook。Worker / Tester 在执行副作用前调用。
+    pub approval: Arc<dyn ApprovalHook>,
+}
+
+impl std::fmt::Debug for StepContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StepContext")
+            .field("workspace", &self.workspace)
+            .field("task", &self.task)
+            .field("prior_artifacts", &self.prior_artifacts)
+            .field("prior_steps", &self.prior_steps)
+            .field("approval", &"<dyn ApprovalHook>")
+            .finish()
+    }
 }
 
 impl StepContext {
-    /// 构造一个初始上下文（无前序产物）。
+    /// 构造一个初始上下文（无前序产物，approval 默认 NullApprovalHook）。
     pub fn new(workspace: impl Into<PathBuf>, task: Task) -> Self {
         Self {
             workspace: workspace.into(),
             task,
             prior_artifacts: Vec::new(),
             prior_steps: Vec::new(),
+            approval: Arc::new(NullApprovalHook),
         }
     }
 
@@ -42,6 +65,12 @@ impl StepContext {
     pub fn with_priors(mut self, steps: &[Step], artifacts: &[Artifact]) -> Self {
         self.prior_steps.extend_from_slice(steps);
         self.prior_artifacts.extend_from_slice(artifacts);
+        self
+    }
+
+    /// 注入人工审批 hook（M7 P1）。Worker 写文件 / Tester 跑命令前会调它。
+    pub fn with_approval(mut self, hook: Arc<dyn ApprovalHook>) -> Self {
+        self.approval = hook;
         self
     }
 }

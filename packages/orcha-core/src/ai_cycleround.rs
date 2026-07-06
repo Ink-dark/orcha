@@ -34,6 +34,7 @@ use orcha_llm::{ChatMessage, ChatResponse, LlmClient, LlmError, ToolDefinition};
 use orcha_sdk::{Artifact, StepResult, Task};
 use serde::{Deserialize, Serialize};
 
+use crate::approval::{ApprovalHook, NullApprovalHook};
 use crate::cycleround::{
     build_round, persist_round, CycleConfig, CycleOutcome, FailureReason, RoundEvent, RoundRecord,
 };
@@ -91,12 +92,15 @@ pub struct AiDrivenCycleround {
     reviewer: LlmReviewer,
     fixer: Fixer,
     memory: Option<Arc<dyn MemoryStore>>,
+    /// M7 P1：人工审批 hook。Worker 写文件 / Tester 跑命令前会调它。
+    /// 默认 [`crate::NullApprovalHook`]（直接放行）。
+    approval: Arc<dyn ApprovalHook>,
 }
 
 impl AiDrivenCycleround {
     /// 用指定熔断参数 + LLM client 构造。
     pub fn new(config: CycleConfig, client: Arc<dyn LlmClient>) -> Self {
-        Self::build(config, client, None)
+        Self::build(config, client, None, None)
     }
 
     /// 用 LLM client + MemoryStore 构造。Memory 同时供 SubAgent 与调度 LLM 使用。
@@ -105,7 +109,18 @@ impl AiDrivenCycleround {
         client: Arc<dyn LlmClient>,
         memory: Arc<dyn MemoryStore>,
     ) -> Self {
-        Self::build(config, client, Some(memory))
+        Self::build(config, client, Some(memory), None)
+    }
+
+    /// M7 P1：注入人工审批 hook。Worker 写文件 / Tester 跑命令前会调它。
+    /// 适合 `orcha fix --ai --approve` 走 stdin 询问管理员。
+    pub fn with_approval(
+        config: CycleConfig,
+        client: Arc<dyn LlmClient>,
+        memory: Option<Arc<dyn MemoryStore>>,
+        approval: Arc<dyn ApprovalHook>,
+    ) -> Self {
+        Self::build(config, client, memory, Some(approval))
     }
 
     /// 用默认熔断参数 + LLM client 构造。
@@ -117,6 +132,7 @@ impl AiDrivenCycleround {
         config: CycleConfig,
         client: Arc<dyn LlmClient>,
         memory: Option<Arc<dyn MemoryStore>>,
+        approval: Option<Arc<dyn ApprovalHook>>,
     ) -> Self {
         // 闭包需 own 一份 client.clone()，避免借用 client 阻止后续 move。
         let client_for_planner = client.clone();
@@ -144,6 +160,7 @@ impl AiDrivenCycleround {
             reviewer: mk_reviewer(),
             fixer: Fixer,
             memory,
+            approval: approval.unwrap_or_else(|| Arc::new(NullApprovalHook)),
         }
     }
 
@@ -180,9 +197,10 @@ impl AiDrivenCycleround {
         let workspace: PathBuf = workspace.to_path_buf();
         let client = self.client.clone();
         let memory = self.memory.clone();
+        let approval = self.approval.clone();
 
         thread::spawn(move || {
-            let cycle = AiDrivenCycleround::build(config, client, memory);
+            let cycle = AiDrivenCycleround::build(config, client, memory, Some(approval));
             run_inner_streaming(cycle, task, workspace, tx);
         });
 
@@ -251,7 +269,8 @@ impl AiDrivenCycleround {
 
             // 调对应 agent
             let ctx = StepContext::new(workspace, task.clone())
-                .with_priors(&Vec::new(), &artifacts);
+                .with_priors(&Vec::new(), &artifacts)
+                .with_approval(self.approval.clone());
             let out = self.dispatch(&decision.agent, &ctx, step_idx);
 
             let one_step = vec![out.result.clone()];
@@ -494,7 +513,8 @@ fn run_inner_streaming(
             }
 
             let ctx = StepContext::new(&workspace, task.clone())
-                .with_priors(&Vec::new(), &artifacts);
+                .with_priors(&Vec::new(), &artifacts)
+                .with_approval(cycle.approval.clone());
             let _ = tx.send(RoundEvent::AgentStarted {
                 round: step_idx,
                 agent: decision.agent.clone(),

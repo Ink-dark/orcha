@@ -180,6 +180,23 @@ impl SubAgent for Tester {
             }
         };
 
+        // M7 P1：跑命令前调人工审批 hook。
+        // 命令是确定性检测出来的（detect_test_command），args 也是；这里把它们
+        // 原样丢给 hook，让管理员决定放行 / 拒绝。
+        let action = crate::approval::ApprovalAction::RunCommand {
+            program: cmd.program.clone(),
+            args: cmd.args.clone(),
+        };
+        match ctx.approval.request(&action) {
+            crate::approval::ApprovalDecision::Approved => {}
+            crate::approval::ApprovalDecision::Rejected(reason) => {
+                return StepOutput::failure(
+                    "S-tester",
+                    format!("人工审批拒绝执行 {}: {reason}", cmd.display()),
+                );
+            }
+        }
+
         let output = match Command::new(&cmd.program)
             .args(&cmd.args)
             .current_dir(&ctx.workspace)
