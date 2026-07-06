@@ -30,13 +30,17 @@ impl IpcAddr {
     /// `auto` 模式：按平台选择。
     /// Linux/macOS → Unix Socket（`{home}/gateway.sock`）
     /// Windows → TCP（`127.0.0.1:{port}`）
-    pub fn auto_detect(home: &std::path::Path, _port: u16) -> Self {
+    pub fn auto_detect(home: &std::path::Path, port: u16) -> Self {
         #[cfg(unix)]
         {
+            // Unix Socket 不用 port，但保留参数让 Windows 分支能用（参数名带下划线避免 unused 警告）。
+            let _port = port;
             IpcAddr::Unix(home.join("gateway.sock"))
         }
         #[cfg(not(unix))]
         {
+            // Windows 走 TCP，不用 home 路径，但保留参数让 Unix 分支能用。
+            let _home = home;
             IpcAddr::Tcp("127.0.0.1".to_string(), port)
         }
     }

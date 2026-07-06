@@ -215,7 +215,7 @@ mod tests {
                 raw: "@Orcha fix login bug".into(),
             },
         };
-        let bytes = encode_all(&[msg.clone()]);
+        let bytes = encode_all(std::slice::from_ref(&msg));
         let decoded: Vec<AdapterToGateway> = decode_all(&bytes);
         assert_eq!(decoded, vec![msg]);
     }
@@ -230,7 +230,7 @@ mod tests {
             detail: "已发现 3 个文件".into(),
             progress: 30,
         };
-        let bytes = encode_all(&[msg.clone()]);
+        let bytes = encode_all(std::slice::from_ref(&msg));
         let decoded: Vec<GatewayToAdapter> = decode_all(&bytes);
         assert_eq!(decoded, vec![msg]);
     }

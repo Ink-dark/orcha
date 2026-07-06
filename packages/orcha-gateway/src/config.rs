@@ -235,12 +235,24 @@ mod tests {
 
     #[test]
     fn db_full_path_absolute_preserved() {
+        // Windows 上 `Path::is_absolute()` 要求盘符前缀（`C:\...`），
+        // Unix 风格的 `/var/...` 在 Windows 上不是绝对路径，会被当成相对路径 join 到 home。
+        // 因此这里按平台用各自合法的绝对路径，避免 Windows CI 炸。
+        let absolute_db = if cfg!(windows) {
+            PathBuf::from(r"C:\var\data\orcha.db")
+        } else {
+            PathBuf::from("/var/data/orcha.db")
+        };
         let cfg = GatewayConfig {
-            home: PathBuf::from("/tmp/orcha"),
-            db_path: PathBuf::from("/var/data/orcha.db"),
+            home: PathBuf::from(if cfg!(windows) {
+                r"C:\tmp\orcha"
+            } else {
+                "/tmp/orcha"
+            }),
+            db_path: absolute_db.clone(),
             ..Default::default()
         };
-        assert_eq!(cfg.db_full_path(), PathBuf::from("/var/data/orcha.db"));
+        assert_eq!(cfg.db_full_path(), absolute_db);
     }
 
     #[test]
