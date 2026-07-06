@@ -6,9 +6,14 @@
 //! 分配一个独立目录作为 workspace，Sub-Agent 只能在此目录内读写。
 //! Docker 容器级隔离（README §6.2）留给 M3 闭环阶段，避免 M2 引入
 //! docker 依赖卡 CI；trait 已预留 `DockerSandbox` 扩展点。
+//!
+//! M4 新增 [`GitWorktree`]：真实 repo 接入时通过 `git worktree add` 创建
+//! 独立工作区，所有改动落 worktree。经 Review 通过后才 apply 回原 repo。
+//! 若 LLM 乱写，原 repo 工作区不被污染，回滚只需 `git worktree remove`。
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use tempfile::TempDir;
@@ -82,6 +87,132 @@ impl Sandbox for FsSandbox {
     fn prepare(&self, task_id: &str) -> Result<PathBuf> {
         self.workspace.task_subdir(task_id)
     }
+}
+
+/// Git worktree 沙箱：从真实 repo 创建隔离工作区。
+///
+/// 构造时执行 `git worktree add --detach <temp_dir>`，
+/// 所有 Sub-Agent 的读写操作落在 worktree 内。
+/// Drop 时执行 `git worktree remove --force <temp_dir>` 清理。
+///
+/// 原 repo 工作区完全不受影响——即便 LLM 产出乱写或危险路径写入，
+/// 被污染的只是 worktree 副本。回滚：drop 本结构体即可。
+pub struct GitWorktree {
+    source_repo: PathBuf,
+    #[allow(dead_code)]
+    worktree_temp: TempDir,
+    worktree_path: PathBuf,
+}
+
+impl GitWorktree {
+    /// 从 `source_repo` 创建独立 worktree。
+    ///
+    /// `source_repo` 必须是 git 仓库根目录（含 `.git`）。
+    /// 构造失败（非 git repo / git 不可用 / 磁盘满等）返回 Err。
+    pub fn new(source_repo: impl AsRef<Path>) -> Result<Self> {
+        let source_repo: PathBuf = source_repo
+            .as_ref()
+            .canonicalize()
+            .context("source repo 路径不存在或无法访问")?;
+
+        if !source_repo.join(".git").exists() {
+            anyhow::bail!("{} 不是 git 仓库（缺 .git）", source_repo.display());
+        }
+
+        // 检查 git 是否可用
+        check_git_available()?;
+
+        let worktree_temp = tempfile::tempdir().context("无法创建 worktree 临时目录")?;
+        let worktree_path = worktree_temp.path().to_path_buf();
+
+        // git worktree add --detach <path> <base-commit>
+        // --detach 表示不在新 worktree 创建分支，避免污染原 repo 分支列表
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &source_repo.to_string_lossy(),
+                "worktree",
+                "add",
+                "--detach",
+                &worktree_path.to_string_lossy(),
+                "HEAD",
+            ])
+            .output()
+            .context("执行 git worktree add 失败")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("git worktree add 失败: {stderr}");
+        }
+
+        Ok(Self {
+            source_repo,
+            worktree_temp,
+            worktree_path,
+        })
+    }
+
+    /// worktree 根路径（即 workspace 路径）。
+    pub fn path(&self) -> &Path {
+        &self.worktree_path
+    }
+
+    /// 源 repo 路径。
+    pub fn source_repo(&self) -> &Path {
+        &self.source_repo
+    }
+}
+
+impl Sandbox for GitWorktree {
+    fn prepare(&self, _task_id: &str) -> Result<PathBuf> {
+        Ok(self.worktree_path.clone())
+    }
+}
+
+impl Drop for GitWorktree {
+    fn drop(&mut self) {
+        // git worktree remove --force 清理 worktree 记录
+        // 即使 worktree 目录已被操作，--force 仍可移除
+        let output = Command::new("git")
+            .args([
+                "-C",
+                &self.source_repo.to_string_lossy(),
+                "worktree",
+                "remove",
+                "--force",
+                &self.worktree_path.to_string_lossy(),
+            ])
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                eprintln!(
+                    "warn: git worktree remove 失败 ({}): {}",
+                    self.worktree_path.display(),
+                    stderr
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "warn: 无法执行 git worktree remove ({}): {e}",
+                    self.worktree_path.display()
+                );
+            }
+        }
+    }
+}
+
+fn check_git_available() -> Result<()> {
+    let output = Command::new("git")
+        .arg("--version")
+        .output()
+        .context("git 不可用，请确认已安装 git 并在 PATH 中")?;
+    if !output.status.success() {
+        anyhow::bail!("git --version 返回非零退出码");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
