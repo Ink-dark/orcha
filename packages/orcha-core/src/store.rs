@@ -602,3 +602,347 @@ mod tests {
         );
     }
 }
+
+// ============================================================
+// M6 SQLite 后端（feature = "sqlite" 启用，可选实现）
+// ============================================================
+
+#[cfg(feature = "sqlite")]
+mod sqlite_backend {
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use anyhow::{Context, Result};
+    use orcha_sdk::{Task, TaskStatus};
+    use rusqlite::{params, Connection, OptionalExtension};
+
+    use crate::error::CoreError;
+    use crate::store::TaskStore;
+
+    /// 基于 SQLite 的 Task 仓储（M6，需启用 `sqlite` feature）。
+    ///
+    /// 相比 [`crate::FileTaskStore`]：
+    /// - 开启 WAL 模式，读不阻塞写、崩溃后可由 WAL 日志恢复；
+    /// - 用 SQLite 事务做乐观锁，天然跨进程安全；
+    /// - 单文件数据库，便于备份/迁移。
+    ///
+    /// 因 `rusqlite::Connection` 不是 `Sync`，用 [`Mutex`] 包装，
+    /// 使 `SqliteTaskStore` 满足 `Send + Sync`，可跨线程共享。
+    pub struct SqliteTaskStore {
+        // Connection 不是 Sync，用 Mutex 保护，保证多线程下串行访问。
+        conn: Mutex<Connection>,
+    }
+
+    // 静态断言：SqliteTaskStore 必须是 Send + Sync。
+    // Mutex<Connection> 满足（Connection: Send），保证可跨线程共享。
+    const _: () = {
+        fn _assert_send_sync<T: Send + Sync>() {}
+        fn _assert() {
+            _assert_send_sync::<SqliteTaskStore>();
+        }
+    };
+
+    impl SqliteTaskStore {
+        /// 打开/创建 SQLite 数据库文件。
+        ///
+        /// - 自动创建父目录（`Connection::open` 不会创建目录）；
+        /// - 开启 WAL 模式（`PRAGMA journal_mode=WAL`）；
+        /// - 幂等建表 `tasks`：
+        ///   - `id TEXT PRIMARY KEY`
+        ///   - `data TEXT`（Task 的 JSON 序列化）
+        ///   - `version INTEGER`（乐观锁版本号）
+        ///   - `status TEXT`（TaskStatus 字符串形式，用于过滤）
+        ///   - `updated_at TEXT`（RFC3339 时间戳）
+        pub fn open(path: &Path) -> Result<Self> {
+            // 确保父目录存在，否则 Connection::open 会失败。
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create sqlite db dir: {}", parent.display())
+                    })?;
+                }
+            }
+            let conn = Connection::open(path)
+                .with_context(|| format!("failed to open sqlite db: {}", path.display()))?;
+            // WAL 模式：读不阻塞写，崩溃后可通过 WAL 日志恢复。
+            conn.execute_batch("PRAGMA journal_mode = WAL;")
+                .context("failed to enable WAL journal_mode")?;
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS tasks ( \
+                     id         TEXT PRIMARY KEY, \
+                     data       TEXT NOT NULL, \
+                     version    INTEGER NOT NULL, \
+                     status     TEXT NOT NULL, \
+                     updated_at TEXT NOT NULL \
+                 )",
+                [],
+            )
+            .context("failed to create tasks table")?;
+            Ok(Self {
+                conn: Mutex::new(conn),
+            })
+        }
+
+        /// 加锁获取 Connection guard。
+        ///
+        /// 若持有锁的线程 panic 导致锁"中毒"，仍取出内部 Connection 继续使用，
+        /// 避免一次 panic 就让整个 store 永久不可用。
+        fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+            self.conn.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// 按 id 删除 Task；不存在也不报错（幂等）。
+        ///
+        /// 注意：`TaskStore` trait 当前未声明 `delete`，因此这里作为固有方法实现，
+        /// 调用方直接通过 `SqliteTaskStore::delete` 调用。
+        pub fn delete(&self, id: &str) -> Result<()> {
+            let conn = self.lock();
+            conn.execute("DELETE FROM tasks WHERE id = ?1", params![id])
+                .with_context(|| format!("failed to delete task {}", id))?;
+            Ok(())
+        }
+    }
+
+    impl TaskStore for SqliteTaskStore {
+        fn insert(&self, task: &Task) -> Result<()> {
+            let data = serde_json::to_string(task).context("failed to serialize task")?;
+            let conn = self.lock();
+            let res = conn.execute(
+                "INSERT INTO tasks (id, data, version, status, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    task.id,
+                    data,
+                    task.version as i64,
+                    task.status.to_string(),
+                    task.updated_at.to_rfc3339(),
+                ],
+            );
+            match res {
+                Ok(_) => Ok(()),
+                // 主键冲突 = id 已存在，与 FileTaskStore 保持一致的错误语义。
+                Err(rusqlite::Error::SqliteFailure(err, _))
+                    if err.code == rusqlite::ErrorCode::ConstraintViolation =>
+                {
+                    anyhow::bail!("task already exists: {}", task.id);
+                }
+                Err(e) => Err(anyhow::Error::new(e)
+                    .context(format!("failed to insert task {}", task.id))),
+            }
+        }
+
+        fn get(&self, id: &str) -> Result<Option<Task>> {
+            let conn = self.lock();
+            let data: Option<String> = conn
+                .query_row(
+                    "SELECT data FROM tasks WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match data {
+                Some(s) => {
+                    let task: Task = serde_json::from_str(&s)
+                        .with_context(|| format!("failed to parse task json for id {}", id))?;
+                    Ok(Some(task))
+                }
+                None => Ok(None),
+            }
+        }
+
+        fn list(&self, filter: Option<TaskStatus>) -> Result<Vec<Task>> {
+            let conn = self.lock();
+            // 先把 data 列全部读出（趁 stmt 还活着），再反序列化。
+            // 注意：rows 必须在 stmt drop 之前被 collect 消费掉，
+            // 因此先绑定到具名局部变量，再 collect，避免尾表达式临时值提前 drop。
+            let raw: Vec<String> = match filter {
+                Some(status) => {
+                    let mut stmt = conn
+                        .prepare("SELECT data FROM tasks WHERE status = ?1")
+                        .context("failed to prepare list(status) stmt")?;
+                    let rows =
+                        stmt.query_map(params![status.to_string()], |row| row.get::<_, String>(0))?;
+                    let collected: rusqlite::Result<Vec<String>> = rows.collect();
+                    collected.context("failed to fetch tasks (status filter)")?
+                }
+                None => {
+                    let mut stmt = conn
+                        .prepare("SELECT data FROM tasks")
+                        .context("failed to prepare list(all) stmt")?;
+                    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                    let collected: rusqlite::Result<Vec<String>> = rows.collect();
+                    collected.context("failed to fetch tasks (all)")?
+                }
+            };
+            let mut tasks = Vec::with_capacity(raw.len());
+            for data in raw {
+                let task: Task =
+                    serde_json::from_str(&data).context("failed to parse task json in list")?;
+                tasks.push(task);
+            }
+            // 按 created_at 升序，与 FileTaskStore 输出顺序保持一致。
+            tasks.sort_by_key(|t| t.created_at);
+            Ok(tasks)
+        }
+
+        fn update_with_version(&self, task: &Task, expected_version: Option<u64>) -> Result<()> {
+            let mut conn = self.lock();
+            // 用事务保证"读 version + 校验 + 写入"原子性，跨进程安全。
+            let tx = conn.transaction().context("failed to begin transaction")?;
+            // 读取落盘当前 version（乐观锁校验 + 自增基准）。
+            // 关键：自增基于落盘 version，而非调用方持有的 task.version（可能 stale），
+            // 否则连续两次 update() 会让落盘 version 在 1 处原地踏步。
+            let current_version: i64 = tx
+                .query_row(
+                    "SELECT version FROM tasks WHERE id = ?1",
+                    params![task.id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("task not found: {}", task.id))?;
+            let current_version = current_version as u64;
+            if let Some(v) = expected_version {
+                if current_version != v {
+                    return Err(CoreError::VersionConflict {
+                        task_id: task.id.clone(),
+                        expected_version: v,
+                        actual_version: current_version,
+                    }
+                    .into());
+                }
+            }
+            // 校验通过（或跳过校验）：基于落盘 version 自增，刷新 updated_at。
+            // 不修改入参 &Task，调用方需要最新 version 时应重新 get。
+            let mut updated = task.clone();
+            updated.version = current_version + 1;
+            updated.updated_at = chrono::Utc::now();
+            let data = serde_json::to_string(&updated).context("failed to serialize task")?;
+            let affected = tx
+                .execute(
+                    "UPDATE tasks SET data = ?1, version = ?2, status = ?3, updated_at = ?4 \
+                     WHERE id = ?5",
+                    params![
+                        data,
+                        updated.version as i64,
+                        updated.status.to_string(),
+                        updated.updated_at.to_rfc3339(),
+                        task.id,
+                    ],
+                )
+                .context("failed to update task")?;
+            if affected == 0 {
+                // 并发中行被删了的极端情况。
+                anyhow::bail!("task not found: {}", task.id);
+            }
+            tx.commit().context("failed to commit transaction")?;
+            Ok(())
+        }
+    }
+}
+
+// 对外导出 SqliteTaskStore（仅在 sqlite feature 启用时可见）。
+#[cfg(feature = "sqlite")]
+pub use sqlite_backend::SqliteTaskStore;
+
+#[cfg(all(test, feature = "sqlite"))]
+mod sqlite_tests {
+    use super::*;
+
+    /// 创建一个临时目录 + SqliteTaskStore，返回 (store, 临时目录)。
+    /// 临时目录 drop 时会自动清理 db 文件。
+    fn fresh_db() -> (SqliteTaskStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let db_path = dir.path().join("test.db");
+        let store = SqliteTaskStore::open(&db_path).expect("open sqlite store");
+        (store, dir)
+    }
+
+    #[test]
+    fn sqlite_insert_then_get_round_trips() {
+        let (store, _dir) = fresh_db();
+        let task = Task::new(Task::generate_id(), "hello".into());
+        store.insert(&task).unwrap();
+        let got = store.get(&task.id).unwrap().expect("task should exist");
+        assert_eq!(got.id, task.id);
+        assert_eq!(got.description, "hello");
+        assert_eq!(got.status, TaskStatus::Pending);
+        assert_eq!(got.version, 0, "新建 Task version=0");
+    }
+
+    #[test]
+    fn sqlite_list_and_filter_by_status() {
+        let (store, _dir) = fresh_db();
+        let mut t1 = Task::new("T-1".into(), "a".into());
+        t1.status = TaskStatus::Running;
+        let t2 = Task::new("T-2".into(), "b".into());
+        store.insert(&t1).unwrap();
+        store.insert(&t2).unwrap();
+
+        let all = store.list(None).unwrap();
+        assert_eq!(all.len(), 2, "应返回全部 2 条");
+
+        let running = store.list(Some(TaskStatus::Running)).unwrap();
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].id, "T-1");
+
+        let pending = store.list(Some(TaskStatus::Pending)).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "T-2");
+    }
+
+    #[test]
+    fn sqlite_update_with_version_and_conflict() {
+        let (store, _dir) = fresh_db();
+        let mut task = Task::new("T-v".into(), "a".into());
+        store.insert(&task).unwrap();
+        assert_eq!(task.version, 0, "新建 Task version=0");
+
+        // Pending -> Running 合法迁移。
+        crate::transition(&mut task, TaskStatus::Running).unwrap();
+        // 落盘 version=0，调用方持有 version=0，匹配 → 成功，落盘 version → 1。
+        store.update_with_version(&task, Some(0)).unwrap();
+        let got = store.get("T-v").unwrap().unwrap();
+        assert_eq!(got.version, 1);
+        assert_eq!(got.status, TaskStatus::Running);
+
+        // 用 stale 的 version=0 再 update → 冲突（实际落盘 version=1）。
+        let err = store.update_with_version(&task, Some(0)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("version conflict")
+                && msg.contains("expected 0")
+                && msg.contains("actual 1"),
+            "应返回 VersionConflict，实际: {msg}"
+        );
+        // 落盘 version 仍是 1（被冲突拒绝的写入未生效）。
+        let got = store.get("T-v").unwrap().unwrap();
+        assert_eq!(got.version, 1);
+    }
+
+    #[test]
+    fn sqlite_delete_removes_task() {
+        let (store, _dir) = fresh_db();
+        let task = Task::new("T-del".into(), "x".into());
+        store.insert(&task).unwrap();
+        assert!(store.get("T-del").unwrap().is_some(), "插入后应能查到");
+        store.delete("T-del").unwrap();
+        assert!(store.get("T-del").unwrap().is_none(), "删除后应查不到");
+    }
+
+    #[test]
+    fn sqlite_insert_duplicate_id_errors() {
+        let (store, _dir) = fresh_db();
+        let task = Task::new("T-dup".into(), "x".into());
+        store.insert(&task).unwrap();
+        let err = store.insert(&task).unwrap_err();
+        assert!(err.to_string().contains("already exists"), "实际: {err}");
+    }
+
+    #[test]
+    fn sqlite_update_missing_errors() {
+        let (store, _dir) = fresh_db();
+        let task = Task::new("T-missing".into(), "a".into());
+        let err = store.update(&task).unwrap_err();
+        assert!(err.to_string().contains("not found"), "实际: {err}");
+    }
+}

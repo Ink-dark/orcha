@@ -363,6 +363,7 @@ fn build_fix_result(
             Some(match reason {
                 FailureReason::MaxRoundsExceeded => "MaxRoundsExceeded",
                 FailureReason::MaxRetriesExceeded => "MaxRetriesExceeded",
+                FailureReason::Panic => "Panic",
             }),
             history.len(),
         ),

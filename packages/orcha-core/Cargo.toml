@@ -17,12 +17,16 @@ thiserror.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 tempfile = "3"
+# SQLite 后端（M6，feature gate，bundled 编译 SQLite C 源码，零外部依赖）
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 
 [features]
 # 启用 LLM 驱动的 Sub-Agent（Planner/Worker/Reviewer 调真 LLM）。
 # 默认关闭，CI 跑确定性实现；demo 路径 `--features llm` 启用。
 default = []
 llm = ["dep:orcha-llm"]
+# 启用 SQLite 后端（M6，WAL + 跨进程锁，替代 FileTaskStore）
+sqlite = ["dep:rusqlite"]
 
 [dev-dependencies]
 # tempfile 同时作为 dev-dependency 以便测试中直接使用。
