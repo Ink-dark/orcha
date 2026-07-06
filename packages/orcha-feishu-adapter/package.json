@@ -1,0 +1,24 @@
+{
+  "name": "orcha-feishu-adapter",
+  "version": "0.1.0",
+  "description": "Orcha 飞书 Adapter - 连接飞书 IM 与 Orcha Gateway（JSON line IPC）",
+  "private": true,
+  "license": "MIT",
+  "main": "dist/main.js",
+  "bin": {
+    "orcha-feishu-adapter": "dist/main.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "start": "node dist/main.js",
+    "start:mock": "ORCHA_ADAPTER_MOCK=1 node dist/main.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.4.0"
+  }
+}
