@@ -58,10 +58,10 @@ if ($pids.Count -eq 0) {
 # 去重
 $pids = $pids | Sort-Object -Unique
 
-foreach ($pid in $pids) {
-    $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+foreach ($procId in $pids) {
+    $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
     if (-not $proc) {
-        Write-Warn "PID $pid 已不存在"
+        Write-Warn "PID $procId 已不存在"
         continue
     }
 
@@ -73,12 +73,12 @@ foreach ($pid in $pids) {
 
     if (-not $proc.HasExited) {
         try {
-            Stop-Process -Id $pid -Force -ErrorAction Stop
+            Stop-Process -Id $procId -Force -ErrorAction Stop
         } catch {
-            Write-Warn "停止 PID $pid 失败：$($_.Exception.Message)"
+            Write-Warn "停止 PID $procId 失败：$($_.Exception.Message)"
         }
     }
-    Write-Ok "已停止 PID $pid ($($proc.ProcessName))"
+    Write-Ok "已停止 PID $procId ($($proc.ProcessName))"
 }
 
 if (Test-Path $pidFile) {
