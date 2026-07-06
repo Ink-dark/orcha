@@ -196,11 +196,11 @@ $ready = $false
 for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Milliseconds 500
     # Gateway 用 eprintln!，日志在 stderr（.err 文件）
-    if (Get-Content "$gwLog.err" -ErrorAction SilentlyContinue | Select-String 'IPC listening on') {
+    if (Get-Content "$gwLog.err" -Encoding UTF8 -ErrorAction SilentlyContinue | Select-String 'IPC listening on') {
         $ready = $true
         break
     }
-    if (Get-Content $gwLog -ErrorAction SilentlyContinue | Select-String 'IPC listening on') {
+    if (Get-Content $gwLog -Encoding UTF8 -ErrorAction SilentlyContinue | Select-String 'IPC listening on') {
         $ready = $true
         break
     }
@@ -208,18 +208,18 @@ for ($i = 0; $i -lt 30; $i++) {
     if ($gwProc.HasExited) {
         Write-Err "Gateway 启动后退出，exit code=$($gwProc.ExitCode)"
         Write-Host "  ---- gateway.log ----" -ForegroundColor Gray
-        Get-Content $gwLog -ErrorAction SilentlyContinue | Select-Object -First 30
+        Get-Content $gwLog -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -First 30
         Write-Host "  ---- gateway.log.err ----" -ForegroundColor Gray
-        Get-Content "$gwLog.err" -ErrorAction SilentlyContinue | Select-Object -First 30
+        Get-Content "$gwLog.err" -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -First 30
         exit 1
     }
 }
 if (-not $ready) {
     Write-Err "Gateway 启动超时（15 秒内无 'IPC listening on' 日志）"
     Write-Host "  ---- gateway.log ----" -ForegroundColor Gray
-    Get-Content $gwLog -ErrorAction SilentlyContinue | Select-Object -First 50
+    Get-Content $gwLog -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -First 50
     Write-Host "  ---- gateway.log.err ----" -ForegroundColor Gray
-    Get-Content "$gwLog.err" -ErrorAction SilentlyContinue | Select-Object -First 50
+    Get-Content "$gwLog.err" -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -First 50
     Stop-Process -Id $gwProc.Id -Force -ErrorAction SilentlyContinue
     exit 1
 }
@@ -258,28 +258,35 @@ if ($adProc.HasExited) {
 }
 Write-Ok "Adapter PID=$($adProc.Id)，日志：$adLog"
 
-# 等待 Adapter 连上 Gateway（最多 10 秒）
+# 等待 Adapter 连上 Gateway（最多 15 秒）
+# Adapter 日志含中文，PS 5.1 按 GBK 读 UTF-8 文件会乱码，所以只 grep ASCII 部分
 $adReady = $false
-for ($i = 0; $i -lt 20; $i++) {
+for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Milliseconds 500
-    # Adapter console.log 走 stdout，console.warn/error 走 stderr
-    if (Get-Content $adLog -ErrorAction SilentlyContinue | Select-String 'IPC 已连接|启动完成') {
+    # 关键就绪标志（全是 ASCII）：
+    #   "ws connect success" — 长连接已建立
+    #   "ws client ready"    — SDK 客户端就绪
+    #   "IPC" + "Gateway"    — IPC 已连上 Gateway
+    $adLogContent = Get-Content $adLog -ErrorAction SilentlyContinue -Encoding UTF8
+    $adErrContent = Get-Content "$adLog.err" -ErrorAction SilentlyContinue -Encoding UTF8
+    $allContent = @($adLogContent) + @($adErrContent) -join "`n"
+    if ($allContent -match 'ws connect success|ws client ready') {
         $adReady = $true
         break
     }
-    if (Get-Content "$adLog.err" -ErrorAction SilentlyContinue | Select-String 'IPC 已连接|启动完成') {
+    if ($allContent -match 'IPC.+Gateway|Gateway.+IPC') {
         $adReady = $true
         break
     }
 }
 if ($adReady) {
-    Write-Ok "Adapter 已就绪"
+    Write-Ok "Adapter 已就绪（飞书长连接 + IPC 都已连上）"
 } else {
-    Write-Warn "Adapter 启动超时（10 秒内无就绪日志），看日志确认：$adLog"
+    Write-Warn "Adapter 启动超时（15 秒内无就绪日志），看日志确认：$adLog"
     Write-Host "  ---- adapter.log ----" -ForegroundColor Gray
-    Get-Content $adLog -ErrorAction SilentlyContinue | Select-Object -First 30
+    Get-Content $adLog -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -First 30
     Write-Host "  ---- adapter.log.err ----" -ForegroundColor Gray
-    Get-Content "$adLog.err" -ErrorAction SilentlyContinue | Select-Object -First 30
+    Get-Content "$adLog.err" -Encoding UTF8 -ErrorAction SilentlyContinue | Select-Object -First 30
 }
 
 # ---- 阶段 6：保存 PID + 打印状态 --------------------------------------
