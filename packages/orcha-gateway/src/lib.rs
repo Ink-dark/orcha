@@ -13,6 +13,7 @@
 
 pub mod config;
 pub mod ipc;
+pub mod protocol;
 pub mod queue;
 
 use anyhow::Result;
