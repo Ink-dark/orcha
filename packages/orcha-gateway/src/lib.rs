@@ -11,6 +11,7 @@
 //!
 //! 详见 docs/ROADMAP.md M6。
 
+pub mod auth;
 pub mod config;
 pub mod ipc;
 pub mod protocol;
