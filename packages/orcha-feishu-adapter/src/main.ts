@@ -3,17 +3,19 @@
  *
  * 启动流程：
  * 1. 读环境变量配置
- * 2. 构造 FeishuClient（mock 或 http 占位）
+ * 2. 构造 FeishuClient（mock 或 SDK 实现）
  * 3. 构造 IpcClient 连接 Gateway
- * 4. 启动飞书 webhook server（接收 @Orcha 触发）
+ * 4. 启动飞书 webhook server（含 challenge 透传 + 签名校验，接收 @Orcha 触发）
  * 5. IPC ↔ Feishu 双向路由：
  *    - webhook onTrigger → IPC Trigger 消息
  *    - IPC CardUpdate/Notify/TaskResult → FeishuClient.pushXxx
  * 6. SIGTERM/SIGINT 优雅关闭：关 webhook + stop IPC + 退出
  *
  * 默认 mock 模式（`ORCHA_ADAPTER_MOCK=1` 或缺省），所有飞书动作用 console.log。
- * 生产模式需提供 `ORCHA_FEISHU_APP_ID` + `ORCHA_FEISHU_APP_SECRET`，
- * 但 HttpFeishuClient 当前是 M7 占位骨架（抛 NotImplemented），M8 接入。
+ * 生产模式需提供：
+ *   - ORCHA_FEISHU_APP_ID + ORCHA_FEISHU_APP_SECRET（必填，调 OpenAPI）
+ *   - ORCHA_FEISHU_VERIFICATION_TOKEN（可选，challenge 校验）
+ *   - ORCHA_FEISHU_ENCRYPT_KEY（可选，事件签名校验）
  */
 
 import { IpcClient, IpcClientOptions } from './ipc';
@@ -45,13 +47,17 @@ interface AdapterConfig {
   feishuAppId?: string;
   /** 飞书 app_secret（非 mock 模式必填）。 */
   feishuAppSecret?: string;
+  /** 飞书 Verification Token（可选，challenge 校验）。 */
+  feishuVerificationToken?: string;
+  /** 飞书 Encrypt Key（可选，事件签名校验）。 */
+  feishuEncryptKey?: string;
 }
 
 /** 从环境变量读配置。失败时抛错并退出。 */
 function loadConfig(): AdapterConfig {
   const gatewayEndpoint = process.env.ORCHA_GATEWAY_ENDPOINT;
   if (!gatewayEndpoint) {
-    console.error('缺少必填环境变量 ORCHA_GATEWAY_ENDPOINT（如 tcp://127.0.0.1:7090 或 unix:///tmp/orcha.sock）');
+    console.error('缺少必填环境变量 ORCHA_GATEWAY_ENDPOINT（如 tcp://127.0.0.1:7422 或 unix:///tmp/orcha.sock）');
     process.exit(2);
   }
 
@@ -64,6 +70,8 @@ function loadConfig(): AdapterConfig {
 
   const feishuAppId = process.env.ORCHA_FEISHU_APP_ID;
   const feishuAppSecret = process.env.ORCHA_FEISHU_APP_SECRET;
+  const feishuVerificationToken = process.env.ORCHA_FEISHU_VERIFICATION_TOKEN;
+  const feishuEncryptKey = process.env.ORCHA_FEISHU_ENCRYPT_KEY;
 
   if (!mock) {
     if (!feishuAppId || !feishuAppSecret) {
@@ -72,7 +80,15 @@ function loadConfig(): AdapterConfig {
     }
   }
 
-  return { gatewayEndpoint, mock, webhookPort, feishuAppId, feishuAppSecret };
+  return {
+    gatewayEndpoint,
+    mock,
+    webhookPort,
+    feishuAppId,
+    feishuAppSecret,
+    feishuVerificationToken,
+    feishuEncryptKey,
+  };
 }
 
 // ============================================================
@@ -85,10 +101,15 @@ async function main(): Promise<void> {
 
   const feishuClient = createFeishuClient(cfg);
   const ipcClient = createIpcClient(cfg, feishuClient);
-  const webhookServer = startWebhookServer(cfg.webhookPort, {
-    onTrigger: (event: FeishuEvent) => {
-      onWebhookTrigger(event, ipcClient);
+  const webhookServer = startWebhookServer({
+    port: cfg.webhookPort,
+    handlers: {
+      onTrigger: (event: FeishuEvent) => {
+        onWebhookTrigger(event, ipcClient);
+      },
     },
+    verificationToken: cfg.feishuVerificationToken,
+    encryptKey: cfg.feishuEncryptKey,
   });
 
   // 信号处理：优雅关闭
@@ -110,6 +131,11 @@ async function main(): Promise<void> {
 
   ipcClient.start();
   console.log(`[adapter] webhook server 监听 :${cfg.webhookPort}/webhook/feishu`);
+  if (!cfg.mock) {
+    const sigOn = cfg.feishuEncryptKey ? 'on' : 'off';
+    const tokenOn = cfg.feishuVerificationToken ? 'on' : 'off';
+    console.log(`[adapter] 签名校验=${sigOn} token校验=${tokenOn}`);
+  }
   console.log('[adapter] 启动完成，等待飞书事件');
 }
 
@@ -118,7 +144,7 @@ function createFeishuClient(cfg: AdapterConfig): FeishuClient {
     console.log('[adapter] 使用 MockFeishuClient（所有动作用 console.log）');
     return new MockFeishuClient();
   }
-  console.log('[adapter] 使用 HttpFeishuClient（M7 占位骨架，方法会抛 NotImplemented）');
+  console.log('[adapter] 使用 HttpFeishuClient（@larksuiteoapi/node-sdk，token 自动刷新）');
   return new HttpFeishuClient({
     appId: cfg.feishuAppId!,
     appSecret: cfg.feishuAppSecret!,

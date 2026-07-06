@@ -1,25 +1,22 @@
 /**
- * 飞书接入：mock 模式 + webhook server + 卡片推送抽象。
+ * 飞书接入：mock 模式 + webhook server + 卡片推送。
  *
  * 三层职责：
  * 1. **接收**：飞书事件回调（webhook POST）→ 解析 @Orcha 触发 → 转成 TriggerMsg
  * 2. **发送**：收到 CardUpdate/Notify/TaskResult → 调飞书 API patch 卡片 / 发消息
  * 3. **mock 模式**：`ORCHA_ADAPTER_MOCK=1` 时所有动作用 console.log，便于本地开发
  *
- * M7 骨架阶段：
- * - MockFeishuClient 完整可用
- * - HttpFeishuClient 是占位骨架（TODO M8：接入飞书 OpenAPI token 刷新 + 卡片 schema）
- * - webhook server 用 node 内置 http，零依赖
- *
- * 飞书事件回调 JSON 结构（v2 简化版，仅含本 Adapter 需要的字段）：
- * ```json
- * { "header": { "event_type": "im.message.receive_v1" },
- *   "event": { "message": { "chat_id": "oc_xxx", "sender": { "sender_id": { "open_id": "ou_xxx" } },
- *                            "content": "{\"text\":\"@_user_1 fix login\"}" } } }
- * ```
+ * M8 实现：
+ * - 用 @larksuiteoapi/node-sdk 调飞书 OpenAPI（token 自动刷新 + 签名校验）
+ * - webhook 加 url_verification challenge 透传
+ * - webhook 加 X-Lark-Signature 签名校验（防伪造请求）
+ * - im.message.create 发初始卡片，im.message.patch 更新卡片内容
+ * - im.message.create 发 Notify/TaskResult 文本消息
  */
 
 import * as http from 'http';
+import * as crypto from 'crypto';
+import * as lark from '@larksuiteoapi/node-sdk';
 import { TriggerSource } from './protocol';
 
 /** 飞书触发事件（已解析）。 */
@@ -110,7 +107,7 @@ export class MockFeishuClient implements FeishuClient {
 }
 
 // ============================================================
-// Http 实现（占位，M8 接入飞书 OpenAPI）
+// Http 实现（M8：用 @larksuiteoapi/node-sdk）
 // ============================================================
 
 /** Http 飞书客户端配置。 */
@@ -119,33 +116,165 @@ export interface HttpFeishuConfig {
   appId: string;
   /** 飞书 app_secret。 */
   appSecret: string;
-  /** 飞书 OpenAPI 基址，默认 https://open.feishu.cn/open-apis。 */
-  baseUrl?: string;
+  /** 飞书 OpenAPI 基址，默认 https://open.feishu.cn/open-apis（lark.Domain.Feishu）。 */
+  domain?: string;
+}
+
+/** 卡片状态 emoji 映射，给用户更直观的进度感。 */
+function phaseEmoji(progress: number): string {
+  if (progress <= 5) return '\u{1F680}';   // 🚀
+  if (progress <= 40) return '\u{1F50D}';  // 🔍
+  if (progress <= 60) return '\u{1F4CB}';  // 📋
+  if (progress <= 80) return '\u{1F4BB}';  // 💻
+  if (progress < 100) return '\u{1F9EA}';  // 🧪
+  return '\u2705';                          // ✅
+}
+
+/** 把 CardUpdate 参数构造成飞书 interactive card 的 content JSON。 */
+function buildCardContent(
+  taskId: string,
+  phase: string,
+  detail: string,
+  progress: number,
+): string {
+  const emoji = phaseEmoji(progress);
+  const bar = buildProgressBar(progress);
+  return JSON.stringify({
+    schema: '2.0',
+    header: {
+      title: { tag: 'plain_text', content: `${emoji} Orcha 任务` },
+      template: progress >= 100 ? 'green' : 'blue',
+    },
+    body: {
+      elements: [
+        { tag: 'div', text: { tag: 'lark_md', content: `**任务 ID**\n${taskId}` } },
+        { tag: 'div', text: { tag: 'lark_md', content: `**阶段**\n${phase}` } },
+        { tag: 'div', text: { tag: 'lark_md', content: `**详情**\n${detail}` } },
+        { tag: 'hr' },
+        { tag: 'column_set', columns: [{ tag: 'column', width: 'weighted', weight: 1, elements: [{ tag: 'markdown', content: bar }] }] },
+      ],
+    },
+  });
+}
+
+/** 生成 ASCII 进度条：`[█████░░░░░] 50%`。 */
+function buildProgressBar(progress: number): string {
+  const total = 10;
+  const filled = Math.round((progress / 100) * total);
+  const bar = '\u2588'.repeat(filled) + '\u2591'.repeat(total - filled);
+  return `[${bar}] ${progress}%`;
 }
 
 /**
- * Http 飞书客户端（M7 占位骨架）。
+ * Http 飞书客户端（M8 用 @larksuiteoapi/node-sdk 实现）。
  *
- * M7 阶段所有方法抛 NotImplemented，避免被误用为已实现。
- * M8 接入真实飞书 OpenAPI：tenant_access_token 刷新 + 卡片 schema + patch 接口。
+ * - 用 lark.Client 自动管 tenant_access_token（缓存 + 过期自动刷新）
+ * - CardUpdate：先 create 一条卡片消息，后续 patch 更新内容
+ *   （session 内 task_id → message_id 映射，重复 push 复用同一条卡片）
+ * - Notify / TaskResult：发文本消息到 chat_id（session）
  */
 export class HttpFeishuClient implements FeishuClient {
-  private readonly cfg: Required<HttpFeishuConfig>;
+  private readonly client: lark.Client;
+  /** session:taskId → message_id 映射，patch 更新时复用。 */
+  private readonly cardMsgIds = new Map<string, string>();
+
   constructor(cfg: HttpFeishuConfig) {
-    this.cfg = {
+    this.client = new lark.Client({
       appId: cfg.appId,
       appSecret: cfg.appSecret,
-      baseUrl: cfg.baseUrl ?? 'https://open.feishu.cn/open-apis',
-    };
+      // cfg.domain 可选覆盖，默认 lark.Domain.Feishu（https://open.feishu.cn）
+      domain: cfg.domain ?? lark.Domain.Feishu,
+    });
   }
-  async pushCardUpdate(): Promise<void> {
-    throw new Error(`HttpFeishuClient.pushCardUpdate not implemented (M8); cfg=${JSON.stringify({ appId: this.cfg.appId, baseUrl: this.cfg.baseUrl })}`);
+
+  async pushCardUpdate(
+    session: string,
+    taskId: string,
+    phase: string,
+    detail: string,
+    progress: number,
+  ): Promise<void> {
+    const key = `${session}:${taskId}`;
+    const content = buildCardContent(taskId, phase, detail, progress);
+
+    const existingMsgId = this.cardMsgIds.get(key);
+    if (existingMsgId) {
+      // patch 更新已有卡片
+      try {
+        await this.client.im.message.patch({
+          path: { message_id: existingMsgId },
+          data: { content },
+        });
+        return;
+      } catch (e) {
+        // patch 失败（消息被删 / 过期）→ 重新 create 一条
+        console.warn(`[feishu] patch 失败，重新创建: ${(e as Error).message}`);
+        this.cardMsgIds.delete(key);
+      }
+    }
+
+    // create 新卡片
+    const resp = await this.client.im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: session,
+        msg_type: 'interactive',
+        content,
+      },
+    });
+    const msgId = resp?.data?.message_id;
+    if (msgId) {
+      this.cardMsgIds.set(key, msgId);
+    }
   }
-  async pushNotify(): Promise<void> {
-    throw new Error('HttpFeishuClient.pushNotify not implemented (M8)');
+
+  async pushNotify(
+    session: string,
+    taskId: string,
+    level: 'info' | 'warn' | 'error',
+    message: string,
+  ): Promise<void> {
+    const emoji = level === 'error' ? '\u274C' : level === 'warn' ? '\u26A0\uFE0F' : '\u2139\uFE0F';
+    const content = JSON.stringify({
+      text: `${emoji} [${level}] ${taskId}\n${message}`,
+    });
+    await this.client.im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: session,
+        msg_type: 'text',
+        content,
+      },
+    });
   }
-  async pushTaskResult(): Promise<void> {
-    throw new Error('HttpFeishuClient.pushTaskResult not implemented (M8)');
+
+  async pushTaskResult(
+    session: string,
+    taskId: string,
+    outcome: string,
+    summary: string,
+    artifacts: string[],
+  ): Promise<void> {
+    const emoji = outcome === 'success' ? '\u2705' : '\u274C';
+    const lines = [
+      `${emoji} 任务完成: ${taskId}`,
+      `**结果**: ${summary}`,
+    ];
+    if (artifacts.length > 0) {
+      lines.push(`**产物**:`);
+      for (const a of artifacts) {
+        lines.push(`- ${a}`);
+      }
+    }
+    const content = JSON.stringify({ text: lines.join('\n') });
+    await this.client.im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: {
+        receive_id: session,
+        msg_type: 'text',
+        content,
+      },
+    });
   }
 }
 
@@ -163,9 +292,6 @@ export class HttpFeishuClient implements FeishuClient {
  * 不匹配返回 null（非触发消息，应忽略）。
  */
 export function parseTrigger(raw: string): string | null {
-  // 飞书 IM 消息 content 字段里的 @ 通常被替换成 @_user_N 占位，
-  // 但本 Adapter 在 webhook 入口已经还原成 @Orcha 前缀（见 webhook 解析）。
-  // 这里只处理 @Orcha 前缀，其他形态（@_user_N）由 webhook 入口预处理。
   const match = raw.match(/^@Orcha\s+(.+)$/);
   if (match === null) {
     return null;
@@ -174,9 +300,7 @@ export function parseTrigger(raw: string): string | null {
   return desc === '' ? null : desc;
 }
 
-/**
- * 从解析后的 FeishuEvent 构造 TriggerSource（用于 IPC Trigger 消息）。
- */
+/** 从解析后的 FeishuEvent 构造 TriggerSource（用于 IPC Trigger 消息）。 */
 export function eventToTriggerSource(event: FeishuEvent): TriggerSource {
   return {
     platform: 'feishu',
@@ -187,55 +311,133 @@ export function eventToTriggerSource(event: FeishuEvent): TriggerSource {
 }
 
 // ============================================================
-// Webhook server
+// Webhook server（含 challenge 透传 + 签名校验）
 // ============================================================
+
+/** webhook server 配置。 */
+export interface WebhookServerOptions {
+  /** 监听端口。 */
+  port: number;
+  /** 事件 handler。 */
+  handlers: FeishuWebhookHandlers;
+  /** 飞书 Verification Token（开放平台 → 事件订阅页获取，留空则不校验）。 */
+  verificationToken?: string;
+  /** 飞书 Encrypt Key（开放平台 → 事件订阅页获取，留空则不校验签名）。 */
+  encryptKey?: string;
+}
+
+/**
+ * 校验飞书事件签名。
+ *
+ * 飞书签名算法：HMAC-SHA256(timestamp + nonce + encryptKey + body)
+ * header: X-Lark-Signature
+ */
+function verifySignature(
+  timestamp: string,
+  nonce: string,
+  body: string,
+  encryptKey: string,
+  signature: string,
+): boolean {
+  const payload = timestamp + nonce + encryptKey + body;
+  const expected = crypto.createHmac('sha256', encryptKey).update(payload).digest('hex');
+  // 用 timingSafeEqual 防时序攻击
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  } catch {
+    return false;
+  }
+}
 
 /**
  * 启动飞书事件回调 webhook server。
  *
- * 监听 POST `/webhook/feishu`，解析飞书事件 JSON：
- * - `im.message.receive_v1` → 提取 @Orcha 触发 → 调 handlers.onTrigger
- * - 其他事件类型：log 后忽略
- *
- * M7 骨架不做事件签名校验（飞书 Encrypt Key + Verification Token），
- * M8 接入生产时必须补上。
+ * 监听 POST `/webhook/feishu`：
+ * - url_verification → 返回 challenge（飞书开放平台添加事件订阅时校验）
+ * - im.message.receive_v1 → 提取 @Orcha 触发 → 调 handlers.onTrigger
+ * - 签名校验（如果配了 encryptKey）
+ * - 其他事件 → log 后 ack
  *
  * 返回 http.Server 实例，调用方负责 close。
  */
-export function startWebhookServer(
-  port: number,
-  handlers: FeishuWebhookHandlers,
-): http.Server {
+export function startWebhookServer(opts: WebhookServerOptions): http.Server {
+  const { port, handlers, verificationToken, encryptKey } = opts;
   const server = http.createServer((req, res) => {
     if (req.method !== 'POST' || req.url !== '/webhook/feishu') {
       res.statusCode = 404;
       res.end('not found');
       return;
     }
-    let body = '';
+
+    // 收集 raw body（签名校验需要原始字节，不能用 JSON.parse 后的）
+    const chunks: Buffer[] = [];
     req.on('data', (chunk: Buffer) => {
-      body += chunk.toString('utf8');
-      // 防御：超长请求体直接拒绝
-      if (body.length > 1024 * 1024) {
+      chunks.push(chunk);
+      if (Buffer.concat(chunks).length > 1024 * 1024) {
         res.statusCode = 413;
         res.end('payload too large');
         req.destroy();
       }
     });
+
     req.on('end', () => {
+      const rawBody = Buffer.concat(chunks).toString('utf8');
+
+      // 签名校验（配了 encryptKey 才校验）
+      if (encryptKey) {
+        const sig = req.headers['x-lark-signature'] as string | undefined;
+        const ts = req.headers['x-lark-request-timestamp'] as string | undefined;
+        const nonce = req.headers['x-lark-request-nonce'] as string | undefined;
+        if (!sig || !ts || !nonce) {
+          console.warn('[webhook] 拒绝：缺少签名头');
+          res.statusCode = 401;
+          res.end('missing signature');
+          return;
+        }
+        if (!verifySignature(ts, nonce, rawBody, encryptKey, sig)) {
+          console.warn('[webhook] 拒绝：签名校验失败');
+          res.statusCode = 401;
+          res.end('invalid signature');
+          return;
+        }
+      }
+
       let parsed: unknown;
       try {
-        parsed = JSON.parse(body);
+        parsed = JSON.parse(rawBody);
       } catch (e) {
         console.warn('[webhook] invalid JSON:', (e as Error).message);
         res.statusCode = 400;
         res.end('invalid json');
         return;
       }
+
       try {
+        // url_verification：返回 challenge（飞书开放平台添加事件订阅时校验）
+        const obj = parsed as Record<string, unknown>;
+        if (obj.type === 'url_verification') {
+          // 可选校验 token（飞书会带 token，但 challenge 阶段通常还没配 encryptKey）
+          if (verificationToken && obj.token !== verificationToken) {
+            console.warn('[webhook] challenge token 不匹配');
+            res.statusCode = 401;
+            res.end('invalid token');
+            return;
+          }
+          const challenge = obj.challenge;
+          if (typeof challenge !== 'string') {
+            res.statusCode = 400;
+            res.end('missing challenge');
+            return;
+          }
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ challenge }));
+          console.log('[webhook] url_verification 已响应');
+          return;
+        }
+
         const event = parseFeishuEvent(parsed);
         if (event === null) {
-          // 非触发事件（如 url 验证 challenge 或非 @Orcha 消息），ack 即可
           res.statusCode = 200;
           res.end('ok');
           return;
@@ -249,6 +451,7 @@ export function startWebhookServer(
         res.end('handler error');
       }
     });
+
     req.on('error', (err: Error) => {
       console.warn('[webhook] request error:', err.message);
       if (!res.headersSent) {
@@ -276,18 +479,12 @@ export function startWebhookServer(
  *       "chat_id": "oc_xxx",
  *       "chat_type": "group" | "p2p",
  *       "message_type": "text",
- *       "content": "{\"text\":\"@_user_1 fix login\"}"
+ *       "content": "{\"text\":\"@_user_1 fix login\"}",
+ *       "mentions": [{ "key": "@_user_1", "id": { "open_id": "ou_bot" } }]
  *     }
  *   }
  * }
  * ```
- *
- * 飞书 url 验证 challenge（添加事件订阅时飞书会发一个 challenge 请求）：
- * ```json
- * { "type": "url_verification", "challenge": "xxx", "token": "xxx" }
- * ```
- * 返回 null（上层会回 200，但没把 challenge 透出去——M8 接入时这里要返回
- * challenge 让上层写到 response）。
  */
 function parseFeishuEvent(payload: unknown): FeishuEvent | null {
   if (typeof payload !== 'object' || payload === null) {
@@ -295,7 +492,7 @@ function parseFeishuEvent(payload: unknown): FeishuEvent | null {
   }
   const obj = payload as Record<string, unknown>;
 
-  // url 验证 challenge：M7 骨架直接当非触发返回（不返回 challenge）
+  // url 验证 challenge 在 webhook 入口已处理，到这里说明不是
   if (obj.type === 'url_verification') {
     return null;
   }
@@ -339,11 +536,9 @@ function parseFeishuEvent(payload: unknown): FeishuEvent | null {
     return null;
   }
   const chatType = msg.chat_type;
-  // group：保留 chatId 作为 group；p2p：group 为 null
   const group = chatType === 'group' ? chatId : null;
 
   if (msg.message_type !== 'text') {
-    // 非文本消息（图片 / 富文本等）暂不处理
     return null;
   }
 
@@ -362,9 +557,8 @@ function parseFeishuEvent(payload: unknown): FeishuEvent | null {
     return null;
   }
 
-  // 飞书 content 里的 @ 实际是 @_user_N 占位，本骨架简化处理：
-  // 把 @_user_1 还原成 @Orcha（假设第一个 @ 占位就是 @Orcha）。
-  // M8 接入真实飞书 SDK 时用 mentions 字段精确还原。
+  // 飞书 content 里的 @ 实际是 @_user_N 占位，把 @_user_1 还原成 @Orcha
+  // （飞书开放平台 mentions 字段会带精确的 open_id，但这里简化处理：第一个 @ 占位就是 @Orcha）
   const raw = text.replace(/^@_user_\d+\s*/, '@Orcha ');
   const description = parseTrigger(raw);
   if (description === null) {

@@ -216,8 +216,12 @@ $adEnv = @{
     ORCHA_ADAPTER_MOCK       = '1'
 }
 # 保留 dev-env 里的飞书凭证（如果设了）
-if ($env:ORCHA_FEISHU_APP_ID)     { $adEnv.ORCHA_FEISHU_APP_ID = $env:ORCHA_FEISHU_APP_ID }
-if ($env:ORCHA_FEISHU_APP_SECRET) { $adEnv.ORCHA_FEISHU_APP_SECRET = $env:ORCHA_FEISHU_APP_SECRET }
+if ($env:ORCHA_FEISHU_APP_ID)           { $adEnv.ORCHA_FEISHU_APP_ID = $env:ORCHA_FEISHU_APP_ID }
+if ($env:ORCHA_FEISHU_APP_SECRET)       { $adEnv.ORCHA_FEISHU_APP_SECRET = $env:ORCHA_FEISHU_APP_SECRET }
+if ($env:ORCHA_FEISHU_VERIFICATION_TOKEN) { $adEnv.ORCHA_FEISHU_VERIFICATION_TOKEN = $env:ORCHA_FEISHU_VERIFICATION_TOKEN }
+if ($env:ORCHA_FEISHU_ENCRYPT_KEY)      { $adEnv.ORCHA_FEISHU_ENCRYPT_KEY = $env:ORCHA_FEISHU_ENCRYPT_KEY }
+# 用户在 dev-env.ps1 里把 mock 设为 0 时切真实飞书模式
+if ($null -ne $env:ORCHA_ADAPTER_MOCK)  { $adEnv.ORCHA_ADAPTER_MOCK = $env:ORCHA_ADAPTER_MOCK }
 
 # PS 5.1 Start-Process 不支持 -Environment，用 cmd /c 注入环境变量
 $envCmd = ($adEnv.GetEnumerator() | ForEach-Object { "set `"$($_.Key)=$($_.Value)`"" }) -join ' && '

@@ -24,8 +24,15 @@ $env:ORCHA_LLM_API_KEY = "YOUR_LLM_API_KEY_HERE"
 # $env:ORCHA_LLM_MODEL = "llama3"
 
 # ====================================================================
-# 飞书凭证（可选，M7 阶段用 mock 模式可留空）
+# 飞书凭证（接真实飞书时必填，mock 模式可留空）
 # ====================================================================
-# 仅当 scripts\start.ps1 不用 mock 时（即改了 ORCHA_ADAPTER_MOCK=0）才需要
+# 飞书开放平台 → 应用详情 → 凭证与基础信息
 # $env:ORCHA_FEISHU_APP_ID = "cli_xxx"
 # $env:ORCHA_FEISHU_APP_SECRET = "..."
+#
+# 飞书开放平台 → 事件订阅 → 加密策略
+# $env:ORCHA_FEISHU_VERIFICATION_TOKEN = "..."   # Verification Token
+# $env:ORCHA_FEISHU_ENCRYPT_KEY = "..."          # Encrypt Key（事件签名校验）
+#
+# 启动真实飞书模式（默认是 mock=1）
+# $env:ORCHA_ADAPTER_MOCK = "0"
