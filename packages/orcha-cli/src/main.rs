@@ -91,6 +91,13 @@ enum Command {
         /// 默认关闭，跑确定性实现（CI/离线可跑）。
         #[arg(long, default_value_t = false)]
         llm: bool,
+
+        /// 启用 AI 驱动调度（M7 P0）：调度权交给 LLM，每步由 LLM 决定调哪个 SubAgent。
+        /// 需配合 `--llm` 使用（隐含 LLM 路径）。默认 `--llm` 走固定 5 步链路，
+        /// `--ai` 改为 AI 决策的动态调度。`max_rounds` 语义变为「总决策步数上限」
+        /// （不再是循环次数），建议设为 20~30 才够 Plan→Code→Test→Review→exit 链路。
+        #[arg(long, default_value_t = false)]
+        ai: bool,
     },
 
     /// 崩溃恢复：扫描 store，把中断的 RUNNING Task 迁移到 BLOCKED 或 FAILED。
@@ -179,6 +186,7 @@ fn main() -> Result<()> {
             max_rounds,
             max_retries,
             llm,
+            ai,
         }) => {
             let exit_code = run_fix(
                 &resolve_home(cli.home.as_deref()),
@@ -187,6 +195,7 @@ fn main() -> Result<()> {
                 max_rounds,
                 max_retries,
                 llm,
+                ai,
             )?;
             // 直接 exit 以保证调用方能区分成功/失败（脚本/CI 用 $? 判断）。
             std::process::exit(exit_code);
@@ -265,6 +274,7 @@ fn run_fix(
     max_rounds: u32,
     max_retries: u32,
     llm: bool,
+    ai: bool,
 ) -> Result<i32> {
     if !workspace.is_dir() {
         bail!("workspace 不存在或不是目录: {}", workspace.display());
@@ -288,8 +298,30 @@ fn run_fix(
         cool_down: Duration::from_secs(60),
     };
 
-    // 路径选择：--llm 走 LLM 驱动（需 feature + env）；否则确定性实现。
-    let outcome = if llm {
+    // 路径选择：
+    // - `--ai --llm`：AI 驱动调度，每步由 LLM 决定调哪个 SubAgent（M7）
+    // - `--llm`：固定 5 步链路 LLM Cycleround
+    // - 默认：确定性 Cycleround
+    let outcome = if ai {
+        #[cfg(feature = "llm")]
+        {
+            if !llm {
+                bail!("`--ai` 需配合 `--llm` 使用");
+            }
+            let cfg = orcha_llm::LlmConfig::from_env()
+                .map_err(|e| anyhow::anyhow!("LLM 配置错误: {e}"))?;
+            let client: std::sync::Arc<dyn orcha_llm::LlmClient> =
+                std::sync::Arc::new(orcha_llm::OpenAiCompatibleClient::new(cfg));
+            let memory = std::sync::Arc::new(FileMemoryStore::new(home));
+            memory.init()?;
+            let cycle = orcha_core::AiDrivenCycleround::with_memory(config, client, memory);
+            cycle.run_with_history(&task, workspace, &history_store)
+        }
+        #[cfg(not(feature = "llm"))]
+        {
+            bail!("`--ai` 需要编译时启用 `--features llm`");
+        }
+    } else if llm {
         #[cfg(feature = "llm")]
         {
             let cfg = orcha_llm::LlmConfig::from_env()
@@ -481,6 +513,7 @@ mod tests {
             5,
             3,
             false,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 0, "成功路径退出码应为 0");
@@ -521,6 +554,7 @@ mod tests {
             5,
             3,
             false,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 0);
@@ -555,6 +589,7 @@ mod tests {
             5,
             2,
             false,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 1, "失败路径退出码应为 1");
@@ -582,6 +617,7 @@ mod tests {
             "x".into(),
             5,
             3,
+            false,
             false,
         )
         .unwrap_err();
@@ -904,6 +940,7 @@ mod tests {
             "创建 hello.py 输出 hello".into(),
             5,
             3,
+            false,
             false,
         )
         .expect("run_fix should not error");

@@ -21,6 +21,10 @@ pub mod llm_agents;
 #[cfg(feature = "llm")]
 pub mod tools;
 
+/// M7 P0：AI 驱动调度（Cycleround 调度权交 LLM）。
+#[cfg(feature = "llm")]
+pub mod ai_cycleround;
+
 pub use audit::{AuditAction, AuditEntry, AuditLogger, NoopAuditLogger};
 pub use cycleround::{
     CycleConfig, CycleOutcome, Cycleround, FailureReason, RoundEvent, RoundRecord,
@@ -46,3 +50,6 @@ pub use sub_agents::{find_python, Fixer, Observer, Planner, Reviewer, Tester, Wo
 
 #[cfg(feature = "llm")]
 pub use llm_agents::{LlmCycleround, LlmPlanner, LlmReviewer, LlmWorker};
+
+#[cfg(feature = "llm")]
+pub use ai_cycleround::{AiDecision, AiDrivenCycleround};
