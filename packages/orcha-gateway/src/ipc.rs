@@ -12,7 +12,22 @@
 use std::io::{self, Read, Write};
 
 /// IPC 连接的读写流抽象。
-pub trait IpcStream: Read + Write + Send {}
+pub trait IpcStream: Read + Write + Send {
+    /// 设置读超时（用于 watchdog，M7）。
+    ///
+    /// - `None`：阻塞读（默认）。
+    /// - `Some(d)`：`d` 后未读到数据则 `read` 返回 `WouldBlock` 错误。
+    ///
+    /// Gateway reader 线程设 35s 超时（略大于 Adapter 心跳间隔 30s），
+    /// 连续 3 次超时（≈105s 无心跳）视为 Adapter 死亡，断开连接。
+    fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> io::Result<()>;
+
+    /// 克隆 handle（用于拆分读写：reader 持一份，writer 持一份）。
+    ///
+    /// 两份共享同一底层连接（同一 fd），各自独立持有。
+    /// `set_read_timeout` 是 socket 级别，但 writer 只 write 不受影响。
+    fn try_clone(&self) -> io::Result<Box<dyn IpcStream>>;
+}
 
 /// IPC 地址（Unix path 或 TCP host:port）。
 #[derive(Debug, Clone)]
@@ -85,7 +100,15 @@ mod tcp_backend {
         }
     }
 
-    impl IpcStream for TcpStreamWrap {}
+    impl IpcStream for TcpStreamWrap {
+        fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> io::Result<()> {
+            self.0.set_read_timeout(dur)
+        }
+
+        fn try_clone(&self) -> io::Result<Box<dyn IpcStream>> {
+            Ok(Box::new(TcpStreamWrap(self.0.try_clone()?)))
+        }
+    }
 
     impl TcpTransport {
         pub fn bind(addr: &IpcAddr) -> io::Result<Self> {
@@ -154,7 +177,15 @@ mod unix_backend {
         }
     }
 
-    impl IpcStream for UnixStreamWrap {}
+    impl IpcStream for UnixStreamWrap {
+        fn set_read_timeout(&self, dur: Option<std::time::Duration>) -> io::Result<()> {
+            self.0.set_read_timeout(dur)
+        }
+
+        fn try_clone(&self) -> io::Result<Box<dyn IpcStream>> {
+            Ok(Box::new(UnixStreamWrap(self.0.try_clone()?)))
+        }
+    }
 
     impl UnixTransport {
         pub fn bind(addr: &IpcAddr) -> io::Result<Self> {

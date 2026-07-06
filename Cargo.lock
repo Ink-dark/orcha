@@ -639,6 +639,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "orcha-core",
+ "orcha-llm",
  "orcha-sdk",
  "serde",
  "serde_json",

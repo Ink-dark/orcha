@@ -11,6 +11,8 @@ description = "Orcha Gateway - 独立进程，任务队列与跨进程通信入�
 [dependencies]
 orcha-sdk = { path = "../orcha-sdk", version = "0.1.0" }
 orcha-core = { path = "../orcha-core", version = "0.1.0" }
+# orcha-llm 仅在启用 `llm` feature 时引入（避免无 LLM 场景拉 ureq）
+orcha-llm = { path = "../orcha-llm", version = "0.1.0", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -22,6 +24,9 @@ toml.workspace = true
 tempfile = "3"
 
 [features]
-default = []
+default = ["llm"]
 # 启用 SQLite 后端（M6，WAL + 跨进程锁）
 sqlite = ["orcha-core/sqlite"]
+# 启用 LLM 驱动调度（M7）：拉入 orcha-llm + orcha-core/llm，
+# 让 Gateway 能构造 LlmCycleround。无 LLM 场景用 --no-default-features。
+llm = ["dep:orcha-llm", "orcha-core/llm"]
