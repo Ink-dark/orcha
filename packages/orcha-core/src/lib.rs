@@ -1,10 +1,13 @@
 // Orcha Core - Cycleround loop and task orchestration.
 // See docs/ROADMAP.md M0/M1/M2/M3 for the contract this crate fulfills.
 
+pub mod audit;
 pub mod cycleround;
 pub mod error;
 pub mod history;
 pub mod memory;
+pub mod path_guard;
+pub mod plan;
 pub mod recovery;
 pub mod sandbox;
 pub mod state_machine;
@@ -15,14 +18,23 @@ pub mod sub_agents;
 #[cfg(feature = "llm")]
 pub mod llm_agents;
 
+#[cfg(feature = "llm")]
+pub mod tools;
+
+pub use audit::{AuditAction, AuditEntry, AuditLogger, NoopAuditLogger};
 pub use cycleround::{
     CycleConfig, CycleOutcome, Cycleround, FailureReason, RoundEvent, RoundRecord,
 };
 pub use error::CoreError;
 pub use history::{FileHistoryStore, HistoryStore};
 pub use memory::{FileMemoryStore, MemoryEntry, MemoryStore};
+pub use path_guard::{PathGuard, PathGuardError, MAX_READ_FILE_SIZE};
+pub use plan::{
+    apply_step, check_diff_scope, extract_changed_files, plan_from_create_desc, Plan, PlanAction,
+    PlanStep,
+};
 pub use recovery::{RecoverStrategy, Recovery, RecoveryReport};
-pub use sandbox::{FsSandbox, Sandbox, Workspace};
+pub use sandbox::{FsSandbox, GitWorktree, Sandbox, Workspace};
 pub use state_machine::{is_legal_transition, is_terminal, transition};
 pub use store::{FileTaskStore, TaskStore};
 

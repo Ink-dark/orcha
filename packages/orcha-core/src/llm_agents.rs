@@ -20,16 +20,19 @@ use std::path::Path;
 use std::sync::Arc;
 
 use orcha_llm::{
-    build_planner_prompt, build_reviewer_prompt, build_worker_prompt, parse_planner_output,
-    parse_reviewer_output, parse_worker_output, ChatMessage, LlmClient,
+    build_reviewer_prompt, parse_planner_output, parse_reviewer_output, parse_worker_output,
+    ChatMessage, LlmClient, PLANNER_SYSTEM, WORKER_SYSTEM,
 };
 use orcha_sdk::{Artifact, ArtifactType, Task};
 
 use crate::cycleround::{build_round, persist_round};
 use crate::history::HistoryStore;
 use crate::memory::{MemoryEntry, MemoryStore};
+use crate::path_guard::PathGuard;
+use crate::plan::check_diff_scope;
 use crate::sub_agent::{StepContext, StepOutput, SubAgent};
 use crate::sub_agents::{list_workspace_files, Fixer, Observer, Tester};
+use crate::tools::{all_tools, run_agent_loop, MAX_TOOL_TURNS};
 use crate::{CycleConfig, CycleOutcome, FailureReason, RoundRecord};
 
 /// LLM 驱动的 Planner：调 LLM 产出 JSON 计划。
@@ -57,10 +60,39 @@ impl LlmPlanner {
     /// 当 memory 为 None 时退化为无记忆调用，与 `SubAgent::run` 等价。
     pub fn run_at(&self, ctx: &StepContext, round: u32) -> StepOutput {
         let files = list_workspace_files(&ctx.workspace);
-        let mut msgs = build_planner_prompt(&ctx.task.description, &files);
+        let files_str = if files.is_empty() {
+            "（workspace 为空）".to_string()
+        } else {
+            files.join(", ")
+        };
+
+        let guard = match PathGuard::new(&ctx.workspace) {
+            Ok(g) => g,
+            Err(e) => {
+                return StepOutput::failure("S-planner", format!("PathGuard 初始化失败: {e}"));
+            }
+        };
+
+        let mut msgs = vec![
+            ChatMessage::system(PLANNER_SYSTEM),
+            ChatMessage::user(format!(
+                "任务：{}\n\n当前 workspace 文件：{files_str}\n\n先用工具探索 workspace，然后输出 JSON 计划。",
+                ctx.task.description
+            )),
+        ];
         inject_memory(&mut msgs, &self.memory, &ctx.task.id);
 
-        let resp = match self.client.chat(&msgs) {
+        let tools = all_tools();
+        let resp = match run_agent_loop(
+            self.client.as_ref(),
+            msgs,
+            &tools,
+            &ctx.workspace,
+            &guard,
+            "planner",
+            None,
+            MAX_TOOL_TURNS,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 return StepOutput::failure("S-planner", format!("LLM 调用失败: {e}"));
@@ -123,7 +155,6 @@ impl LlmWorker {
     }
 
     pub fn run_at(&self, ctx: &StepContext, round: u32) -> StepOutput {
-        // 从前序 Planner artifact 拿到 plan 引用（简化：让 LLM 直接产出 files）。
         let plan_text = ctx
             .prior_artifacts
             .iter()
@@ -138,10 +169,33 @@ impl LlmWorker {
             format!("参考 planner artifact {}", plan_text)
         };
 
-        let mut msgs = build_worker_prompt(&ctx.task.description, &plan_summary);
+        let guard = match PathGuard::new(&ctx.workspace) {
+            Ok(g) => g,
+            Err(e) => {
+                return StepOutput::failure("S-worker", format!("PathGuard 初始化失败: {e}"));
+            }
+        };
+
+        let mut msgs = vec![
+            ChatMessage::system(WORKER_SYSTEM),
+            ChatMessage::user(format!(
+                "任务：{}\n\n计划摘要：{plan_summary}\n\n先用工具读取需要修改的文件，确认内容后再输出 JSON。",
+                ctx.task.description
+            )),
+        ];
         inject_memory(&mut msgs, &self.memory, &ctx.task.id);
 
-        let resp = match self.client.chat(&msgs) {
+        let tools = all_tools();
+        let resp = match run_agent_loop(
+            self.client.as_ref(),
+            msgs,
+            &tools,
+            &ctx.workspace,
+            &guard,
+            "worker",
+            None,
+            MAX_TOOL_TURNS,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 return StepOutput::failure("S-worker", format!("LLM 调用失败: {e}"));
@@ -164,32 +218,47 @@ impl LlmWorker {
             return StepOutput::failure("S-worker", "LLM 未产出任何文件");
         }
 
+        // M4：使用已构造的 PathGuard + target_files 白名单。
+        // target_files 直接由 LLM 输出的 file 列表派生（每个 file 即声明要写的路径）。
+        // PathGuard 强制：路径不逃逸 workspace + 不在危险路径黑名单内 + 在 target_files 白名单内。
+        let target_files: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
+
         let mut artifacts = Vec::new();
         let mut written = Vec::new();
+        let mut combined_patch = String::new();
         for (path, content) in &files {
-            // 防穿越
-            if path.contains("..") || path.starts_with('/') {
-                return StepOutput::failure("S-worker", format!("非法路径: {path}"));
-            }
-            let target = ctx.workspace.join(path);
-            if let Some(parent) = target.parent() {
+            // M4：统一走 PathGuard::validate_write，强制写边界。
+            let resolved = match guard.validate_write(path, &target_files) {
+                Ok(p) => p,
+                Err(e) => {
+                    return StepOutput::failure("S-worker", format!("写边界拒绝 {path}: {e}"));
+                }
+            };
+            // validate_write 已校验路径，但仍走 create_dir_all + write 流程（保留 M2 行为）。
+            if let Some(parent) = resolved.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
                     return StepOutput::failure("S-worker", format!("创建目录失败: {e}"));
                 }
             }
             let normalized = ensure_trailing_newline(content);
-            if let Err(e) = std::fs::write(&target, &normalized) {
+            if let Err(e) = std::fs::write(&resolved, &normalized) {
                 return StepOutput::failure("S-worker", format!("写文件失败 {path}: {e}"));
             }
             let patch = make_create_diff(path, &normalized).unwrap_or_default();
+            combined_patch.push_str(&patch);
             artifacts.push(Artifact {
                 artifact_id: next_artifact_id(&ctx.prior_artifacts, "worker"),
                 artifact_type: ArtifactType::CodeDiff,
                 commit_sha: None,
                 patch: Some(patch),
-                url: Some(format!("file:///{}", target.display())),
+                url: Some(format!("file:///{}", resolved.display())),
             });
             written.push(path.clone());
+        }
+
+        // M4：自检 patch 改动文件集合 ⊆ target_files（防 patch 被篡改含未声明文件）。
+        if let Err(e) = check_diff_scope(&combined_patch, &target_files) {
+            return StepOutput::failure("S-worker", format!("diff 范围校验失败: {e}"));
         }
 
         StepOutput::success(
@@ -231,11 +300,39 @@ impl LlmReviewer {
     }
 
     pub fn run_at(&self, ctx: &StepContext, round: u32) -> StepOutput {
-        let worker_files: Vec<(String, String)> = ctx
+        // M4：收集 Worker 产出的 patch 与文件，先做 diff scope 校验，再交 LLM 审。
+        // diff scope 校验不依赖 LLM 输出，是确定性前置检查：
+        //   patch 改动文件集合必须 ⊆ plan 声明的 target_files
+        // 由于 LlmWorker 的 target_files 由 LLM 输出文件列表派生，
+        // 这里反向从 worker artifact 抽取改动文件，并从 ctx.task.description 派生期望文件集合。
+        // 更严格的 target_files 比对留待 P1（需 Planner 产 Plan 后贯穿）。
+        let worker_artifacts: Vec<&Artifact> = ctx
             .prior_artifacts
             .iter()
             .rev()
             .filter(|a| a.artifact_type == ArtifactType::CodeDiff)
+            .collect();
+
+        if worker_artifacts.is_empty() {
+            return StepOutput::failure("S-reviewer", "无可审核的 Worker 产出");
+        }
+
+        // 收集 worker 产出的 patch 文本，做 diff scope 校验。
+        // target_files 派生：从 task.description 抽取声明路径（兼容旧路径，无声明则不强制）。
+        let combined_patch: String = worker_artifacts
+            .iter()
+            .filter_map(|a| a.patch.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let target_files = derive_target_files_from_task(&ctx.task.description);
+        if !target_files.is_empty() {
+            if let Err(e) = check_diff_scope(&combined_patch, &target_files) {
+                return StepOutput::failure("S-reviewer", format!("diff 范围越界: {e}"));
+            }
+        }
+
+        let worker_files: Vec<(String, String)> = worker_artifacts
+            .iter()
             .filter_map(|a| {
                 let u = a.url.as_ref()?;
                 let p = u.strip_prefix("file://")?;
@@ -245,10 +342,6 @@ impl LlmReviewer {
                 Some((rel.to_string_lossy().into_owned(), content))
             })
             .collect();
-
-        if worker_files.is_empty() {
-            return StepOutput::failure("S-reviewer", "无可审核的 Worker 产出");
-        }
 
         let mut msgs = build_reviewer_prompt(&ctx.task.description, &worker_files);
         inject_memory(&mut msgs, &self.memory, &ctx.task.id);
@@ -290,6 +383,28 @@ impl LlmReviewer {
             .with_artifacts(vec![artifact])
         }
     }
+}
+
+/// 从 task.description 派生 target_files 期望集合。
+///
+/// 兼容 M2/M3 任务描述格式 `"创建 <filename> 输出 <content>"`：派生为 `[filename]`。
+/// M4 新格式（待 Planner 产 Plan 后启用）：直接从 Plan.target_files 取。
+/// 无法派生时返回空 Vec，表示不强制（兼容老测试）。
+fn derive_target_files_from_task(desc: &str) -> Vec<String> {
+    let desc = desc.trim();
+    // 兼容旧格式
+    if let Some(after) = desc
+        .strip_prefix("创建 ")
+        .or_else(|| desc.strip_prefix("create "))
+    {
+        if let Some(output_idx) = after.find(" 输出 ").or_else(|| after.find(" output ")) {
+            let filename = after[..output_idx].trim().to_string();
+            if !filename.is_empty() {
+                return vec![filename];
+            }
+        }
+    }
+    Vec::new()
 }
 
 impl SubAgent for LlmReviewer {
@@ -719,7 +834,161 @@ mod tests {
         let worker = LlmWorker::new(client);
         let out = worker.run(&ctx);
         assert!(!out.result.success);
-        assert!(out.result.summary.contains("非法路径"));
+        // M4：错误消息由 PathGuard 产，统一前缀「写边界拒绝」+ 具体原因（含非法组件 / 逃逸 workspace 等）。
+        assert!(
+            out.result.summary.contains("写边界拒绝"),
+            "expected summary to mention write boundary rejection, got: {}",
+            out.result.summary
+        );
+    }
+
+    // ---- M4 写边界验收：LlmWorker 端到端 ----
+
+    #[test]
+    fn m4_llm_worker_rejects_writing_to_git_hooks() {
+        // 危险路径黑名单：即便 LLM 输出 .git/hooks/pre-commit，也拒绝写入。
+        let client = MockLlmClient::new(vec![
+            r#"{"files":[{"path":".git/hooks/pre-commit","content":"evil"}]}"#.into(),
+        ]);
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-1".into(), "x".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(!out.result.success);
+        assert!(
+            out.result.summary.contains("写边界拒绝"),
+            "got: {}",
+            out.result.summary
+        );
+        assert!(
+            out.result.summary.contains(".git/hooks/pre-commit"),
+            "should name the offending path, got: {}",
+            out.result.summary
+        );
+        // 文件未被写入。
+        assert!(!ws.path().join(".git/hooks/pre-commit").exists());
+    }
+
+    #[test]
+    fn m4_llm_worker_rejects_writing_env_file() {
+        let client = MockLlmClient::new(vec![
+            r#"{"files":[{"path":".env","content":"SECRET=leaked"}]}"#.into(),
+        ]);
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-1".into(), "x".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(!out.result.success);
+        assert!(out.result.summary.contains("写边界拒绝"));
+        assert!(!ws.path().join(".env").exists());
+    }
+
+    #[test]
+    fn m4_llm_worker_rejects_writing_github_workflow() {
+        let client = MockLlmClient::new(vec![
+            r#"{"files":[{"path":".github/workflows/ci.yml","content":"on: [push]"}]}"#.into(),
+        ]);
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-1".into(), "x".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(!out.result.success);
+        assert!(out.result.summary.contains("写边界拒绝"));
+    }
+
+    #[test]
+    fn m4_llm_worker_rejects_absolute_path() {
+        let client = MockLlmClient::new(vec![
+            r#"{"files":[{"path":"/etc/passwd","content":"x"}]}"#.into(),
+        ]);
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-1".into(), "x".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(!out.result.success);
+        assert!(out.result.summary.contains("写边界拒绝"));
+    }
+
+    #[test]
+    fn m4_llm_worker_allows_normal_create() {
+        // 正常路径：写 src/hello.py，应通过。
+        let client = MockLlmClient::new(vec![
+            r#"{"files":[{"path":"src/hello.py","content":"print('hi')"}]}"#.into(),
+        ]);
+        let ws = tempfile::tempdir().unwrap();
+        let task = Task::new("T-1".into(), "x".into());
+        let ctx = StepContext::new(ws.path(), task);
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(out.result.success, "summary: {}", out.result.summary);
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("src/hello.py")).unwrap(),
+            "print('hi')\n"
+        );
+    }
+
+    // ---- M4 写边界验收：LlmReviewer diff 范围 ----
+
+    #[test]
+    fn m4_llm_reviewer_rejects_off_scope_patch() {
+        // task 声明写 hello.py，但 Worker artifact 的 patch 改了 evil.py。
+        // Reviewer 应在调 LLM 前就拒绝（diff scope 越界）。
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("evil.py"), "x\n").unwrap();
+        let task = Task::new("T-1".into(), "创建 hello.py 输出 x".into());
+        let evil_patch = "diff --git a/evil.py b/evil.py\nnew file mode 100644\n--- /dev/null\n+++ b/evil.py\n@@ -0,0 +1,1 @@\n+x\n";
+        let diff_artifact = Artifact {
+            artifact_id: "ART-worker-001".into(),
+            artifact_type: ArtifactType::CodeDiff,
+            commit_sha: None,
+            patch: Some(evil_patch.into()),
+            url: Some(format!("file://{}/evil.py", ws.path().display())),
+        };
+        let ctx = StepContext::new(ws.path(), task).with_prior(
+            orcha_sdk::Step {
+                id: "S-worker".into(),
+                name: "worker".into(),
+                agent: "worker".into(),
+                status: orcha_sdk::StepStatus::Succeeded,
+            },
+            vec![diff_artifact],
+        );
+        // LLM 不应被调用——确定性 diff scope 检查先拒绝。
+        let client = MockLlmClient::new(vec![r#"{"approved":true,"issues":[]}"#.into()]);
+        let out = LlmReviewer::new(client).run(&ctx);
+        assert!(!out.result.success);
+        assert!(
+            out.result.summary.contains("diff 范围越界"),
+            "expected scope rejection, got: {}",
+            out.result.summary
+        );
+    }
+
+    #[test]
+    fn m4_llm_reviewer_allows_in_scope_patch() {
+        // task 声明写 hello.py，patch 也只改 hello.py：应交 LLM 审。
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("hello.py"), "print('hi')\n").unwrap();
+        let task = Task::new("T-1".into(), "创建 hello.py 输出 print('hi')".into());
+        let patch = "diff --git a/hello.py b/hello.py\nnew file mode 100644\n--- /dev/null\n+++ b/hello.py\n@@ -0,0 +1,1 @@\n+print('hi')\n";
+        let diff_artifact = Artifact {
+            artifact_id: "ART-worker-001".into(),
+            artifact_type: ArtifactType::CodeDiff,
+            commit_sha: None,
+            patch: Some(patch.into()),
+            url: Some(format!("file://{}/hello.py", ws.path().display())),
+        };
+        let ctx = StepContext::new(ws.path(), task).with_prior(
+            orcha_sdk::Step {
+                id: "S-worker".into(),
+                name: "worker".into(),
+                agent: "worker".into(),
+                status: orcha_sdk::StepStatus::Succeeded,
+            },
+            vec![diff_artifact],
+        );
+        let client = MockLlmClient::new(vec![r#"{"approved":true,"issues":[]}"#.into()]);
+        let out = LlmReviewer::new(client).run(&ctx);
+        assert!(out.result.success, "summary: {}", out.result.summary);
     }
 
     #[test]
