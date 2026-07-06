@@ -14,10 +14,11 @@
 pub mod client;
 pub mod prompt;
 
-pub use client::{ChatMessage, LlmClient, LlmConfig, OpenAiCompatibleClient};
+pub use client::{
+    ChatMessage, ChatResponse, FunctionCall, FunctionDef, LlmClient, LlmConfig, LlmError,
+    OpenAiCompatibleClient, ToolCallRequest, ToolDefinition,
+};
 pub use prompt::{
     build_planner_prompt, build_reviewer_prompt, build_worker_prompt, parse_planner_output,
-    parse_reviewer_output, parse_worker_output,
+    parse_reviewer_output, parse_worker_output, PLANNER_SYSTEM, REVIEWER_SYSTEM, WORKER_SYSTEM,
 };
-
-pub use client::LlmError;
