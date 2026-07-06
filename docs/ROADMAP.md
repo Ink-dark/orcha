@@ -157,15 +157,26 @@
 **目标**：**触发主入口（一等公民）**。通过各平台官方 SDK 的**长连接**接入 IM，提供实时交互体验（体感对标 OpenClaw）。@Orcha 触发任务后，进度经长连接实时推送回原会话，无需公网回调地址、无需 HTTP 轮询。Shell（M5）作为可视化面板观测同一份任务，不做触发。
 
 **交付物**：
+- 新建 `orcha-gateway` crate（独立 `main`，独立进程，与 Shell 故障域隔离）
 - 飞书 SDK 长连接接入（WebSocket 接收事件，免公网 webhook）
 - QQ SDK 长连接接入
-- 会话级状态管理：@Orcha 触发 Cycleround，进度/产物经长连接回传原会话
+- Cycleround 改造为 AI 驱动调度（硬编码 Observer→Planner→...→Fixer 改为 AI 每步决策下一步调谁，带熔断）
+- Cycleround 事件流改造（`run` 返回 `mpsc::Receiver<RoundEvent>`，每步吐 `AgentStarted`/`AgentFinished` 事件）
+- Gateway 任务队列 + worker 池（非阻塞：收到 @Orcha 入队，后台 worker 跑 Cycleround，长连接不被卡死）
+- 飞书卡片实时更新（patch card：执行中持续更新同一张卡片 "🔍 观察中… → 📋 规划中… → 💻 写代码中…"）
+- `SqliteTaskStore`（feature gate，WAL + 跨进程锁，替代 `FileTaskStore`；Shell 只读连接，Gateway 独占写）
 - 鉴权与白名单群校验
 
 **验收（可验证）**：
+- [ ] 新建 `orcha-gateway` crate，独立进程可启动并接入飞书 SDK 长连接
 - [ ] 飞书通过 SDK 长连接接收 `@Orcha fix <issue>` 并触发 Cycleround
 - [ ] QQ 通过 SDK 长连接接收并触发任务
+- [ ] Cycleround 调度由 AI 驱动（不再硬编码 Observer→Planner→...→Fixer 顺序）
+- [ ] Cycleround `run` 返回 `mpsc::Receiver<RoundEvent>`，Gateway 可消费每步事件
 - [ ] 执行进度经长连接实时回传原会话（非 HTTP 轮询，体感对标 OpenClaw）
+- [ ] 飞书卡片在任务进行中持续 patch 更新（"🔍 观察中…" → "📋 规划中…" → "💻 写代码中…"）
+- [ ] Gateway 任务队列 + worker 池生效：一个任务执行期间长连接可继续接收新消息
+- [ ] `SqliteTaskStore` 替换 `FileTaskStore`，Gateway 与 Shell 分进程读写同一 SQLite 不损坏
 - [ ] 产物 / Artifact 链接在 IM 中可点击展开
 - [ ] 私有群权限校验生效（机器人仅在白名单群内响应）
 - [ ] 多会话并发互不干扰
