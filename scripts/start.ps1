@@ -167,6 +167,10 @@ if (-not (Test-Path $logDir)) {
 $gwLog = Join-Path $logDir 'gateway.log'
 $adLog = Join-Path $logDir 'adapter.log'
 
+# Gateway 用 eprintln!，日志全在 stderr（写到 .err 文件）
+# Adapter 用 console.log/warn/error，stdout/.log + stderr/.err 都有
+# 等待就绪时两个文件都 grep
+
 Write-Step "启动 Gateway（后台）"
 $gwProc = Start-Process -FilePath $gatewayExe `
     -ArgumentList @("--config", $configFile) `
@@ -175,33 +179,47 @@ $gwProc = Start-Process -FilePath $gatewayExe `
     -RedirectStandardError  "$gwLog.err" `
     -PassThru -WindowStyle Hidden
 
-# 把环境变量传给子进程（Start-Process 不继承当前会话 env）
-# 用 -Environment 仅 PS 7+ 支持，PS 5.1 退而求其次：dev-env.ps1 已 dot-source 设到当前进程，
-# Start-Process 默认继承父进程环境变量，所以 OK。
-
 Start-Sleep -Seconds 1
 if ($gwProc.HasExited) {
-    Write-Err "Gateway 启动后立即退出，看日志：$gwLog"
+    Write-Err "Gateway 启动后立即退出"
+    Write-Host "  ---- gateway.log ----" -ForegroundColor Gray
     Get-Content $gwLog -ErrorAction SilentlyContinue | Select-Object -First 30
+    Write-Host "  ---- gateway.log.err ----" -ForegroundColor Gray
     Get-Content "$gwLog.err" -ErrorAction SilentlyContinue | Select-Object -First 30
     exit 1
 }
-Write-Ok "Gateway PID=$($gwProc.Id)，日志：$gwLog"
+Write-Ok "Gateway PID=$($gwProc.Id)"
 
 # ---- 阶段 4：等待 Gateway 端口就绪 -------------------------------------
-Write-Step "等待 Gateway IPC 就绪"
+Write-Step "等待 Gateway IPC 就绪（最多 15 秒）"
 $ready = $false
-for ($i = 0; $i -lt 10; $i++) {
+for ($i = 0; $i -lt 30; $i++) {
     Start-Sleep -Milliseconds 500
-    $line = Get-Content $gwLog -ErrorAction SilentlyContinue | Select-String 'IPC listening on'
-    if ($line) {
+    # Gateway 用 eprintln!，日志在 stderr（.err 文件）
+    if (Get-Content "$gwLog.err" -ErrorAction SilentlyContinue | Select-String 'IPC listening on') {
         $ready = $true
         break
     }
+    if (Get-Content $gwLog -ErrorAction SilentlyContinue | Select-String 'IPC listening on') {
+        $ready = $true
+        break
+    }
+    # 早期退出的情况
+    if ($gwProc.HasExited) {
+        Write-Err "Gateway 启动后退出，exit code=$($gwProc.ExitCode)"
+        Write-Host "  ---- gateway.log ----" -ForegroundColor Gray
+        Get-Content $gwLog -ErrorAction SilentlyContinue | Select-Object -First 30
+        Write-Host "  ---- gateway.log.err ----" -ForegroundColor Gray
+        Get-Content "$gwLog.err" -ErrorAction SilentlyContinue | Select-Object -First 30
+        exit 1
+    }
 }
 if (-not $ready) {
-    Write-Err "Gateway 启动超时，看日志：$gwLog"
-    Get-Content $gwLog -ErrorAction SilentlyContinue | Select-Object -First 30
+    Write-Err "Gateway 启动超时（15 秒内无 'IPC listening on' 日志）"
+    Write-Host "  ---- gateway.log ----" -ForegroundColor Gray
+    Get-Content $gwLog -ErrorAction SilentlyContinue | Select-Object -First 50
+    Write-Host "  ---- gateway.log.err ----" -ForegroundColor Gray
+    Get-Content "$gwLog.err" -ErrorAction SilentlyContinue | Select-Object -First 50
     Stop-Process -Id $gwProc.Id -Force -ErrorAction SilentlyContinue
     exit 1
 }
@@ -240,16 +258,28 @@ if ($adProc.HasExited) {
 }
 Write-Ok "Adapter PID=$($adProc.Id)，日志：$adLog"
 
-# 等待 Adapter 连上 Gateway
-Start-Sleep -Seconds 1
-$adReady = Get-Content $adLog -ErrorAction SilentlyContinue | Select-String 'IPC 已连接'
-if (-not $adReady) {
-    $adReady = Get-Content "$adLog.err" -ErrorAction SilentlyContinue | Select-String 'IPC 已连接'
+# 等待 Adapter 连上 Gateway（最多 10 秒）
+$adReady = $false
+for ($i = 0; $i -lt 20; $i++) {
+    Start-Sleep -Milliseconds 500
+    # Adapter console.log 走 stdout，console.warn/error 走 stderr
+    if (Get-Content $adLog -ErrorAction SilentlyContinue | Select-String 'IPC 已连接|启动完成') {
+        $adReady = $true
+        break
+    }
+    if (Get-Content "$adLog.err" -ErrorAction SilentlyContinue | Select-String 'IPC 已连接|启动完成') {
+        $adReady = $true
+        break
+    }
 }
 if ($adReady) {
-    Write-Ok "Adapter 已连上 Gateway"
+    Write-Ok "Adapter 已就绪"
 } else {
-    Write-Warn "Adapter 启动中，看日志确认：$adLog"
+    Write-Warn "Adapter 启动超时（10 秒内无就绪日志），看日志确认：$adLog"
+    Write-Host "  ---- adapter.log ----" -ForegroundColor Gray
+    Get-Content $adLog -ErrorAction SilentlyContinue | Select-Object -First 30
+    Write-Host "  ---- adapter.log.err ----" -ForegroundColor Gray
+    Get-Content "$adLog.err" -ErrorAction SilentlyContinue | Select-Object -First 30
 }
 
 # ---- 阶段 6：保存 PID + 打印状态 --------------------------------------
