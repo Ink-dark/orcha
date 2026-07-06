@@ -39,6 +39,10 @@ pub struct GatewayConfig {
     /// IM 凭证占位（M7 接入时填充）。
     #[serde(default)]
     pub im: ImConfig,
+
+    /// 鉴权配置（白名单，M7）。
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 fn default_home() -> PathBuf {
@@ -149,6 +153,13 @@ pub struct FeishuConfig {
     pub app_secret_env: String,
 }
 
+/// 鉴权配置（白名单，M7）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AuthConfig {
+    #[serde(default)]
+    pub whitelist: Vec<crate::auth::WhitelistEntry>,
+}
+
 impl GatewayConfig {
     /// 从 config.toml 文件加载；文件不存在则返回默认配置。
     pub fn load(path: &Path) -> Result<Self> {
@@ -192,6 +203,11 @@ impl GatewayConfig {
     pub fn build_task_store(&self) -> Result<orcha_core::FileTaskStore> {
         Ok(orcha_core::FileTaskStore::new(&self.home))
     }
+
+    /// 从 `auth.whitelist` 构造 [`crate::auth::Authenticator`]（克隆条目）。
+    pub fn authenticator(&self) -> crate::auth::Authenticator {
+        crate::auth::Authenticator::new(self.auth.whitelist.clone())
+    }
 }
 
 impl Default for GatewayConfig {
@@ -204,6 +220,7 @@ impl Default for GatewayConfig {
             cycle: CycleConfigToml::default(),
             llm: LlmConfig::default(),
             im: ImConfig::default(),
+            auth: AuthConfig::default(),
         }
     }
 }
