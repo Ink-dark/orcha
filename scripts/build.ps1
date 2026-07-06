@@ -1,18 +1,18 @@
-# scripts/build.ps1 ¡ª Orcha Ò»¼ü±àÒë + ÑéÖ¤½Å±¾£¨Windows PowerShell 5.1+£©
+# scripts/build.ps1 â€” Orcha ä¸€é”®ç¼–è¯‘ + éªŒè¯è„šæœ¬ï¼ˆWindows PowerShell 5.1+ï¼‰
 #
-# ÓÃ·¨£º
-#   .\scripts\build.ps1                  # ±àÒë Rust + TS£¨Ä¬ÈÏ£©
-#   .\scripts\build.ps1 -Test            # ¼ÓÅÜÈ«Á¿²âÊÔ
-#   .\scripts\build.ps1 -Lint            # ¼ÓÅÜ clippy + fmt check
-#   .\scripts\build.ps1 -Test -Lint     # È«Á¿ÑéÊÕ£¨±àÒë + ²âÊÔ + lint£©
-#   .\scripts\build.ps1 -Release        # ÓÃ release profile£¨¸üÂı£¬²úÎïÔÚ target\release£©
-#   .\scripts\build.ps1 -SkipTs         # Ìø¹ı Feishu Adapter£¨Ö»±àÒë Rust£©
+# ç”¨æ³•ï¼š
+#   .\scripts\build.ps1                  # ç¼–è¯‘ Rust + TSï¼ˆé»˜è®¤ï¼‰
+#   .\scripts\build.ps1 -Test            # åŠ è·‘å…¨é‡æµ‹è¯•
+#   .\scripts\build.ps1 -Lint            # åŠ è·‘ clippy + fmt check
+#   .\scripts\build.ps1 -Test -Lint     # å…¨é‡éªŒæ”¶ï¼ˆç¼–è¯‘ + æµ‹è¯• + lintï¼‰
+#   .\scripts\build.ps1 -Release        # ç”¨ release profileï¼ˆæ›´æ…¢ï¼Œäº§ç‰©åœ¨ target\releaseï¼‰
+#   .\scripts\build.ps1 -SkipTs         # è·³è¿‡ Feishu Adapterï¼ˆåªç¼–è¯‘ Rustï¼‰
 #
-# ÍË³öÂë£º
-#   0 = È«²¿Í¨¹ı
-#   1 = Ä³²½Ê§°Ü£¨½Å±¾»á´òÓ¡Ê§°Ü²½Öè²¢Á¢¼´ÍË³ö£©
+# é€€å‡ºç ï¼š
+#   0 = å…¨éƒ¨é€šè¿‡
+#   1 = æŸæ­¥å¤±è´¥ï¼ˆè„šæœ¬ä¼šæ‰“å°å¤±è´¥æ­¥éª¤å¹¶ç«‹å³é€€å‡ºï¼‰
 #
-# Ïê¼û docs/LOCAL_RUN.md¡£
+# è¯¦è§ docs/LOCAL_RUN.mdã€‚
 
 [CmdletBinding()]
 param(
@@ -22,27 +22,27 @@ param(
     [switch]$SkipTs
 )
 
-# Ç¿ÖÆ UTF-8£º±ÜÃâ PowerShell 5.1 °ÑÖĞÎÄ°´ GBK ½âÂëµ¼ÖÂÂÒÂë + ÒıºÅ½âÎöÊ§°Ü¡£
-# ±ØĞëÔÚ param() Ö®ºó¡¢ÈÎºÎÖĞÎÄÊä³öÖ®Ç°ÉèÖÃ¡£
+# å¼ºåˆ¶ UTF-8ï¼šé¿å… PowerShell 5.1 æŠŠä¸­æ–‡æŒ‰ GBK è§£ç å¯¼è‡´ä¹±ç  + å¼•å·è§£æå¤±è´¥ã€‚
+# å¿…é¡»åœ¨ param() ä¹‹åã€ä»»ä½•ä¸­æ–‡è¾“å‡ºä¹‹å‰è®¾ç½®ã€‚
 $OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 [Console]::InputEncoding = [System.Text.Encoding]::UTF8
 
-# ×¢Òâ£º²»ÓÃ $ErrorActionPreference = 'Stop'£¬ÒòÎª cargo / npm / node °Ñ½ø¶È
-# ĞÅÏ¢Ğ´µ½ stderr£¬PowerShell »á°Ñ stderr ĞĞµ± error record Å× NativeCommandError¡£
-# ¸ÄÓÃ Invoke-Native Cmdlet °ü×°£¬¿¿ $LASTEXITCODE ÅĞ¶Ï³É°Ü¡£
+# æ³¨æ„ï¼šä¸ç”¨ $ErrorActionPreference = 'Stop'ï¼Œå› ä¸º cargo / npm / node æŠŠè¿›åº¦
+# ä¿¡æ¯å†™åˆ° stderrï¼ŒPowerShell ä¼šæŠŠ stderr è¡Œå½“ error record æŠ› NativeCommandErrorã€‚
+# æ”¹ç”¨ Invoke-Native Cmdlet åŒ…è£…ï¼Œé  $LASTEXITCODE åˆ¤æ–­æˆè´¥ã€‚
 
-# ---- ÑÕÉ«Êä³ö -----------------------------------------------------------
+# ---- é¢œè‰²è¾“å‡º -----------------------------------------------------------
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg)   { Write-Host "  [OK] $msg" -ForegroundColor Green }
 function Write-Warn($msg) { Write-Host "  [!]  $msg" -ForegroundColor Yellow }
 function Write-Err($msg)  { Write-Host "  [X]  $msg" -ForegroundColor Red }
 
-# ---- °ü×°Ô­ÉúÃüÁîµ÷ÓÃ ---------------------------------------------------
-# µ÷ÓÃ cargo/npm/node µÈÔ­Éú³ÌĞò¡£ÕâĞ©³ÌĞò°Ñ½ø¶ÈĞÅÏ¢Ğ´µ½ stderr£¬
-# PowerShell 5.1 ÔÚ $ErrorActionPreference=Stop Ê±»á°Ñ stderr µ± error Å×
-# NativeCommandError¡£ÕâÀïÁÙÊ±¸Ä³É Continue£¬ÈÃ stderr ĞĞÕı³£ÏÔÊ¾£¨ºìÉ«£©µ«
-# ²»ÖÕÖ¹½Å±¾£¬¿¿ $LASTEXITCODE ÅĞ¶Ï³É°Ü¡£
+# ---- åŒ…è£…åŸç”Ÿå‘½ä»¤è°ƒç”¨ ---------------------------------------------------
+# è°ƒç”¨ cargo/npm/node ç­‰åŸç”Ÿç¨‹åºã€‚è¿™äº›ç¨‹åºæŠŠè¿›åº¦ä¿¡æ¯å†™åˆ° stderrï¼Œ
+# PowerShell 5.1 åœ¨ $ErrorActionPreference=Stop æ—¶ä¼šæŠŠ stderr å½“ error æŠ›
+# NativeCommandErrorã€‚è¿™é‡Œä¸´æ—¶æ”¹æˆ Continueï¼Œè®© stderr è¡Œæ­£å¸¸æ˜¾ç¤ºï¼ˆçº¢è‰²ï¼‰ä½†
+# ä¸ç»ˆæ­¢è„šæœ¬ï¼Œé  $LASTEXITCODE åˆ¤æ–­æˆè´¥ã€‚
 function Invoke-Native {
     param(
         [Parameter(Mandatory)] [scriptblock] $Block,
@@ -59,20 +59,20 @@ function Invoke-Native {
     }
 }
 
-# ---- ½×¶Î 0£ºÒÀÀµ¼ì²é ----------------------------------------------------
-Write-Step "¼ì²éÒÀÀµ"
+# ---- é˜¶æ®µ 0ï¼šä¾èµ–æ£€æŸ¥ ----------------------------------------------------
+Write-Step "æ£€æŸ¥ä¾èµ–"
 
 $missing = @()
 
 $rustc = Get-Command rustc -ErrorAction SilentlyContinue
 if (-not $rustc) {
-    $missing += "rustc (Rust ¹¤¾ßÁ´£¬MSRV 1.75) ¡ª¡ª https://rustup.rs/"
+    $missing += "rustc (Rust å·¥å…·é“¾ï¼ŒMSRV 1.75) â€”â€” https://rustup.rs/"
 } else {
     $rv = (rustc --version) -replace '^rustc ', ''
     $rvMajor = ([version]($rv -replace '(\d+\.\d+)\..*', '$1.0')).Major
     $rvMinor = ([version]($rv -replace '(\d+\.\d+)\..*', '$1.0')).Minor
     if ($rvMajor -lt 1 -or ($rvMajor -eq 1 -and $rvMinor -lt 75)) {
-        Write-Err "Rust °æ±¾ $rv µÍÓÚ MSRV 1.75£¬ÇëÉı¼¶£ºrustup update stable"
+        Write-Err "Rust ç‰ˆæœ¬ $rv ä½äº MSRV 1.75ï¼Œè¯·å‡çº§ï¼šrustup update stable"
         exit 1
     }
     Write-Ok "Rust $rv"
@@ -80,7 +80,7 @@ if (-not $rustc) {
 
 $cargo = Get-Command cargo -ErrorAction SilentlyContinue
 if (-not $cargo) {
-    $missing += "cargo (Ëæ rustup °²×°)"
+    $missing += "cargo (éš rustup å®‰è£…)"
 } else {
     Write-Ok "cargo $((cargo --version) -replace '^cargo ', '')"
 }
@@ -88,12 +88,12 @@ if (-not $cargo) {
 if (-not $SkipTs) {
     $node = Get-Command node -ErrorAction SilentlyContinue
     if (-not $node) {
-        $missing += "node (Node.js 20+) ¡ª¡ª https://nodejs.org/"
+        $missing += "node (Node.js 20+) â€”â€” https://nodejs.org/"
     } else {
         $nv = ((node --version) -replace '^v', '')
         $nvMajor = [int]($nv -replace '^(\d+)\..*', '$1')
         if ($nvMajor -lt 20) {
-            Write-Err "Node.js °æ±¾ $nv µÍÓÚ 20£¬ÇëÉı¼¶"
+            Write-Err "Node.js ç‰ˆæœ¬ $nv ä½äº 20ï¼Œè¯·å‡çº§"
             exit 1
         }
         Write-Ok "Node v$nv"
@@ -101,55 +101,55 @@ if (-not $SkipTs) {
 
     $npm = Get-Command npm -ErrorAction SilentlyContinue
     if (-not $npm) {
-        $missing += "npm (Ëæ Node.js °²×°)"
+        $missing += "npm (éš Node.js å®‰è£…)"
     } else {
         Write-Ok "npm $((npm --version))"
     }
 }
 
 if ($missing.Count -gt 0) {
-    Write-Err "È±ÉÙÒÀÀµ£º"
+    Write-Err "ç¼ºå°‘ä¾èµ–ï¼š"
     $missing | ForEach-Object { Write-Host "      - $_" -ForegroundColor Red }
     exit 1
 }
 
-# ---- ½×¶Î 1£ºRust ±àÒë --------------------------------------------------
-Write-Step "±àÒë Rust workspace£¨--all-features£©"
+# ---- é˜¶æ®µ 1ï¼šRust ç¼–è¯‘ --------------------------------------------------
+Write-Step "ç¼–è¯‘ Rust workspaceï¼ˆ--all-featuresï¼‰"
 
 $cargoArgs = @('build', '--workspace', '--all-features')
 if ($Release) { $cargoArgs += '--release' }
 
-Invoke-Native { & cargo @cargoArgs } "Rust ±àÒëÊ§°Ü"
-Write-Ok "Rust ±àÒëÍ¨¹ı"
+Invoke-Native { & cargo @cargoArgs } "Rust ç¼–è¯‘å¤±è´¥"
+Write-Ok "Rust ç¼–è¯‘é€šè¿‡"
 
-# ---- ½×¶Î 2£ºTS ±àÒë ----------------------------------------------------
+# ---- é˜¶æ®µ 2ï¼šTS ç¼–è¯‘ ----------------------------------------------------
 if (-not $SkipTs) {
-    Write-Step "±àÒë Feishu Adapter TS"
+    Write-Step "ç¼–è¯‘ Feishu Adapter TS"
 
     $adapterDir = Join-Path $PSScriptRoot '..\packages\orcha-feishu-adapter'
     $adapterDir = (Resolve-Path $adapterDir).Path
 
     if (-not (Test-Path (Join-Path $adapterDir 'node_modules'))) {
-        Write-Warn "node_modules ²»´æÔÚ£¬ÏÈ npm install"
+        Write-Warn "node_modules ä¸å­˜åœ¨ï¼Œå…ˆ npm install"
         Push-Location $adapterDir
-        Invoke-Native { & npm install } "npm install Ê§°Ü"
+        Invoke-Native { & npm install } "npm install å¤±è´¥"
         Pop-Location
-        Write-Ok "npm install Íê³É"
+        Write-Ok "npm install å®Œæˆ"
     }
 
     Push-Location $adapterDir
-    Invoke-Native { & npm run build } "TS ±àÒëÊ§°Ü"
+    Invoke-Native { & npm run build } "TS ç¼–è¯‘å¤±è´¥"
     Pop-Location
-    Write-Ok "TS ±àÒëÍ¨¹ı£¨dist/£©"
+    Write-Ok "TS ç¼–è¯‘é€šè¿‡ï¼ˆdist/ï¼‰"
 }
 
-# ---- ½×¶Î 3£º²âÊÔ£¨¿ÉÑ¡£© ----------------------------------------------
+# ---- é˜¶æ®µ 3ï¼šæµ‹è¯•ï¼ˆå¯é€‰ï¼‰ ----------------------------------------------
 if ($Test) {
-    Write-Step "ÅÜÈ«Á¿²âÊÔ£¨cargo test --workspace --all-features£©"
+    Write-Step "è·‘å…¨é‡æµ‹è¯•ï¼ˆcargo test --workspace --all-featuresï¼‰"
 
-    # cargo °Ñ±àÒë½ø¶È´òµ½ stderr£¬PowerShell 5.1 °Ñ stderr ĞĞµ± ErrorRecord£¬
-    # ÓÃ 2>&1 ºÏ²¢ºó Out-String »á°ÑËüÃÇ×ª³É×Ö·û´®£¬µ« ErrorRecord µÄ ToString()
-    # »á´ø "NativeCommandError" Ç°×ºÎÛÈ¾Êä³ö¡£×îÎÈµÄ×ö·¨£ºÖØ¶¨Ïòµ½ÁÙÊ±ÎÄ¼ş¡£
+    # cargo æŠŠç¼–è¯‘è¿›åº¦æ‰“åˆ° stderrï¼ŒPowerShell 5.1 æŠŠ stderr è¡Œå½“ ErrorRecordï¼Œ
+    # ç”¨ 2>&1 åˆå¹¶å Out-String ä¼šæŠŠå®ƒä»¬è½¬æˆå­—ç¬¦ä¸²ï¼Œä½† ErrorRecord çš„ ToString()
+    # ä¼šå¸¦ "NativeCommandError" å‰ç¼€æ±¡æŸ“è¾“å‡ºã€‚æœ€ç¨³çš„åšæ³•ï¼šé‡å®šå‘åˆ°ä¸´æ—¶æ–‡ä»¶ã€‚
     $logFile = [System.IO.Path]::GetTempFileName()
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
@@ -157,14 +157,14 @@ if ($Test) {
     $testExit = $LASTEXITCODE
     $ErrorActionPreference = $prevEAP
 
-    # Á÷Ê½»Ø·ÅÈÕÖ¾
+    # æµå¼å›æ”¾æ—¥å¿—
     Get-Content $logFile -Encoding UTF8 | ForEach-Object { Write-Host $_ }
 
     if ($testExit -ne 0) {
-        Write-Err "²âÊÔÊ§°Ü£¨exit $testExit£©"
+        Write-Err "æµ‹è¯•å¤±è´¥ï¼ˆexit $testExitï¼‰"
         $failed = Get-Content $logFile -Encoding UTF8 | Select-String 'FAILED'
         if ($failed) {
-            Write-Host "Ê§°Ü²âÊÔ£º" -ForegroundColor Red
+            Write-Host "å¤±è´¥æµ‹è¯•ï¼š" -ForegroundColor Red
             $failed | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
         }
         Remove-Item $logFile -ErrorAction SilentlyContinue
@@ -173,7 +173,7 @@ if ($Test) {
 
     $okCount = (Get-Content $logFile -Encoding UTF8 | Select-String 'test result: ok\.').Count
     Remove-Item $logFile -ErrorAction SilentlyContinue
-    Write-Ok "²âÊÔÈ«¹ı£º$okCount ¸ö test result ok"
+    Write-Ok "æµ‹è¯•å…¨è¿‡ï¼š$okCount ä¸ª test result ok"
 
     if (-not $SkipTs) {
         $adapterDir = (Resolve-Path (Join-Path $PSScriptRoot '..\packages\orcha-feishu-adapter')).Path
@@ -187,40 +187,43 @@ if ($Test) {
         Get-Content $tscLog -Encoding UTF8 | ForEach-Object { Write-Host $_ }
         Remove-Item $tscLog -ErrorAction SilentlyContinue
         if ($tscExit -ne 0) {
-            Write-Err "TS ÀàĞÍ¼ì²éÊ§°Ü"
+            Write-Err "TS ç±»å‹æ£€æŸ¥å¤±è´¥"
             Pop-Location
             exit 1
         }
         Pop-Location
-        Write-Ok "TS ÀàĞÍ¼ì²éÍ¨¹ı"
+        Write-Ok "TS ç±»å‹æ£€æŸ¥é€šè¿‡"
     }
 }
 
-# ---- ½×¶Î 4£ºlint£¨¿ÉÑ¡£© ----------------------------------------------
+# ---- é˜¶æ®µ 4ï¼šlintï¼ˆå¯é€‰ï¼‰ ----------------------------------------------
 if ($Lint) {
-    Write-Step "clippy ¼ì²é£¨--all-targets --all-features£©"
+    Write-Step "clippy æ£€æŸ¥ï¼ˆ--all-targets --all-featuresï¼‰"
 
-    Invoke-Native { & cargo clippy --workspace --all-targets --all-features -- -D warnings } "clippy ÓĞ warning »ò error"
-    Write-Ok "clippy Í¨¹ı£¬ÎŞ warning"
+    Invoke-Native { & cargo clippy --workspace --all-targets --all-features -- -D warnings } "clippy æœ‰ warning æˆ– error"
+    Write-Ok "clippy é€šè¿‡ï¼Œæ—  warning"
 
-    Write-Step "fmt ¼ì²é£¨--check£©"
+    Write-Step "fmt æ£€æŸ¥ï¼ˆ--checkï¼‰"
 
-    Invoke-Native { & cargo fmt --all --check } "fmt ²»¹æ·¶£¬ÔËĞĞ£ºcargo fmt --all"
-    Write-Ok "fmt Í¨¹ı"
+    Invoke-Native { & cargo fmt --all --check } "fmt ä¸è§„èŒƒï¼Œè¿è¡Œï¼šcargo fmt --all"
+    Write-Ok "fmt é€šè¿‡"
 }
 
-# ---- ×Ü½á ----------------------------------------------------------------
+# ---- æ€»ç»“ ----------------------------------------------------------------
 $targetDir = if ($Release) { 'release' } else { 'debug' }
 $runFlag = if ($Release) { '--release' } else { '' }
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
 Write-Host ""
-Write-Host "==== È«²¿Íê³É ====" -ForegroundColor Green
-Write-Host "  Rust ²úÎï£ºtarget\$targetDir\" -ForegroundColor Gray
+Write-Host "==== å…¨éƒ¨å®Œæˆ ====" -ForegroundColor Green
+Write-Host "  Rust äº§ç‰©ï¼štarget\$targetDir\" -ForegroundColor Gray
 if (-not $SkipTs) {
-    Write-Host "  TS ²úÎï£º  packages\orcha-feishu-adapter\dist\" -ForegroundColor Gray
+    Write-Host "  TS äº§ç‰©ï¼š  packages\orcha-feishu-adapter\dist\" -ForegroundColor Gray
 }
 Write-Host ""
-Write-Host "  ÏÂÒ»²½£º" -ForegroundColor Gray
-Write-Host "    Gateway£º  cargo run -p orcha-gateway $runFlag" -ForegroundColor Gray
-Write-Host "    Adapter£º  pushd packages\orcha-feishu-adapter; node dist\main.js; popd" -ForegroundColor Gray
-Write-Host "    ´¥·¢Ê¾Àı£º¼û docs\LOCAL_RUN.md ³¡¾° A" -ForegroundColor Gray
+Write-Host "  ä¸‹ä¸€æ­¥ï¼ˆç›´æ¥å¤åˆ¶å®Œæ•´ä¸€è¡Œæ‰§è¡Œï¼‰ï¼š" -ForegroundColor Gray
+Write-Host "    Gatewayï¼š  cd $repoRoot; cargo run -p orcha-gateway $runFlag" -ForegroundColor Gray
+if (-not $SkipTs) {
+    Write-Host "    Adapterï¼š  cd $repoRoot; pushd packages\orcha-feishu-adapter; node dist\main.js; popd" -ForegroundColor Gray
+}
+Write-Host "    è§¦å‘ç¤ºä¾‹ï¼šè§ docs\LOCAL_RUN.md åœºæ™¯ A" -ForegroundColor Gray
