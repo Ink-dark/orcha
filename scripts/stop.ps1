@@ -25,28 +25,36 @@ if (Test-Path $pidFile) {
     $pids = (Get-Content $pidFile -Encoding UTF8).Trim() -split '\s+' | Where-Object { $_ -match '^\d+$' }
 }
 
-# 兜底：按进程名找
+# 兜底：按进程名 + 端口找残留进程
 if ($pids.Count -eq 0) {
-    $gw = Get-Process -Name 'orcha-gateway' -ErrorAction SilentlyContinue
-    if ($gw) { $pids += $gw.Id }
-    # cmd.exe 包装的 adapter，找它的子 node 进程
-    $node = Get-Process -Name 'node' -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -like '*orcha-feishu-adapter*' -or $true }  # node 进程不好按路径筛，全停
-    if ($node) {
-        # 谨慎：可能停掉用户其他 node 进程，只在 PID 文件丢失时才做
-        # 改为只停 orcha 相关的：靠命令行匹配（PS 5.1 用 WMI）
-        $nodeProcs = Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
-            Where-Object { $_.CommandLine -like '*orcha-feishu-adapter*' }
-        foreach ($np in $nodeProcs) {
-            $pids += $np.ProcessId
-        }
-        # 同样停包装的 cmd.exe
-        $cmdProcs = Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" |
-            Where-Object { $_.CommandLine -like '*orcha-feishu-adapter*' }
-        foreach ($cp in $cmdProcs) {
-            $pids += $cp.ProcessId
+    Write-Warn "PID 文件不存在或为空，按进程名/端口兜底查找"
+}
+
+# 始终追加按进程名查（即使有 PID 文件，也可能有上次没停干净的）
+$gw = Get-Process -Name 'orcha-gateway' -ErrorAction SilentlyContinue
+if ($gw) { $pids += $gw.Id }
+
+# adapter 是 cmd.exe 包装的 node 进程，按命令行匹配
+$nodeProcs = Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
+    Where-Object { $_.CommandLine -like '*orcha-feishu-adapter*' }
+foreach ($np in $nodeProcs) { $pids += $np.ProcessId }
+
+$cmdProcs = Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" |
+    Where-Object { $_.CommandLine -like '*orcha-feishu-adapter*' }
+foreach ($cp in $cmdProcs) { $pids += $cp.ProcessId }
+
+# 按端口查（防止 PID 文件丢失 + 进程名匹配都漏掉的僵尸 Gateway）
+# 7422 是 Gateway 默认 IPC 端口
+try {
+    $portConns = Get-NetTCPConnection -LocalPort 7422 -ErrorAction Stop |
+        Where-Object { $_.State -eq 'Listen' }
+    foreach ($pc in $portConns) {
+        if ($pc.OwningProcess -and ($pc.OwningProcess -ne 0)) {
+            $pids += $pc.OwningProcess
         }
     }
+} catch {
+    # Get-NetTCPConnection 在 PS 5.1 / 没有 Admin 权限时可能失败，忽略
 }
 
 if ($pids.Count -eq 0) {
