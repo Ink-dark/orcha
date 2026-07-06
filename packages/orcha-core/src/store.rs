@@ -28,7 +28,10 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(20);
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Task 仓储抽象。所有后端实现此 trait，CLI 与 Core 只依赖它。
-pub trait TaskStore {
+///
+/// `Send + Sync` 让 trait object `Arc<dyn TaskStore>` 可跨线程 spawn
+/// （M7 Gateway worker 线程持 `Arc<dyn TaskStore>` 跑 Cycleround）。
+pub trait TaskStore: Send + Sync {
     /// 写入新 Task；若 id 已存在应返回错误。
     fn insert(&self, task: &Task) -> Result<()>;
 

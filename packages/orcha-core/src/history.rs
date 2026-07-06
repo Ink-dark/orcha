@@ -33,7 +33,7 @@ use crate::RoundRecord;
 /// - `TaskStore` 存 Task 的状态机（PENDING / RUNNING / ...）。
 /// - `HistoryStore` 存 Cycleround 每轮的执行记录（RoundRecord 序列）。
 /// - 二者共用同一 `home` 目录但子目录不同（`store/` vs `history/`）。
-pub trait HistoryStore {
+pub trait HistoryStore: Send + Sync {
     /// 追加一轮执行记录。
     /// 调用方负责保证 `task_id` 存在（FileHistoryStore 不校验）。
     fn append_round(&self, task_id: &str, record: &RoundRecord) -> Result<()>;
