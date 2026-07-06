@@ -211,17 +211,14 @@ Write-Ok "Gateway IPC 已就绪"
 Write-Step "启动 Adapter（后台）"
 $adapterDir = Join-Path $repoRoot 'packages\orcha-feishu-adapter'
 $adEnv = @{
-    ORCHA_GATEWAY_ENDPOINT  = 'tcp://127.0.0.1:7422'
-    ORCHA_ADAPTER_WEBHOOK_PORT = '7099'
-    ORCHA_ADAPTER_MOCK       = '1'
+    ORCHA_GATEWAY_ENDPOINT = 'tcp://127.0.0.1:7422'
+    ORCHA_ADAPTER_MOCK     = '1'
 }
 # 保留 dev-env 里的飞书凭证（如果设了）
-if ($env:ORCHA_FEISHU_APP_ID)           { $adEnv.ORCHA_FEISHU_APP_ID = $env:ORCHA_FEISHU_APP_ID }
-if ($env:ORCHA_FEISHU_APP_SECRET)       { $adEnv.ORCHA_FEISHU_APP_SECRET = $env:ORCHA_FEISHU_APP_SECRET }
-if ($env:ORCHA_FEISHU_VERIFICATION_TOKEN) { $adEnv.ORCHA_FEISHU_VERIFICATION_TOKEN = $env:ORCHA_FEISHU_VERIFICATION_TOKEN }
-if ($env:ORCHA_FEISHU_ENCRYPT_KEY)      { $adEnv.ORCHA_FEISHU_ENCRYPT_KEY = $env:ORCHA_FEISHU_ENCRYPT_KEY }
-# 用户在 dev-env.ps1 里把 mock 设为 0 时切真实飞书模式
-if ($null -ne $env:ORCHA_ADAPTER_MOCK)  { $adEnv.ORCHA_ADAPTER_MOCK = $env:ORCHA_ADAPTER_MOCK }
+if ($env:ORCHA_FEISHU_APP_ID)     { $adEnv.ORCHA_FEISHU_APP_ID = $env:ORCHA_FEISHU_APP_ID }
+if ($env:ORCHA_FEISHU_APP_SECRET) { $adEnv.ORCHA_FEISHU_APP_SECRET = $env:ORCHA_FEISHU_APP_SECRET }
+# 用户在 dev-env.ps1 里把 mock 设为 0 时切真实飞书模式（长连接）
+if ($null -ne $env:ORCHA_ADAPTER_MOCK) { $adEnv.ORCHA_ADAPTER_MOCK = $env:ORCHA_ADAPTER_MOCK }
 
 # PS 5.1 Start-Process 不支持 -Environment，用 cmd /c 注入环境变量
 $envCmd = ($adEnv.GetEnumerator() | ForEach-Object { "set `"$($_.Key)=$($_.Value)`"" }) -join ' && '
@@ -263,7 +260,11 @@ Write-Host "==== Orcha 已启动 ====" -ForegroundColor Green
 Write-Host "  Gateway PID：$($gwProc.Id)" -ForegroundColor Gray
 Write-Host "  Adapter PID：$($adProc.Id)" -ForegroundColor Gray
 Write-Host "  IPC 端点：   tcp://127.0.0.1:7422" -ForegroundColor Gray
-Write-Host "  Webhook：    http://127.0.0.1:7099/webhook/feishu" -ForegroundColor Gray
+if ($adEnv.ORCHA_ADAPTER_MOCK -eq '0') {
+    Write-Host "  飞书模式：   长连接（主动连飞书服务器，无需公网 URL）" -ForegroundColor Gray
+} else {
+    Write-Host "  飞书模式：   mock（不连真实飞书，动作用 console.log）" -ForegroundColor Gray
+}
 Write-Host "  ORCHA_HOME： $orchaHome" -ForegroundColor Gray
 Write-Host ""
 Write-Host "  日志：" -ForegroundColor Gray
@@ -274,33 +275,20 @@ Write-Host "  实时看日志：  Get-Content $gwLog -Wait -Tail 20" -Foreground
 Write-Host "  停止服务：    .\scripts\stop.ps1" -ForegroundColor Gray
 Write-Host ""
 
-# ---- 阶段 7：可选 smoke test ------------------------------------------
+# ---- 阶段 7：可选 smoke test（仅 mock 模式有意义）---------------------
 if ($Smoke) {
-    Write-Step "触发 smoke test"
-    $body = @{
-        schema = '2.0'
-        header = @{ event_type = 'im.message.receive_v1' }
-        event = @{
-            sender = @{ sender_id = @{ open_id = 'ou_smoke' } }
-            message = @{
-                chat_id = 'oc_smoke'
-                chat_type = 'group'
-                message_type = 'text'
-                content = '{"text":"@_user_1 hello world"}'
-            }
+    if ($adEnv.ORCHA_ADAPTER_MOCK -eq '0') {
+        Write-Warn "非 mock 模式：smoke 跳过（长连接由飞书服务器推送事件，无法本地触发）"
+        Write-Host "  真实联调请到飞书群里 @机器人 发消息，看 logs\adapter.log" -ForegroundColor Gray
+    } else {
+        Write-Step "smoke：检查 Adapter 是否在跑"
+        $adReady = Get-Content $adLog -ErrorAction SilentlyContinue | Select-String '启动完成'
+        if ($adReady) {
+            Write-Ok "Adapter 已就绪（mock 模式无事件入口，靠真实飞书或单元测试验证接收链路）"
+        } else {
+            Write-Warn "Adapter 还在启动中，看日志：$adLog"
         }
-    } | ConvertTo-Json -Depth 10
-
-    try {
-        $resp = Invoke-WebRequest -Uri 'http://127.0.0.1:7099/webhook/feishu' `
-            -Method POST -Body $body -ContentType 'application/json' `
-            -UseBasicParsing -TimeoutSec 5
-        Write-Ok "smoke 触发返回：$($resp.StatusCode)"
-    } catch {
-        Write-Warn "smoke 触发失败：$($_.Exception.Message)"
-        Write-Host "  可能 Adapter 还没起完，看日志：$adLog" -ForegroundColor Gray
     }
-
     Write-Host ""
     Write-Host "  看 Gateway 处理日志：" -ForegroundColor Gray
     Write-Host "    Get-Content $gwLog -Wait -Tail 30" -ForegroundColor Gray

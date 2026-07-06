@@ -5,17 +5,17 @@
  * 1. 读环境变量配置
  * 2. 构造 FeishuClient（mock 或 SDK 实现）
  * 3. 构造 IpcClient 连接 Gateway
- * 4. 启动飞书 webhook server（含 challenge 透传 + 签名校验，接收 @Orcha 触发）
+ * 4. 启动飞书 WebSocket 长连接（接收 @Orcha 触发；mock 模式跳过）
  * 5. IPC ↔ Feishu 双向路由：
- *    - webhook onTrigger → IPC Trigger 消息
+ *    - 长连接 onTrigger → IPC Trigger 消息
  *    - IPC CardUpdate/Notify/TaskResult → FeishuClient.pushXxx
- * 6. SIGTERM/SIGINT 优雅关闭：关 webhook + stop IPC + 退出
+ * 6. SIGTERM/SIGINT 优雅关闭：关长连接 + stop IPC + 退出
  *
- * 默认 mock 模式（`ORCHA_ADAPTER_MOCK=1` 或缺省），所有飞书动作用 console.log。
+ * 默认 mock 模式（`ORCHA_ADAPTER_MOCK=1` 或缺省），所有飞书动作用 console.log，
+ * 不启动长连接（避免无凭证时连飞书失败刷日志）。
  * 生产模式需提供：
- *   - ORCHA_FEISHU_APP_ID + ORCHA_FEISHU_APP_SECRET（必填，调 OpenAPI）
- *   - ORCHA_FEISHU_VERIFICATION_TOKEN（可选，challenge 校验）
- *   - ORCHA_FEISHU_ENCRYPT_KEY（可选，事件签名校验）
+ *   - ORCHA_FEISHU_APP_ID + ORCHA_FEISHU_APP_SECRET（必填）
+ *   长连接模式下无需 Verification Token / Encrypt Key / 公网 URL / 内网穿透。
  */
 
 import { IpcClient, IpcClientOptions } from './ipc';
@@ -27,9 +27,10 @@ import {
   FeishuClient,
   FeishuEvent,
   HttpFeishuClient,
+  LongConnectionHandle,
   MockFeishuClient,
   eventToTriggerSource,
-  startWebhookServer,
+  startLongConnection,
 } from './feishu';
 
 // ============================================================
@@ -41,16 +42,10 @@ interface AdapterConfig {
   gatewayEndpoint: string;
   /** 是否 mock 模式。 */
   mock: boolean;
-  /** webhook server 监听端口。 */
-  webhookPort: number;
   /** 飞书 app_id（非 mock 模式必填）。 */
   feishuAppId?: string;
   /** 飞书 app_secret（非 mock 模式必填）。 */
   feishuAppSecret?: string;
-  /** 飞书 Verification Token（可选，challenge 校验）。 */
-  feishuVerificationToken?: string;
-  /** 飞书 Encrypt Key（可选，事件签名校验）。 */
-  feishuEncryptKey?: string;
 }
 
 /** 从环境变量读配置。失败时抛错并退出。 */
@@ -62,16 +57,8 @@ function loadConfig(): AdapterConfig {
   }
 
   const mock = process.env.ORCHA_ADAPTER_MOCK !== '0';
-  const webhookPort = Number.parseInt(process.env.ORCHA_ADAPTER_WEBHOOK_PORT ?? '7099', 10);
-  if (!Number.isFinite(webhookPort) || webhookPort <= 0 || webhookPort > 65535) {
-    console.error(`ORCHA_ADAPTER_WEBHOOK_PORT 非法: ${process.env.ORCHA_ADAPTER_WEBHOOK_PORT}`);
-    process.exit(2);
-  }
-
   const feishuAppId = process.env.ORCHA_FEISHU_APP_ID;
   const feishuAppSecret = process.env.ORCHA_FEISHU_APP_SECRET;
-  const feishuVerificationToken = process.env.ORCHA_FEISHU_VERIFICATION_TOKEN;
-  const feishuEncryptKey = process.env.ORCHA_FEISHU_ENCRYPT_KEY;
 
   if (!mock) {
     if (!feishuAppId || !feishuAppSecret) {
@@ -83,11 +70,8 @@ function loadConfig(): AdapterConfig {
   return {
     gatewayEndpoint,
     mock,
-    webhookPort,
     feishuAppId,
     feishuAppSecret,
-    feishuVerificationToken,
-    feishuEncryptKey,
   };
 }
 
@@ -97,20 +81,27 @@ function loadConfig(): AdapterConfig {
 
 async function main(): Promise<void> {
   const cfg = loadConfig();
-  console.log(`[adapter] 启动中 mock=${cfg.mock} gateway=${cfg.gatewayEndpoint} webhook_port=${cfg.webhookPort}`);
+  console.log(`[adapter] 启动中 mock=${cfg.mock} gateway=${cfg.gatewayEndpoint}`);
 
   const feishuClient = createFeishuClient(cfg);
   const ipcClient = createIpcClient(cfg, feishuClient);
-  const webhookServer = startWebhookServer({
-    port: cfg.webhookPort,
-    handlers: {
-      onTrigger: (event: FeishuEvent) => {
-        onWebhookTrigger(event, ipcClient);
+
+  // 长连接仅在非 mock 模式启动（mock 模式无凭证，连不上飞书）
+  let longConn: LongConnectionHandle | null = null;
+  if (!cfg.mock) {
+    longConn = startLongConnection({
+      appId: cfg.feishuAppId!,
+      appSecret: cfg.feishuAppSecret!,
+      handlers: {
+        onTrigger: (event: FeishuEvent) => {
+          onWebhookTrigger(event, ipcClient);
+        },
       },
-    },
-    verificationToken: cfg.feishuVerificationToken,
-    encryptKey: cfg.feishuEncryptKey,
-  });
+    });
+    console.log('[adapter] 飞书长连接已启动（SDK 内部自动重连 + 签名校验）');
+  } else {
+    console.log('[adapter] mock 模式：不启动长连接（无飞书凭证）');
+  }
 
   // 信号处理：优雅关闭
   let shuttingDown = false;
@@ -121,7 +112,9 @@ async function main(): Promise<void> {
     }
     shuttingDown = true;
     console.log(`[adapter] 收到 ${signal}，开始优雅关闭`);
-    webhookServer.close();
+    if (longConn) {
+      longConn.close();
+    }
     await ipcClient.stop();
     console.log('[adapter] 已关闭');
     process.exit(0);
@@ -130,12 +123,6 @@ async function main(): Promise<void> {
   process.on('SIGINT', shutdown);
 
   ipcClient.start();
-  console.log(`[adapter] webhook server 监听 :${cfg.webhookPort}/webhook/feishu`);
-  if (!cfg.mock) {
-    const sigOn = cfg.feishuEncryptKey ? 'on' : 'off';
-    const tokenOn = cfg.feishuVerificationToken ? 'on' : 'off';
-    console.log(`[adapter] 签名校验=${sigOn} token校验=${tokenOn}`);
-  }
   console.log('[adapter] 启动完成，等待飞书事件');
 }
 

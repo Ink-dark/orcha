@@ -1,21 +1,18 @@
 /**
- * 飞书接入：mock 模式 + webhook server + 卡片推送。
+ * 飞书接入：mock 模式 + WebSocket 长连接 + 卡片推送。
  *
  * 三层职责：
- * 1. **接收**：飞书事件回调（webhook POST）→ 解析 @Orcha 触发 → 转成 TriggerMsg
+ * 1. **接收**：飞书 WebSocket 长连接（lark.WSClient）主动拉事件 → 解析 @Orcha 触发 → 转成 TriggerMsg
  * 2. **发送**：收到 CardUpdate/Notify/TaskResult → 调飞书 API patch 卡片 / 发消息
  * 3. **mock 模式**：`ORCHA_ADAPTER_MOCK=1` 时所有动作用 console.log，便于本地开发
  *
- * M8 实现：
- * - 用 @larksuiteoapi/node-sdk 调飞书 OpenAPI（token 自动刷新 + 签名校验）
- * - webhook 加 url_verification challenge 透传
- * - webhook 加 X-Lark-Signature 签名校验（防伪造请求）
- * - im.message.create 发初始卡片，im.message.patch 更新卡片内容
- * - im.message.create 发 Notify/TaskResult 文本消息
+ * M8 实现（长连接版）：
+ * - 接收：用 @larksuiteoapi/node-sdk 的 WSClient 长连接，SDK 内部自动维护心跳 / 重连 / 事件签名校验 / 解密
+ * - 发送：用 lark.Client 调 OpenAPI（token 自动刷新），im.message.create 发卡片 / 文本，im.message.patch 更新卡片
+ * - 优势：不需要公网 URL、不需要 HTTPS 证书、不需要内网穿透、不需要配 Encrypt Key / Verification Token
+ * - 限制：一个 app 同时只能有一个长连接实例（多副本请用 webhook 模式）
  */
 
-import * as http from 'http';
-import * as crypto from 'crypto';
 import * as lark from '@larksuiteoapi/node-sdk';
 import { TriggerSource } from './protocol';
 
@@ -34,7 +31,7 @@ export interface FeishuEvent {
 }
 
 /** 飞书事件回调 handler。 */
-export interface FeishuWebhookHandlers {
+export interface FeishuHandlers {
   /** 收到 @Orcha 触发。 */
   onTrigger: (event: FeishuEvent) => void;
 }
@@ -311,177 +308,84 @@ export function eventToTriggerSource(event: FeishuEvent): TriggerSource {
 }
 
 // ============================================================
-// Webhook server（含 challenge 透传 + 签名校验）
+// WebSocket 长连接（lark.WSClient）
 // ============================================================
 
-/** webhook server 配置。 */
-export interface WebhookServerOptions {
-  /** 监听端口。 */
-  port: number;
+/** 长连接启动选项。 */
+export interface LongConnectionOptions {
   /** 事件 handler。 */
-  handlers: FeishuWebhookHandlers;
-  /** 飞书 Verification Token（开放平台 → 事件订阅页获取，留空则不校验）。 */
-  verificationToken?: string;
-  /** 飞书 Encrypt Key（开放平台 → 事件订阅页获取，留空则不校验签名）。 */
-  encryptKey?: string;
+  handlers: FeishuHandlers;
+  /** 飞书 app_id。 */
+  appId: string;
+  /** 飞书 app_secret。 */
+  appSecret: string;
+  /** 飞书 OpenAPI 域，默认 lark.Domain.Feishu（https://open.feishu.cn）。 */
+  domain?: string;
+}
+
+/** 长连接句柄，调用方负责 close。 */
+export interface LongConnectionHandle {
+  /** 关闭长连接。 */
+  close(): void;
 }
 
 /**
- * 校验飞书事件签名。
+ * 启动飞书 WebSocket 长连接。
  *
- * 飞书签名算法：HMAC-SHA256(timestamp + nonce + encryptKey + body)
- * header: X-Lark-Signature
+ * - 用 lark.WSClient 主动连飞书服务器（不需要公网 URL / 内网穿透 / HTTPS 证书）
+ * - SDK 内部自动维护心跳 / 重连 / 事件签名校验 / 解密（无需配 Encrypt Key / Verification Token）
+ * - 注册 `im.message.receive_v1` 事件，收到消息后解析 @Orcha 触发
+ * - 限制：一个 app 同时只能有一个长连接实例
+ *
+ * 返回句柄，调用方在退出时 close。
  */
-function verifySignature(
-  timestamp: string,
-  nonce: string,
-  body: string,
-  encryptKey: string,
-  signature: string,
-): boolean {
-  const payload = timestamp + nonce + encryptKey + body;
-  const expected = crypto.createHmac('sha256', encryptKey).update(payload).digest('hex');
-  // 用 timingSafeEqual 防时序攻击
-  try {
-    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
-  } catch {
-    return false;
-  }
-}
-
-/**
- * 启动飞书事件回调 webhook server。
- *
- * 监听 POST `/webhook/feishu`：
- * - url_verification → 返回 challenge（飞书开放平台添加事件订阅时校验）
- * - im.message.receive_v1 → 提取 @Orcha 触发 → 调 handlers.onTrigger
- * - 签名校验（如果配了 encryptKey）
- * - 其他事件 → log 后 ack
- *
- * 返回 http.Server 实例，调用方负责 close。
- */
-export function startWebhookServer(opts: WebhookServerOptions): http.Server {
-  const { port, handlers, verificationToken, encryptKey } = opts;
-  const server = http.createServer((req, res) => {
-    if (req.method !== 'POST' || req.url !== '/webhook/feishu') {
-      res.statusCode = 404;
-      res.end('not found');
-      return;
-    }
-
-    // 收集 raw body（签名校验需要原始字节，不能用 JSON.parse 后的）
-    const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => {
-      chunks.push(chunk);
-      if (Buffer.concat(chunks).length > 1024 * 1024) {
-        res.statusCode = 413;
-        res.end('payload too large');
-        req.destroy();
-      }
-    });
-
-    req.on('end', () => {
-      const rawBody = Buffer.concat(chunks).toString('utf8');
-
-      // 签名校验（配了 encryptKey 才校验）
-      if (encryptKey) {
-        const sig = req.headers['x-lark-signature'] as string | undefined;
-        const ts = req.headers['x-lark-request-timestamp'] as string | undefined;
-        const nonce = req.headers['x-lark-request-nonce'] as string | undefined;
-        if (!sig || !ts || !nonce) {
-          console.warn('[webhook] 拒绝：缺少签名头');
-          res.statusCode = 401;
-          res.end('missing signature');
-          return;
-        }
-        if (!verifySignature(ts, nonce, rawBody, encryptKey, sig)) {
-          console.warn('[webhook] 拒绝：签名校验失败');
-          res.statusCode = 401;
-          res.end('invalid signature');
-          return;
-        }
-      }
-
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(rawBody);
-      } catch (e) {
-        console.warn('[webhook] invalid JSON:', (e as Error).message);
-        res.statusCode = 400;
-        res.end('invalid json');
-        return;
-      }
-
-      try {
-        // url_verification：返回 challenge（飞书开放平台添加事件订阅时校验）
-        const obj = parsed as Record<string, unknown>;
-        if (obj.type === 'url_verification') {
-          // 可选校验 token（飞书会带 token，但 challenge 阶段通常还没配 encryptKey）
-          if (verificationToken && obj.token !== verificationToken) {
-            console.warn('[webhook] challenge token 不匹配');
-            res.statusCode = 401;
-            res.end('invalid token');
-            return;
-          }
-          const challenge = obj.challenge;
-          if (typeof challenge !== 'string') {
-            res.statusCode = 400;
-            res.end('missing challenge');
-            return;
-          }
-          res.statusCode = 200;
-          res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ challenge }));
-          console.log('[webhook] url_verification 已响应');
-          return;
-        }
-
-        const event = parseFeishuEvent(parsed);
-        if (event === null) {
-          res.statusCode = 200;
-          res.end('ok');
-          return;
-        }
-        handlers.onTrigger(event);
-        res.statusCode = 200;
-        res.end('ok');
-      } catch (e) {
-        console.error('[webhook] handler error:', e);
-        res.statusCode = 500;
-        res.end('handler error');
-      }
-    });
-
-    req.on('error', (err: Error) => {
-      console.warn('[webhook] request error:', err.message);
-      if (!res.headersSent) {
-        res.statusCode = 400;
-        res.end('bad request');
-      }
-    });
+export function startLongConnection(opts: LongConnectionOptions): LongConnectionHandle {
+  const wsClient = new lark.WSClient({
+    appId: opts.appId,
+    appSecret: opts.appSecret,
+    domain: opts.domain ?? lark.Domain.Feishu,
+    loggerLevel: lark.LoggerLevel.info,
   });
 
-  server.listen(port);
-  return server;
+  const eventDispatcher = new lark.EventDispatcher({}).register({
+    // im.message.receive_v1：用户在群/私聊发消息
+    'im.message.receive_v1': async (data: unknown) => {
+      // SDK 已处理签名/解密，data 是事件 payload 的 event 部分
+      const event = parseFeishuEvent(data);
+      if (event !== null) {
+        opts.handlers.onTrigger(event);
+      }
+    },
+  });
+
+  // start 是 async（返回 Promise<void>），不 await 让主流程继续
+  // 失败时 SDK 内部会重连；fatal 错误由 onReconnecting / onError 回调通知（未来加）
+  void wsClient.start({ eventDispatcher });
+
+  return {
+    close(): void {
+      wsClient.close();
+    },
+  };
 }
 
+// ============================================================
+// 事件解析（纯函数，可单测）
+// ============================================================
+
 /**
- * 解析飞书事件 JSON 为 FeishuEvent。非触发消息返回 null。
+ * 解析飞书 im.message.receive_v1 事件的 event payload 为 FeishuEvent。
+ * 非触发消息（非文本、无 @Orcha）返回 null。
  *
- * 飞书 v2 事件结构（简化）：
+ * event 结构（简化）：
  * ```json
  * {
- *   "schema": "2.0",
- *   "header": { "event_type": "im.message.receive_v1" },
- *   "event": {
- *     "sender": { "sender_id": { "open_id": "ou_xxx" } },
- *     "message": {
- *       "chat_id": "oc_xxx",
- *       "chat_type": "group" | "p2p",
- *       "message_type": "text",
- *       "content": "{\"text\":\"@_user_1 fix login\"}",
- *       "mentions": [{ "key": "@_user_1", "id": { "open_id": "ou_bot" } }]
- *     }
+ *   "sender": { "sender_id": { "open_id": "ou_xxx" } },
+ *   "message": {
+ *     "chat_id": "oc_xxx",
+ *     "chat_type": "group" | "p2p",
+ *     "message_type": "text",
+ *     "content": "{\"text\":\"@_user_1 fix login\"}"
  *   }
  * }
  * ```
@@ -490,27 +394,7 @@ function parseFeishuEvent(payload: unknown): FeishuEvent | null {
   if (typeof payload !== 'object' || payload === null) {
     return null;
   }
-  const obj = payload as Record<string, unknown>;
-
-  // url 验证 challenge 在 webhook 入口已处理，到这里说明不是
-  if (obj.type === 'url_verification') {
-    return null;
-  }
-
-  const header = obj.header;
-  if (typeof header !== 'object' || header === null) {
-    return null;
-  }
-  const eventType = (header as Record<string, unknown>).event_type;
-  if (eventType !== 'im.message.receive_v1') {
-    return null;
-  }
-
-  const event = obj.event;
-  if (typeof event !== 'object' || event === null) {
-    return null;
-  }
-  const ev = event as Record<string, unknown>;
+  const ev = payload as Record<string, unknown>;
 
   const sender = ev.sender;
   if (typeof sender !== 'object' || sender === null) {
