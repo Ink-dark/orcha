@@ -347,13 +347,14 @@ pub trait LlmClient: Send + Sync {
 
 - **结论**：飞书接入不 Rust 重撸 WS，而是 fork OpenClaw 官方插件（`larksuite/openclaw-lark`，MIT）当独立 Node/TS 进程，通过 Unix Socket / localhost TCP 接 Rust Gateway。
 - **理由**：OpenClaw "国产 IM 水土不服"（坑 7）的教训——飞书/QQ 非 Slack，协议差异大，Rust 生态缺成熟 SDK，重撸风险高。fork 官方插件复用其 WS 重连/事件解析逻辑，Rust 侧只管业务。
-- **架构**：
+- **架构**（IPC 经 `IpcTransport` trait 抽象，跨平台）：
   ```
   飞书 WS ←→ Feishu Adapter (TS, fork openclaw-lark)
-                     ↓ Unix Socket / localhost TCP
+                     ↓ IpcTransport trait
                 orcha-gateway (Rust)
+                （Unix Socket / Named Pipe / localhost TCP）
                      ↓
-                orcha-core (Cycleround)
+                orcha-core (Cycleround daemon)
   ```
 - **对应 Gap**：Gap 8（Gateway crate 仍要建，但飞书 SDK 接入改为 Adapter 进程）
 
@@ -366,21 +367,33 @@ pub trait LlmClient: Send + Sync {
 
 ---
 
-## 9. M6 执行优先级
+## 9. 执行优先级（M6 / M7 拆分后）
+
+> 原单 M6 已拆为新 M6（基础设施）+ 新 M7（IM 接入与守护），原 M7/M8 顺延为 M8/M9。
+
+### M6 — Gateway 基础设施与跨进程通信
 
 | 优先级 | 事项 | 对应 Gap / 决策 |
 |--------|------|----------|
-| P0 | 新建 `orcha-gateway` crate + Unix Socket 接 Feishu Adapter（TS） | Gap 8 / 决策 6 |
-| P0 | Cycleround 改为 AI 驱动调度 + 事件流 | Gap 2, Gap 4 / 决策 2, 3 |
-| P0 | Feishu Adapter TS 进程（fork `openclaw-lark`）接 Gateway | 决策 6 |
-| P0 | 双向 watchdog + 降级链（LLM 超时 → 通知 → restart → 恢复） | Gap 10 / 决策 5 |
-| P1 | SQLite 替换 FileTaskStore | Gap 6 / 决策 1 |
+| P0 | 新建 `orcha-gateway` crate，Core 改 daemon | Gap 8 / 决策 1 |
+| P0 | `IpcTransport` trait（Unix Socket / Named Pipe / TCP，跨平台含 Windows） | 决策 6 |
+| P0 | Cycleround 事件流（`mpsc::Receiver<RoundEvent>`，调度顺序暂不变） | Gap 4 / 决策 3 |
+| P1 | `SqliteTaskStore` 替换 `FileTaskStore`（合并原 M4） | Gap 6 / 决策 1 |
 | P1 | Gateway 任务队列 + worker 池（非阻塞） | Gap 5 |
-| P1 | Reviewer 跨轮拒绝记忆（带状态闸门） | Gap 9 / 决策 7 |
-| P2 | 飞书卡片实时更新（patch card） | Gap 4(消费端) |
-| P2 | SubAgent 调度解耦（trait 不改，调用方改） | Gap 1(部分) |
+| P1 | `config.toml` + 密钥管理 + trace ID | （评审补缺） |
 
-**一句话**：M6 的核心是让 Core 能"说话"（事件流）和"听话"（AI 调度），外加"不崩"（双向守护）和"不蒙混"（状态闸门），其余都是支撑设施。
+### M7 — IM 接入与智能守护（初赛交付主体）
+
+| 优先级 | 事项 | 对应 Gap / 决策 |
+|--------|------|----------|
+| P0 | Feishu Adapter TS 进程（fork `openclaw-lark`）经 IPC 接 Gateway | 决策 6 |
+| P0 | Cycleround 改为 AI 驱动调度 | Gap 2 / 决策 2 |
+| P0 | 双向 watchdog + 降级链（LLM 超时 → 通知 → restart → 恢复） | Gap 10 / 决策 5 |
+| P1 | Reviewer 跨轮拒绝记忆（带状态闸门） | Gap 9 / 决策 7 |
+| P1 | 飞书/QQ 长连接接入 + 卡片 patch 更新 | Gap 8 / 决策 3 消费端 |
+| P2 | 鉴权与白名单群校验 + 部署拓扑文档 | — |
+
+**一句话**：M6 搭"管道"（进程/IPC/SQLite/队列/事件流），M7 接"IM + 智能"（飞书/AI 调度/守护/降级），初赛只验 M7。
 
 ---
 
