@@ -8,6 +8,11 @@ Cargo.lock.bak
 .env
 .env.local
 
+# 本地运行产物
+scripts/dev-env.ps1
+logs/
+.orcha/
+
 # Node
 node_modules/
 packages/orcha-feishu-adapter/dist/

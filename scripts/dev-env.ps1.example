@@ -1,0 +1,31 @@
+# scripts/dev-env.ps1.example — 环境变量模板
+#
+# 拷贝为 dev-env.ps1 并填入真实值后，scripts/start.ps1 会自动 dot-source 加载。
+#
+#   copy scripts\dev-env.ps1.example scripts\dev-env.ps1
+#   notepad scripts\dev-env.ps1
+
+# ====================================================================
+# LLM 配置（必填）
+# ====================================================================
+
+# 必填：你的 LLM API key
+# OpenAI:    sk-...
+# DeepSeek:  sk-...
+# Ollama:    ollama（本地 ollama 服务，免费）
+$env:ORCHA_LLM_API_KEY = "YOUR_LLM_API_KEY_HERE"
+
+# 可选：覆盖默认（base_url = https://api.openai.com/v1，model = gpt-4o）
+# $env:ORCHA_LLM_BASE_URL = "https://api.deepseek.com/v1"
+# $env:ORCHA_LLM_MODEL = "deepseek-chat"
+
+# 本地 Ollama 示例：
+# $env:ORCHA_LLM_BASE_URL = "http://localhost:11434/v1"
+# $env:ORCHA_LLM_MODEL = "llama3"
+
+# ====================================================================
+# 飞书凭证（可选，M7 阶段用 mock 模式可留空）
+# ====================================================================
+# 仅当 scripts\start.ps1 不用 mock 时（即改了 ORCHA_ADAPTER_MOCK=0）才需要
+# $env:ORCHA_FEISHU_APP_ID = "cli_xxx"
+# $env:ORCHA_FEISHU_APP_SECRET = "..."
