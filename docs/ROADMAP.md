@@ -52,6 +52,7 @@
 
 **交付物**：
 - Task 仓储：`TaskStore` trait + `FileTaskStore`（JSON 文件落盘），trait 预留 `SqliteTaskStore`/Redis/PG 接口。M1 用纯 Rust 文件存储以保 Windows MSVC 零 C 依赖；M4 持久化升级时再引入 rusqlite。
+- **FileTaskStore 并发保护**：内存队列 + 单线程串行落盘，防文件截断（M1 阶段就做，不等 M4）
 - 状态机：`PENDING → RUNNING → (BLOCKED ↔ RUNNING) → DONE | FAILED`（M0 已实现）
 - CLI：`orcha init`、`orcha run "<desc>"`、`orcha status [id]`、`orcha list [--status <STATUS>]`
 - Home 解析：`--home` > `$ORCHA_HOME` > `./.orcha`
@@ -62,6 +63,7 @@
 - [x] 非法状态迁移抛出 `InvalidTransition`，且有单元测试覆盖（M0 state_machine 测试 + store update 测试）
 - [x] `orcha list` 列出全部任务，支持 `--status` 过滤（大小写不敏感）
 - [x] 重启进程后 `orcha list` 仍可查到历史任务（持久化生效；`persistence_survives_process_restart` 集成测试跨独立子进程验证）
+- [ ] FileTaskStore 并发写入不截断（内存队列 + 串行落盘的单测覆盖）
 - [ ] CI 在 GitHub Actions 上跑通本次新增测试（ubuntu + windows MSVC）— 待 push 后由 Actions 确认
 
 ---
@@ -131,6 +133,8 @@
 
 ## M5 — Web UI Shell + HTTP API
 
+> **初赛 Demo 约束**：初赛只搞 IM 交互（M6），M5 Web UI **不纳入初赛验收范围**。M5 已实现并保留作为开发期观测面板，但不作为初赛交付。
+
 **目标**：面向用户的可视化面板与对话窗口。提供 Web UI 与 JSON API 展示任务状态/历史/memory；任务触发主入口见 M6 Gateway，Shell 本身不做 IM 接入。
 
 **交付物**：
@@ -154,28 +158,40 @@
 
 ## M6 — IM Gateway（飞书 / QQ 长连接）
 
+> **架构对标**：本里程碑的每项关键决策都对应 OpenClaw 的一个失败坑（详见 `docs/ARCHITECTURE_ANALYSIS.md` 第 7.5 节）。核心规避：单进程一崩全崩→分进程+watchdog、国产 IM 水土不服→fork 官方 TS 插件、盲跑→带状态闸门、token 雪崩→降级链。
+
 **目标**：**触发主入口（一等公民）**。通过各平台官方 SDK 的**长连接**接入 IM，提供实时交互体验（体感对标 OpenClaw）。@Orcha 触发任务后，进度经长连接实时推送回原会话，无需公网回调地址、无需 HTTP 轮询。Shell（M5）作为可视化面板观测同一份任务，不做触发。
 
 **交付物**：
 - 新建 `orcha-gateway` crate（独立 `main`，独立进程，与 Shell 故障域隔离）
-- 飞书 SDK 长连接接入（WebSocket 接收事件，免公网 webhook）
+- **Feishu Adapter 独立 TS 进程**：fork OpenClaw 官方插件 `larksuite/openclaw-lark`（MIT），作为独立 Node/TS 进程通过 Unix Socket / localhost TCP 接 Rust Gateway，不 Rust 重撸 WS
+- 飞书 SDK 长连接接入（经 Adapter TS 进程，WebSocket 接收事件，免公网 webhook）
 - QQ SDK 长连接接入
 - Cycleround 改造为 AI 驱动调度（硬编码 Observer→Planner→...→Fixer 改为 AI 每步决策下一步调谁，带熔断）
 - Cycleround 事件流改造（`run` 返回 `mpsc::Receiver<RoundEvent>`，每步吐 `AgentStarted`/`AgentFinished` 事件）
 - Gateway 任务队列 + worker 池（非阻塞：收到 @Orcha 入队，后台 worker 跑 Cycleround，长连接不被卡死）
 - 飞书卡片实时更新（patch card：执行中持续更新同一张卡片 "🔍 观察中… → 📋 规划中… → 💻 写代码中…"）
+- **双向守护与自愈**：Core ↔ Gateway 互为 watchdog；Gateway AI 常驻做智能诊断（读 crash log → 针对性恢复）
+- **降级链**：LLM 超时 → IM 通知用户"AI 卡住，正在恢复" → 预设脚本 restart → 恢复后再通知"已恢复"
+- **启动顺序**：外层 init 保进程 → Core 先起 → Gateway 后起（依赖 Core 的 Unix Socket 就绪）
+- **Test&QA 带状态闸门**：Reviewer 多轮循环中记住上一轮拒了哪几点，AI 不能靠换写法蒙混
 - `SqliteTaskStore`（feature gate，WAL + 跨进程锁，替代 `FileTaskStore`；Shell 只读连接，Gateway 独占写）
 - 鉴权与白名单群校验
 
 **验收（可验证）**：
-- [ ] 新建 `orcha-gateway` crate，独立进程可启动并接入飞书 SDK 长连接
-- [ ] 飞书通过 SDK 长连接接收 `@Orcha fix <issue>` 并触发 Cycleround
+- [ ] 新建 `orcha-gateway` crate，独立进程可启动并接入 Feishu Adapter（TS 进程经 Unix Socket 通信）
+- [ ] Feishu Adapter（fork `openclaw-lark`）TS 进程可启动并接入飞书 SDK 长连接
+- [ ] 飞书通过 Adapter 长连接接收 `@Orcha fix <issue>` 并触发 Cycleround
 - [ ] QQ 通过 SDK 长连接接收并触发任务
 - [ ] Cycleround 调度由 AI 驱动（不再硬编码 Observer→Planner→...→Fixer 顺序）
 - [ ] Cycleround `run` 返回 `mpsc::Receiver<RoundEvent>`，Gateway 可消费每步事件
 - [ ] 执行进度经长连接实时回传原会话（非 HTTP 轮询，体感对标 OpenClaw）
 - [ ] 飞书卡片在任务进行中持续 patch 更新（"🔍 观察中…" → "📋 规划中…" → "💻 写代码中…"）
 - [ ] Gateway 任务队列 + worker 池生效：一个任务执行期间长连接可继续接收新消息
+- [ ] Core ↔ Gateway 互为 watchdog：一方崩溃，另一方检测并触发恢复
+- [ ] LLM 超时触发降级链（IM 通知 → restart → 恢复通知），不 token 雪崩
+- [ ] 启动顺序正确（外层 init → Core 就绪 → Gateway 后起）
+- [ ] Reviewer 跨轮拒绝记忆生效：AI 换写法重复犯错会被加重拒绝
 - [ ] `SqliteTaskStore` 替换 `FileTaskStore`，Gateway 与 Shell 分进程读写同一 SQLite 不损坏
 - [ ] 产物 / Artifact 链接在 IM 中可点击展开
 - [ ] 私有群权限校验生效（机器人仅在白名单群内响应）
