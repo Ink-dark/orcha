@@ -237,12 +237,89 @@ pub trait LlmClient: Send + Sync {
 
 ---
 
-## 8. 待你定夺的关键问题
+## 8. 待定问题 → 已决策（2026-07-06）
 
-1. **进程模型**：Gateway 与 Shell 同进程还是分进程？（决定 Gap 6 用 Mutex 还是 flock/SQLite）
-2. **Cycleround 重构深度**：是渐进改造（保留确定性 Cycleround 当 dev 假实现，LlmCycleround 演进为主路径）还是重写（Cycleround 退化为纯脚手架工具集，调度完全交给 AI）？
-3. **事件流改造**：Gap 4 优先做还是 M6 再做？（决定 M6 能不能实时回传）
-4. **SubAgent trait 重构**：Gap 1+2 一起做还是分开？（权限维度和调度解耦耦合较深）
+4 个关键问题已定，M6 执行依据：
+
+### 决策 1：进程模型 → 分进程，存储换 SQLite
+
+- **结论**：Gateway 和 Shell 是两个独立进程，`FileTaskStore` → `SqliteTaskStore`。
+- **理由**：设计文档已定 Shell 在用户机、Gateway 在云端，物理分进程。SQLite WAL + 跨进程锁解决 Gap 6，附带解决 JSON corruption 风险。`TaskStore` trait 已抽象，换实现不影响上层。
+- **落地**：
+  - M6 新建 `orcha-gateway` crate，独立 `main`
+  - `orcha-core` 加 `SqliteTaskStore`（feature gate），保留 `FileTaskStore` 给 cli dev 模式
+  - Shell 继续读 SQLite（只读连接），不碰写
+- **对应 Gap**：Gap 6（无并发写保护）、Gap 8（无 Gateway crate）
+
+### 决策 2：Cycleround 重构 → 渐进，调度权交 AI
+
+- **结论**：保留确定性 Cycleround 当 dev/test 假实现，LlmCycleround 演进为主路径。硬编码顺序改为 **AI 每步决策下一步**。
+- **Cycleround 不退化为纯脚手架**，仍然管：熔断、StepResult 记录落盘、Minicommit 触发、异常捕获回滚。但**不再决定调谁**。
+- **目标调度模型**：
+  ```rust
+  loop {
+      let decision = ai_decide_next_step(&context); // LLM 返回 { agent, params }
+      match decision.agent {
+          "observer" | "planner" | "worker" | "tester" | "reviewer" | "fixer" => agent.run(&ctx),
+          "exit" => break, // QA 通过，正常退出
+          _ => /* unknown */,
+      }
+      if should_stop(&ctx) { break; } // 熔断
+  }
+  ```
+- **为什么不全重写**：9 天时间，确定性版本能跑通 happy path，留作单测 fixture 和离线调试工具。重写风险大收益小。
+- **对应 Gap**：Gap 2（调度硬编码）、Gap 3（Worker 瞎改文件——调度交 AI 后，Worker 退化为工具调用）
+
+### 决策 3：事件流 → M6 优先做，和调度重构同步
+
+- **结论**：事件流不后置。M6 必须做，且和 Cycleround 重构同步完成。
+- **理由**：飞书 IM 核心体验是实时反馈。用户 @Orcha 后 30 秒没动静会以为 bot 死了。飞书卡片支持 patch 更新（"🔍 观察中…" → "📋 规划中…" → "💻 写代码中…"），需 Core 持续吐事件。
+- **改造方式**（工作量不大）：
+  ```rust
+  pub fn run(&mut self) -> mpsc::Receiver<RoundEvent> {
+      let (tx, rx) = mpsc::channel();
+      std::thread::spawn(move || {
+          loop {
+              tx.send(RoundEvent::AgentStarted { agent: "planner" }).ok();
+              // ... 执行 ...
+              tx.send(RoundEvent::AgentFinished { agent: "planner", result }).ok();
+          }
+      });
+      rx
+  }
+  ```
+  Gateway 拿 receiver 转成 IM 卡片更新推给用户。
+- **对应 Gap**：Gap 4（无事件流）
+
+### 决策 4：SubAgent trait → 先解耦调度，权限后置
+
+- **结论**：Gap 2（调度）和 Gap 1（权限）**分开做**。M6 只做调度解耦，权限维度等初赛后再加。
+- **理由**：当前 trait 极简（`name` + `run`），初赛阶段所有 agent 在同一 workspace 跑，权限隔离非痛点。强行加 capability 拖慢调度重构。
+- **M6 trait 改动极小**：trait 本身不动，调度逻辑从 Cycleround 挪到 AI 决策侧。
+- **初赛后再加**：
+  ```rust
+  pub trait SubAgent {
+      fn name(&self) -> &'static str;
+      fn capabilities(&self) -> Capabilities; // READ | WRITE | EXECUTE
+      fn run(&self, ctx: &StepContext) -> StepOutput;
+  }
+  ```
+- **对应 Gap**：Gap 1（部分——调度解耦做了，权限维度后置）
+
+---
+
+## 9. M6 执行优先级
+
+| 优先级 | 事项 | 对应 Gap |
+|--------|------|----------|
+| P0 | 新建 `orcha-gateway` crate + Unix Socket 接 Adapter | Gap 8 |
+| P0 | Cycleround 改为 AI 驱动调度 + 事件流 | Gap 2, Gap 4 |
+| P1 | SQLite 替换 FileTaskStore | Gap 6 |
+| P1 | Gateway 任务队列 + worker 池（非阻塞） | Gap 5 |
+| P2 | SubAgent 调度解耦（trait 不改，调用方改） | Gap 1(部分) |
+| P2 | 飞书卡片实时更新 | Gap 4(消费端) |
+
+**一句话**：M6 的核心是让 Core 能"说话"（事件流）和"听话"（AI 调度），其余都是支撑设施。
 
 ---
 
