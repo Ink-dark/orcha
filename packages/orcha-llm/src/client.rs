@@ -165,9 +165,19 @@ impl LlmError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// 所有改 `ORCHA_LLM_*` 环境变量的测试必须先拿这把锁，
+    /// 避免并行执行时互相踩 env（cargo 默认多线程跑测试）。
+    /// 用 OnceLock 懒初始化避免 static 顺序问题。
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    fn env_lock() -> &'static Mutex<()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn config_from_env_fails_without_api_key() {
+        let _guard = env_lock().lock().unwrap();
         // 临时清空 env 验证报错。
         let old_key = std::env::var("ORCHA_LLM_API_KEY").ok();
         std::env::remove_var("ORCHA_LLM_API_KEY");
@@ -180,9 +190,7 @@ mod tests {
 
     #[test]
     fn config_from_env_uses_defaults_when_only_key_set() {
-        // 用串行执行（serial_test crate 太重，改用独立 env 命名避免冲突）。
-        // 此测试与 config_from_env_respects_custom_base_url 串行靠 cargo 默认并行，
-        // 通过 set/unset 同一组变量保证最后状态干净。
+        let _guard = env_lock().lock().unwrap();
         let old_key = std::env::var("ORCHA_LLM_API_KEY").ok();
         let old_url = std::env::var("ORCHA_LLM_BASE_URL").ok();
         let old_model = std::env::var("ORCHA_LLM_MODEL").ok();
@@ -213,6 +221,7 @@ mod tests {
 
     #[test]
     fn config_from_env_respects_custom_base_url() {
+        let _guard = env_lock().lock().unwrap();
         let old_key = std::env::var("ORCHA_LLM_API_KEY").ok();
         let old_url = std::env::var("ORCHA_LLM_BASE_URL").ok();
         let old_model = std::env::var("ORCHA_LLM_MODEL").ok();
