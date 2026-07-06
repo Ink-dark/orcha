@@ -1,4 +1,4 @@
-# scripts/stop.ps1 — 停止 Orcha Gateway + Adapter 后台进程
+﻿# scripts/stop.ps1 — 停止 Orcha Gateway + Adapter 后台进程
 #
 # 用法：.\scripts\stop.ps1
 #

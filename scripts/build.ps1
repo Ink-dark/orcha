@@ -1,4 +1,4 @@
-# scripts/build.ps1 — Orcha 一键编译 + 验证脚本（Windows PowerShell 5.1+）
+﻿# scripts/build.ps1 — Orcha 一键编译 + 验证脚本（Windows PowerShell 5.1+）
 #
 # 用法：
 #   .\scripts\build.ps1                  # 编译 Rust + TS（默认）

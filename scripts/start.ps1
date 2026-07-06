@@ -1,4 +1,4 @@
-# scripts/start.ps1 — Orcha 一键启动 Gateway + Adapter（后台）
+﻿# scripts/start.ps1 — Orcha 一键启动 Gateway + Adapter（后台）
 #
 # 用法：
 #   .\scripts\start.ps1                  # 启动两个后台进程
