@@ -337,33 +337,58 @@ export interface LongConnectionHandle {
  * - 注册 `im.message.receive_v1` 事件，收到消息后解析 @Orcha 触发
  * - 限制：一个 app 同时只能有一个长连接实例
  *
+ * 连接状态通过 console.log/warn 实时打印，便于诊断：
+ *   [feishu-ws] 已连接 / 重连中 / 重连成功 / 致命错误
+ *
  * 返回句柄，调用方在退出时 close。
  */
 export function startLongConnection(opts: LongConnectionOptions): LongConnectionHandle {
+  console.log(`[feishu-ws] 启动长连接 appId=${opts.appId} domain=${opts.domain ?? 'feishu'}`);
+
   const wsClient = new lark.WSClient({
     appId: opts.appId,
     appSecret: opts.appSecret,
     domain: opts.domain ?? lark.Domain.Feishu,
-    loggerLevel: lark.LoggerLevel.info,
+    // debug 级别让 SDK 输出连接握手细节，方便诊断连接失败
+    loggerLevel: lark.LoggerLevel.debug,
+    onReady: () => {
+      console.log('[feishu-ws] 长连接已建立，等待飞书事件');
+    },
+    onError: (err: Error) => {
+      console.error(`[feishu-ws] 长连接致命错误: ${err.message}`);
+      console.error('  可能原因：app_id/app_secret 错、应用未发布、未开长连接、网络不通');
+    },
+    onReconnecting: () => {
+      console.warn('[feishu-ws] 连接断开，重连中...');
+    },
+    onReconnected: () => {
+      console.log('[feishu-ws] 重连成功');
+    },
   });
 
   const eventDispatcher = new lark.EventDispatcher({}).register({
     // im.message.receive_v1：用户在群/私聊发消息
     'im.message.receive_v1': async (data: unknown) => {
+      console.log('[feishu-ws] 收到消息事件');
       // SDK 已处理签名/解密，data 是事件 payload 的 event 部分
       const event = parseFeishuEvent(data);
       if (event !== null) {
         opts.handlers.onTrigger(event);
+      } else {
+        console.log('[feishu-ws] 事件已忽略（非 @Orcha 触发或解析失败）');
       }
     },
   });
 
-  // start 是 async（返回 Promise<void>），不 await 让主流程继续
-  // 失败时 SDK 内部会重连；fatal 错误由 onReconnecting / onError 回调通知（未来加）
-  void wsClient.start({ eventDispatcher });
+  // start 返回 Promise，但 SDK 内部已通过 onReady/onError 回调通知状态
+  // 这里 catch 一下防止 unhandledRejection
+  void wsClient.start({ eventDispatcher }).catch((err: unknown) => {
+    console.error(`[feishu-ws] start 失败: ${(err as Error).message ?? err}`);
+  });
 
   return {
     close(): void {
+      console.log('[feishu-ws] 关闭长连接');
       wsClient.close();
     },
   };
