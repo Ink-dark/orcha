@@ -308,7 +308,9 @@ Write-Host "  日志：" -ForegroundColor Gray
 Write-Host "    Gateway:  $gwLog" -ForegroundColor Gray
 Write-Host "    Adapter:  $adLog" -ForegroundColor Gray
 Write-Host ""
-Write-Host "  实时看日志：  Get-Content $gwLog -Wait -Tail 20" -ForegroundColor Gray
+Write-Host "  实时看日志：  Get-Content $gwLog -Wait -Tail 20 -Encoding UTF8" -ForegroundColor Gray
+Write-Host "                Get-Content `"$gwLog.err`" -Wait -Tail 20 -Encoding UTF8" -ForegroundColor Gray
+Write-Host "                Get-Content `"$adLog`" -Wait -Tail 20 -Encoding UTF8" -ForegroundColor Gray
 Write-Host "  停止服务：    .\scripts\stop.ps1" -ForegroundColor Gray
 Write-Host ""
 
