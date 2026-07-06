@@ -208,6 +208,32 @@ impl GatewayConfig {
     pub fn authenticator(&self) -> crate::auth::Authenticator {
         crate::auth::Authenticator::new(self.auth.whitelist.clone())
     }
+
+    /// 构造 LLM 客户端（M7，需启用 `llm` feature）。
+    ///
+    /// 从 `llm.api_key_env` 指定的环境变量读 API key，配合 `llm.base_url` /
+    /// `llm.model` 构造 [`orcha_llm::OpenAiCompatibleClient`]。
+    ///
+    /// - 无 key 或 key 为空 → 返回 `None`：Gateway 仍能启动（CI smoke test 无 key），
+    ///   但任务触发后 worker 会因无法调 LLM 失败（在 CardUpdate 里告知用户）。
+    /// - 有 key → 返回 `Arc<dyn LlmClient>`，注入 worker 跑 `LlmCycleround`。
+    #[cfg(feature = "llm")]
+    pub fn build_llm_client(&self) -> Option<std::sync::Arc<dyn orcha_llm::LlmClient>> {
+        let key = std::env::var(&self.llm.api_key_env).ok()?;
+        if key.trim().is_empty() {
+            return None;
+        }
+        let cfg = orcha_llm::LlmConfig {
+            base_url: self.llm.base_url.trim_end_matches('/').to_string(),
+            api_key: key,
+            model: self.llm.model.clone(),
+            timeout: std::time::Duration::from_secs(120),
+            temperature: 0.2,
+        };
+        Some(std::sync::Arc::new(orcha_llm::OpenAiCompatibleClient::new(
+            cfg,
+        )))
+    }
 }
 
 impl Default for GatewayConfig {
