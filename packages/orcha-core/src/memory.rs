@@ -32,7 +32,7 @@ pub struct MemoryEntry {
 }
 
 /// Task 对话历史持久化抽象。
-pub trait MemoryStore {
+pub trait MemoryStore: Send + Sync {
     /// 追加一条对话。
     fn append(&self, task_id: &str, entry: &MemoryEntry) -> Result<()>;
     /// 读全部对话，按追加顺序（即时间序）。
