@@ -5,6 +5,7 @@
 //! - 群聊（group 非空）：按 (platform, group) 匹配，群内任何人 @Orcha 都允许。
 //! - 私聊（group 为空）：按 (platform, user) 匹配，仅白名单用户私聊允许。
 //! - 平台必须匹配。
+//! - 通配符 `"*"`：group 字段为 `"*"` 时匹配任意群（开发调试用，生产慎用）。
 //! - 大小写敏感（飞书 open_id / chat_id 是定长字符串，无大小写歧义）。
 
 use crate::protocol::TriggerSource;
@@ -86,9 +87,12 @@ impl Authenticator {
         }
 
         // 3. 群聊：按 (platform, group) 匹配；私聊：按 (platform, user) 匹配
+        // 通配符 "*" 匹配任意 group（开发调试用，见 config.toml 注释）
         if let Some(group) = &source.group {
             let found = self.entries.iter().any(|e| {
-                e.platform == source.platform && e.group.as_deref() == Some(group.as_str())
+                e.platform == source.platform
+                    && (e.group.as_deref() == Some(group.as_str())
+                        || e.group.as_deref() == Some("*"))
             });
             if found {
                 AuthResult::Allowed
@@ -98,8 +102,12 @@ impl Authenticator {
                 }
             }
         } else {
+            // 私聊路径：按 (platform, user) 匹配。
+            // 通配符 "*" 匹配任意 user（开发调试用，与 group 通配对称）。
             let found = self.entries.iter().any(|e| {
-                e.platform == source.platform && e.user.as_deref() == Some(source.user.as_str())
+                e.platform == source.platform
+                    && (e.user.as_deref() == Some(source.user.as_str())
+                        || e.user.as_deref() == Some("*"))
             });
             if found {
                 AuthResult::Allowed
@@ -122,11 +130,12 @@ impl Authenticator {
         }
 
         // 2. 群聊路径：按 group 匹配（platform 缺省，任一匹配即可）
+        // 通配符 "*" 匹配任意 group
         if let Some(group) = group {
             let found = self
                 .entries
                 .iter()
-                .any(|e| e.group.as_deref() == Some(group));
+                .any(|e| e.group.as_deref() == Some(group) || e.group.as_deref() == Some("*"));
             if found {
                 AuthResult::Allowed
             } else {
@@ -135,8 +144,11 @@ impl Authenticator {
                 }
             }
         } else {
-            // 3. 私聊路径：按 user 匹配
-            let found = self.entries.iter().any(|e| e.user.as_deref() == Some(user));
+            // 3. 私聊路径：按 user 匹配（"*" 通配任意 user）
+            let found = self
+                .entries
+                .iter()
+                .any(|e| e.user.as_deref() == Some(user) || e.user.as_deref() == Some("*"));
             if found {
                 AuthResult::Allowed
             } else {
@@ -375,5 +387,100 @@ mod tests {
         ] {
             assert!(AuthResult::Denied { reason }.reason_str().is_some());
         }
+    }
+
+    #[test]
+    fn group_wildcard_matches_any_group() {
+        // 10. group = "*" 通配任意群（开发调试用）
+        let auth = Authenticator::new(vec![WhitelistEntry {
+            platform: "feishu".into(),
+            user: None,
+            group: Some("*".into()),
+        }]);
+        // 任意 group 都应命中
+        assert_eq!(
+            auth.check(&src("feishu", "u1", Some("oc_any"))),
+            AuthResult::Allowed
+        );
+        assert_eq!(
+            auth.check(&src("feishu", "u2", Some("oc_other"))),
+            AuthResult::Allowed
+        );
+        // check_user_group 路径也要支持通配
+        assert_eq!(
+            auth.check_user_group("any", Some("oc_x")),
+            AuthResult::Allowed
+        );
+        // 平台仍需匹配
+        assert_eq!(
+            auth.check(&src("qq", "u", Some("oc_x"))),
+            AuthResult::Denied {
+                reason: DenyReason::PlatformNotMatched
+            }
+        );
+        // 私聊路径不被 group=* 影响
+        assert_eq!(
+            auth.check(&src("feishu", "u", None)),
+            AuthResult::Denied {
+                reason: DenyReason::UserNotInWhitelist
+            }
+        );
+    }
+
+    #[test]
+    fn user_wildcard_matches_any_user_in_private_chat() {
+        // 11. user = "*" 通配任意私聊用户（开发调试用，与 group 通配对称）
+        let auth = Authenticator::new(vec![WhitelistEntry {
+            platform: "feishu".into(),
+            user: Some("*".into()),
+            group: None,
+        }]);
+        // 任意 user 私聊都应命中
+        assert_eq!(
+            auth.check(&src("feishu", "ou_any", None)),
+            AuthResult::Allowed
+        );
+        assert_eq!(
+            auth.check(&src("feishu", "ou_other", None)),
+            AuthResult::Allowed
+        );
+        // check_user_group 路径也要支持 user 通配
+        assert_eq!(auth.check_user_group("any", None), AuthResult::Allowed);
+        // 平台仍需匹配
+        assert_eq!(
+            auth.check(&src("qq", "u", None)),
+            AuthResult::Denied {
+                reason: DenyReason::PlatformNotMatched
+            }
+        );
+        // 群聊路径不被 user=* 影响（群聊走 group 匹配）
+        assert_eq!(
+            auth.check(&src("feishu", "u", Some("oc_x"))),
+            AuthResult::Denied {
+                reason: DenyReason::GroupNotInWhitelist
+            }
+        );
+    }
+
+    #[test]
+    fn user_wildcard_and_group_wildcard_coexist() {
+        // 12. 同时配 user=* 和 group=* ：私聊 + 群聊都放行
+        let auth = Authenticator::new(vec![
+            WhitelistEntry {
+                platform: "feishu".into(),
+                user: None,
+                group: Some("*".into()),
+            },
+            WhitelistEntry {
+                platform: "feishu".into(),
+                user: Some("*".into()),
+                group: None,
+            },
+        ]);
+        assert_eq!(
+            auth.check(&src("feishu", "u1", Some("oc_any"))),
+            AuthResult::Allowed
+        );
+        assert_eq!(auth.check(&src("feishu", "u2", None)), AuthResult::Allowed);
     }
 }

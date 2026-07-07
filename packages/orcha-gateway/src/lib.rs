@@ -10,6 +10,7 @@
 //! 详见 docs/ROADMAP.md M7。
 
 pub mod adapter_registry;
+pub mod approval_hook;
 pub mod auth;
 pub mod config;
 pub mod ipc;
@@ -28,10 +29,13 @@ use orcha_llm::LlmClient;
 use orcha_sdk::Task;
 
 use crate::adapter_registry::AdapterRegistry;
+use crate::approval_hook::{handle_approval_response, PendingMap};
 use crate::auth::Authenticator;
-use crate::config::GatewayConfig;
+use crate::config::{ApprovalConfig, GatewayConfig};
 use crate::ipc::{IpcAddr, IpcListener, IpcStream};
-use crate::protocol::{AdapterToGateway, GatewayToAdapter, NotifyLevel, TriggerSource};
+use crate::protocol::{
+    AdapterToGateway, ApprovalDecisionDto, GatewayToAdapter, NotifyLevel, TriggerSource,
+};
 use crate::queue::{TaskQueue, TaskSubmitter};
 
 /// reader read 超时（略大于 Adapter 心跳间隔 30s）。
@@ -69,6 +73,29 @@ pub fn run(config: GatewayConfig) -> Result<()> {
         eprintln!("[gateway] 警告：auth.whitelist 为空，所有触发都会被拒绝");
     }
 
+    // M7 P1：审批 pending map（Worker insert / Reader remove，共享 Arc<Mutex>）
+    let pending: PendingMap = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let approval_config = Arc::new(config.approval.clone());
+    if approval_config.enabled() {
+        eprintln!(
+            "[gateway] 人工审批已启用（timeout={}s write={} cmd={} del={}）",
+            approval_config.timeout_secs,
+            approval_config.write.as_ref().map(|v| v.len()).unwrap_or(0),
+            approval_config
+                .command
+                .as_ref()
+                .map(|v| v.len())
+                .unwrap_or(0),
+            approval_config
+                .delete
+                .as_ref()
+                .map(|v| v.len())
+                .unwrap_or(0),
+        );
+    } else {
+        eprintln!("[gateway] 人工审批未启用（[approval] 未配置）");
+    }
+
     let registry = AdapterRegistry::new();
 
     // 2. TaskQueue + worker
@@ -80,6 +107,9 @@ pub fn run(config: GatewayConfig) -> Result<()> {
         config.cycle_config(),
         config.home.clone(),
         registry.clone(),
+        pending.clone(),
+        approval_config.clone(),
+        Arc::new(config.workspace.clone()),
     );
 
     // 3. IPC server
@@ -90,9 +120,20 @@ pub fn run(config: GatewayConfig) -> Result<()> {
     let submitter = queue.submitter();
     let accept_registry = registry.clone();
     let accept_auth = authenticator;
+    let accept_pending = pending.clone();
+    let accept_approval = approval_config.clone();
     thread::Builder::new()
         .name("orcha-accept".into())
-        .spawn(move || accept_loop(listener, accept_registry, submitter, accept_auth))
+        .spawn(move || {
+            accept_loop(
+                listener,
+                accept_registry,
+                submitter,
+                accept_auth,
+                accept_pending,
+                accept_approval,
+            )
+        })
         .context("spawn accept thread")?;
 
     // 4. 阻塞主线程（Ctrl-C 由 systemd / launchd 处理，M7 不引入 ctrl-c crate）
@@ -115,6 +156,8 @@ fn accept_loop(
     registry: AdapterRegistry,
     submitter: TaskSubmitter,
     auth: Authenticator,
+    pending: PendingMap,
+    approval_config: Arc<ApprovalConfig>,
 ) {
     loop {
         match listener.accept() {
@@ -122,9 +165,20 @@ fn accept_loop(
                 let registry = registry.clone();
                 let submitter = submitter.clone();
                 let auth = auth.clone();
+                let pending = pending.clone();
+                let approval_config = approval_config.clone();
                 if let Err(e) = thread::Builder::new()
                     .name("orcha-adapter-conn".into())
-                    .spawn(move || handle_connection(stream, registry, submitter, auth))
+                    .spawn(move || {
+                        handle_connection(
+                            stream,
+                            registry,
+                            submitter,
+                            auth,
+                            pending,
+                            approval_config,
+                        )
+                    })
                 {
                     eprintln!("[gateway] spawn adapter conn thread 失败: {e}");
                 }
@@ -142,13 +196,15 @@ fn accept_loop(
 /// - 注册到 registry，拿 `(id, sender, receiver)`
 /// - 拆读写：writer 持原 stream，reader 持 `try_clone` 副本
 /// - spawn writer 线程：receiver → `write_msg` 到 stream
-/// - reader 循环：`read_msg` → 分发 `Trigger` / `AuthCheck` / `Heartbeat` / `Reply`
+/// - reader 循环：`read_msg` → 分发 `Trigger` / `AuthCheck` / `Heartbeat` / `Reply` / `ApprovalResponse`
 /// - watchdog：read 超时计数，连续 3 次断开
 fn handle_connection(
     stream: Box<dyn IpcStream>,
     registry: AdapterRegistry,
     submitter: TaskSubmitter,
     auth: Authenticator,
+    pending: PendingMap,
+    approval_config: Arc<ApprovalConfig>,
 ) {
     let (id, tx, rx) = registry.register();
     eprintln!(
@@ -215,6 +271,45 @@ fn handle_connection(
                             "[gateway] 收到 Reply task_id={task_id} session={session} content=\"{content}\"（M7 暂存）"
                         );
                     }
+                    AdapterToGateway::ApprovalResponse {
+                        action_id,
+                        operator_open_id,
+                        operator_chat_id,
+                        decision,
+                    } => {
+                        // M7 P1：审批卡片回调。查 pending map → 过白名单 → 回传 worker
+                        // → 广播 ApprovalResult 给 Adapter patch 卡片。
+                        match handle_approval_response(
+                            &pending,
+                            &approval_config,
+                            &action_id,
+                            &operator_open_id,
+                            operator_chat_id.as_deref(),
+                            decision.clone(),
+                        ) {
+                            Some((_action, final_decision, operator)) => {
+                                let _ = tx.send(GatewayToAdapter::ApprovalResult {
+                                    action_id: action_id.clone(),
+                                    decision: (&final_decision).into(),
+                                    operator_open_id: operator,
+                                });
+                            }
+                            None => {
+                                // 未知 action_id（可能 worker 已超时清理）。
+                                // 仍回 ApprovalResult 告知 Adapter，让卡片 patch 失败状态。
+                                eprintln!(
+                                    "[gateway] ApprovalResponse 收到未知 action_id={action_id}（可能已超时）"
+                                );
+                                let _ = tx.send(GatewayToAdapter::ApprovalResult {
+                                    action_id,
+                                    decision: ApprovalDecisionDto::Rejected {
+                                        reason: "未知 action_id（可能已超时）".into(),
+                                    },
+                                    operator_open_id: None,
+                                });
+                            }
+                        }
+                    }
                 }
             }
             Ok(None) => break, // EOF，对端关闭
@@ -267,6 +362,13 @@ fn handle_trigger(
     let r = auth.check(&source);
     if !r.allowed() {
         let reason = r.reason_str().map(String::from);
+        eprintln!(
+            "[gateway] 触发被拒绝 platform={} user={:?} group={:?} reason={}",
+            source.platform,
+            source.user,
+            source.group,
+            reason.as_deref().unwrap_or("未知")
+        );
         let _ = tx.send(GatewayToAdapter::AuthResult {
             allowed: false,
             reason: reason.clone(),
@@ -295,6 +397,10 @@ fn handle_trigger(
     let task = Task::new(final_id, description);
 
     // 4. 入队
+    eprintln!(
+        "[gateway] enqueue task_id={} desc={}",
+        task.id, task.description
+    );
     if let Err(e) = submitter.enqueue(task, session, source) {
         eprintln!("[gateway] enqueue 失败: {e}");
     }
@@ -385,6 +491,10 @@ mod tests {
         let memory_store: Arc<dyn MemoryStore> = Arc::new(memory);
 
         let registry = AdapterRegistry::new();
+        let pending: PendingMap = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let approval_config: Arc<ApprovalConfig> = Arc::new(ApprovalConfig::default());
+        let workspace_config: Arc<crate::config::WorkspaceConfig> =
+            Arc::new(crate::config::WorkspaceConfig::default());
         let queue = TaskQueue::new(
             task_store,
             history_store,
@@ -393,6 +503,9 @@ mod tests {
             orcha_core::CycleConfig::default(),
             dir.path().to_path_buf(),
             registry,
+            pending,
+            approval_config,
+            workspace_config,
         );
         // queue drop 会让 worker 退出，但 submitter 持 sender clone 仍可用
         queue.submitter()

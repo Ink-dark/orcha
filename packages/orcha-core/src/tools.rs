@@ -1,7 +1,9 @@
 use std::path::Path;
+use std::process::Command;
 
 use orcha_llm::{ChatMessage, LlmClient, LlmError, ToolDefinition};
 
+use crate::approval::{ApprovalAction, ApprovalDecision, ApprovalHook};
 use crate::audit::AuditLogger;
 use crate::path_guard::PathGuard;
 
@@ -71,6 +73,25 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "required": []
             }),
         ),
+        ToolDefinition::new(
+            "run_command",
+            "在 workspace 中执行 shell 命令（如 cargo build / npm test / git diff），返回 stdout+stderr 与退出码。命令在 workspace 根目录执行，无法访问 workspace 外文件。每个命令需经人工审批（--approve 模式下会询问）。输出截断到 4000 字符。",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "program": {
+                        "type": "string",
+                        "description": "要执行的程序，例如 cargo / npm / git / python / pytest"
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "参数列表，例如 [\"build\", \"--release\"] 或 [\"test\", \"-q\"]"
+                    }
+                },
+                "required": ["program"]
+            }),
+        ),
     ]
 }
 
@@ -79,6 +100,9 @@ pub fn all_tools() -> Vec<ToolDefinition> {
 /// 返回值直接作为 `tool` 消息的 content 传回 LLM。
 /// `agent_name` 用于审计日志标注来源。
 /// `audit` 为可选审计日志器。
+/// `approval` 为可选人工审批 hook；`run_command` 工具必须经审批才执行，
+/// 无 hook 时 fail-closed 拒绝（防 LLM 在无审批环境下乱跑命令）。
+#[allow(clippy::too_many_arguments)]
 pub fn execute_tool(
     name: &str,
     args: &serde_json::Value,
@@ -86,12 +110,14 @@ pub fn execute_tool(
     guard: &PathGuard,
     agent_name: &str,
     audit: Option<&AuditLogger>,
+    approval: Option<&dyn ApprovalHook>,
 ) -> String {
     match name {
         "read_file" => execute_read_file(args, workspace, guard, agent_name, audit),
         "grep" => execute_grep(args, workspace, guard, agent_name, audit),
         "glob" => execute_glob(args, workspace),
         "list_dir" => execute_list_dir(args, workspace, guard, agent_name, audit),
+        "run_command" => execute_run_command(args, workspace, approval, agent_name),
         _ => format!("未知工具: {name}"),
     }
 }
@@ -337,6 +363,106 @@ fn execute_list_dir(
     }
 }
 
+/// run_command 工具输出字符上限。超过则截断尾部，避免 LLM 上下文爆炸。
+const MAX_COMMAND_OUTPUT_CHARS: usize = 4000;
+
+fn execute_run_command(
+    args: &serde_json::Value,
+    workspace: &Path,
+    approval: Option<&dyn ApprovalHook>,
+    agent_name: &str,
+) -> String {
+    let program = match args.get("program").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        None => return "错误: 缺少 program 参数".to_string(),
+    };
+    let cmd_args: Vec<String> = args
+        .get("args")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 审批：无 hook 时 fail-closed 拒绝（防 LLM 在无审批环境下乱跑命令）。
+    let action = ApprovalAction::RunCommand {
+        program: program.clone(),
+        args: cmd_args.clone(),
+    };
+    match approval {
+        Some(hook) => match hook.request(&action) {
+            ApprovalDecision::Approved => {}
+            ApprovalDecision::Rejected(reason) => {
+                eprintln!(
+                    "[{agent_name}] 命令被审批拒绝: {program} {} - {reason}",
+                    cmd_args.join(" ")
+                );
+                return format!("命令被审批拒绝: {reason}");
+            }
+        },
+        None => {
+            return format!(
+                "拒绝执行 {program}: 无审批 hook（fail-closed，需配置 --approve 或注入 ApprovalHook）"
+            );
+        }
+    }
+
+    eprintln!(
+        "[{agent_name}] 执行命令: {program} {} (cwd: {})",
+        cmd_args.join(" "),
+        workspace.display()
+    );
+
+    let output = match Command::new(&program)
+        .args(&cmd_args)
+        .current_dir(workspace)
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            return format!("执行 {program} 失败: {e}");
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let exit = output.status.code().unwrap_or(-1);
+
+    let mut combined = String::new();
+    if !stdout.is_empty() {
+        combined.push_str("--- stdout ---\n");
+        combined.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !combined.is_empty() {
+            combined.push('\n');
+        }
+        combined.push_str("--- stderr ---\n");
+        combined.push_str(&stderr);
+    }
+    if combined.is_empty() {
+        combined = "(无输出)".to_string();
+    }
+
+    let truncated = if combined.chars().count() > MAX_COMMAND_OUTPUT_CHARS {
+        let mut s: String = combined
+            .chars()
+            .take(MAX_COMMAND_OUTPUT_CHARS - 1)
+            .collect();
+        s.push('…');
+        s.push_str(&format!(
+            "\n(已截断，原始输出超过 {MAX_COMMAND_OUTPUT_CHARS} 字符)"
+        ));
+        s
+    } else {
+        combined
+    };
+
+    format!("exit code: {exit}\n{truncated}")
+}
+
 struct WalkResult {
     files: Vec<std::path::PathBuf>,
     errors: Vec<String>,
@@ -510,6 +636,8 @@ fn segment_matches(pat: &str, name: &str) -> bool {
 /// `initial_messages` 应包含 system + 首条 user 消息（及可选的 memory 注入）。
 /// `agent_name` 用于审计日志标注来源。
 /// `audit` 为可选审计日志器。
+/// `approval` 为可选人工审批 hook，传入后 `run_command` 工具会经审批才执行；
+/// 传 None 时 `run_command` 会 fail-closed 拒绝。
 /// 返回 LLM 最终文本回复。
 #[allow(clippy::too_many_arguments)]
 pub fn run_agent_loop(
@@ -521,6 +649,7 @@ pub fn run_agent_loop(
     agent_name: &str,
     audit: Option<&AuditLogger>,
     max_turns: usize,
+    approval: Option<&dyn ApprovalHook>,
 ) -> Result<String, LlmError> {
     let mut messages = initial_messages;
 
@@ -555,6 +684,7 @@ pub fn run_agent_loop(
                 guard,
                 agent_name,
                 audit,
+                approval,
             );
             messages.push(ChatMessage::tool(&call.id, result));
         }
@@ -562,4 +692,169 @@ pub fn run_agent_loop(
 
     let text = client.chat(&messages)?;
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::approval::{ApprovalDecision, MockApprovalHook, NullApprovalHook};
+    use crate::path_guard::PathGuard;
+    use std::fs;
+
+    fn make_guard(ws: &Path) -> PathGuard {
+        PathGuard::new(ws).expect("PathGuard init")
+    }
+
+    #[test]
+    fn all_tools_includes_run_command() {
+        let tools = all_tools();
+        let names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
+        assert!(
+            names.contains(&"run_command"),
+            "应包含 run_command 工具: {names:?}"
+        );
+        assert_eq!(tools.len(), 5, "应有 5 个工具");
+    }
+
+    #[test]
+    fn run_command_fails_closed_without_approval_hook() {
+        let ws = tempfile::tempdir().unwrap();
+        let guard = make_guard(ws.path());
+        let args = serde_json::json!({"program": "echo", "args": ["hi"]});
+        let result = execute_tool(
+            "run_command",
+            &args,
+            ws.path(),
+            &guard,
+            "tester",
+            None,
+            None, // 无 approval hook → fail-closed
+        );
+        assert!(result.contains("fail-closed"), "无 hook 应拒绝: {result}");
+        assert!(result.contains("echo"), "应提及命令名: {result}");
+    }
+
+    #[test]
+    fn run_command_executes_when_approved() {
+        let ws = tempfile::tempdir().unwrap();
+        let guard = make_guard(ws.path());
+        // Windows 用 cmd /c echo，跨平台用 echo 不一定存在
+        let (program, args) = if cfg!(windows) {
+            ("cmd", vec!["/C".to_string(), "echo hello".to_string()])
+        } else {
+            ("echo", vec!["hello".to_string()])
+        };
+        let args_json = serde_json::json!({"program": program, "args": args});
+        let hook = NullApprovalHook;
+        let result = execute_tool(
+            "run_command",
+            &args_json,
+            ws.path(),
+            &guard,
+            "tester",
+            None,
+            Some(&hook),
+        );
+        assert!(result.contains("exit code: 0"), "应成功: {result}");
+        assert!(result.contains("hello"), "应含输出: {result}");
+    }
+
+    #[test]
+    fn run_command_rejected_by_hook() {
+        let ws = tempfile::tempdir().unwrap();
+        let guard = make_guard(ws.path());
+        let args = serde_json::json!({"program": "echo", "args": ["hi"]});
+        let hook = MockApprovalHook::new(vec![ApprovalDecision::Rejected("测试拒绝".into())]);
+        let result = execute_tool(
+            "run_command",
+            &args,
+            ws.path(),
+            &guard,
+            "tester",
+            None,
+            Some(&hook),
+        );
+        assert!(result.contains("测试拒绝"), "应含拒绝理由: {result}");
+        assert!(result.contains("命令被审批拒绝"), "应提示被拒绝: {result}");
+    }
+
+    #[test]
+    fn run_command_returns_error_when_missing_program() {
+        let ws = tempfile::tempdir().unwrap();
+        let guard = make_guard(ws.path());
+        let args = serde_json::json!({"args": ["hi"]});
+        let hook = NullApprovalHook;
+        let result = execute_tool(
+            "run_command",
+            &args,
+            ws.path(),
+            &guard,
+            "tester",
+            None,
+            Some(&hook),
+        );
+        assert!(result.contains("缺少 program 参数"), "应报错: {result}");
+    }
+
+    #[test]
+    fn run_command_returns_error_for_nonexistent_program() {
+        let ws = tempfile::tempdir().unwrap();
+        let guard = make_guard(ws.path());
+        let args = serde_json::json!({"program": "this-program-does-not-exist-12345"});
+        let hook = NullApprovalHook;
+        let result = execute_tool(
+            "run_command",
+            &args,
+            ws.path(),
+            &guard,
+            "tester",
+            None,
+            Some(&hook),
+        );
+        assert!(
+            result.contains("失败") || result.contains("exit code"),
+            "应提示失败: {result}"
+        );
+    }
+
+    #[test]
+    fn run_command_truncates_long_output() {
+        let ws = tempfile::tempdir().unwrap();
+        let guard = make_guard(ws.path());
+        // 生成超过 4000 字符的输出
+        let long_arg = "A".repeat(5000);
+        // 写一个脚本文件并执行
+        if cfg!(windows) {
+            let script = format!("@echo off\necho {long_arg}");
+            fs::write(ws.path().join("long.bat"), script).unwrap();
+            let args = serde_json::json!({"program": "cmd", "args": ["/C", "long.bat"]});
+            let hook = NullApprovalHook;
+            let result = execute_tool(
+                "run_command",
+                &args,
+                ws.path(),
+                &guard,
+                "tester",
+                None,
+                Some(&hook),
+            );
+            assert!(
+                result.contains("已截断") || result.contains("exit code"),
+                "应截断或退出: {result}"
+            );
+        } else {
+            let args = serde_json::json!({"program": "printf", "args": [format!("'{long_arg}'")]});
+            let hook = NullApprovalHook;
+            let result = execute_tool(
+                "run_command",
+                &args,
+                ws.path(),
+                &guard,
+                "tester",
+                None,
+                Some(&hook),
+            );
+            assert!(result.contains("已截断"), "应截断: {result}");
+        }
+    }
 }

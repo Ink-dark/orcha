@@ -21,6 +21,7 @@
 import { IpcClient, IpcClientOptions } from './ipc';
 import {
   AdapterToGateway,
+  ApprovalResponseMsg,
   GatewayToAdapter,
 } from './protocol';
 import {
@@ -95,6 +96,20 @@ async function main(): Promise<void> {
       handlers: {
         onTrigger: (event: FeishuEvent) => {
           onWebhookTrigger(event, ipcClient);
+        },
+        onApprovalAction: (
+          actionId: string,
+          operatorOpenId: string,
+          operatorChatId: string | null,
+          decision,
+        ) => {
+          onApprovalCardAction(
+            actionId,
+            operatorOpenId,
+            operatorChatId,
+            decision,
+            ipcClient,
+          );
         },
       },
     });
@@ -176,11 +191,35 @@ function onWebhookTrigger(event: FeishuEvent, ipcClient: IpcClient): void {
   }
 }
 
+/** M7 P1：审批卡片按钮点击 → 转 IPC ApprovalResponse 消息。 */
+function onApprovalCardAction(
+  actionId: string,
+  operatorOpenId: string,
+  operatorChatId: string | null,
+  decision: ApprovalResponseMsg['decision'],
+  ipcClient: IpcClient,
+): void {
+  const msg: ApprovalResponseMsg = {
+    type: 'approval_response',
+    action_id: actionId,
+    operator_open_id: operatorOpenId,
+    operator_chat_id: operatorChatId,
+    decision,
+  };
+  const ok = ipcClient.send(msg);
+  if (!ok) {
+    console.warn(`[adapter] IPC 断开，审批回复丢失: action_id=${actionId}`);
+  } else {
+    console.log(`[adapter] 审批回复已发送: action_id=${actionId} operator=${operatorOpenId}`);
+  }
+}
+
 /** IPC 消息 → 飞书推送。 */
 async function onGatewayMessage(
   msg: GatewayToAdapter,
   feishuClient: FeishuClient,
 ): Promise<void> {
+  console.log(`[adapter] IPC 收到消息 type=${msg.type} task_id=${(msg as any).task_id ?? '-'}`);
   switch (msg.type) {
     case 'card_update':
       await feishuClient.pushCardUpdate(
@@ -210,6 +249,23 @@ async function onGatewayMessage(
       return;
     case 'auth_result':
       console.log(`[adapter] 鉴权结果: allowed=${msg.allowed} reason=${msg.reason ?? 'null'}`);
+      return;
+    case 'approval_request':
+      console.log(`[adapter] 收到审批请求 action_id=${msg.action_id} task=${msg.task_id} action=${JSON.stringify(msg.action)}`);
+      await feishuClient.pushApprovalCard(
+        msg.session,
+        msg.task_id,
+        msg.action_id,
+        msg.action,
+      );
+      console.log(`[adapter] 审批卡片已推送 action_id=${msg.action_id}`);
+      return;
+    case 'approval_result':
+      await feishuClient.patchApprovalResult(
+        msg.action_id,
+        msg.decision,
+        msg.operator_open_id,
+      );
       return;
     case 'heartbeat_ack':
       // 心跳 ack 不做处理（仅在断开时由 watchdog 触发重连）

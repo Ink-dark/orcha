@@ -561,11 +561,49 @@ fn list_files(root: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// 需要跳过的目录名（不区分大小写匹配）。
+///
+/// 跳过 VCS 内部目录（`.git`/`.hg`/`.svn`）、构建产物目录（`target`/`build`/`dist`/`out`）、
+/// 依赖目录（`node_modules`/`.cargo`）、orcha 自身元数据目录（`.orcha`）、
+/// 以及 IDE / 工具缓存目录（`.idea`/`.vscode`/`.deepseek`）。
+///
+/// 这些目录在真实仓库下文件数动辄上千（如 `.git/` 中的对象、`target/` 中的编译产物），
+/// 列入 Observer 报告既无意义又会让 LLM 上下文爆炸。
+const SKIPPED_DIR_NAMES: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    ".orcha",
+    ".idea",
+    ".vscode",
+    ".deepseek",
+    ".cargo",
+    "node_modules",
+    "target",
+    "build",
+    "dist",
+    "out",
+];
+
+/// 判断目录名是否应跳过（大小写不敏感）。
+fn is_skipped_dir(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SKIPPED_DIR_NAMES
+        .iter()
+        .any(|&n| n.eq_ignore_ascii_case(&lower))
+}
+
 fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<()> {
     for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
+            // 跳过 VCS / 构建产物 / 依赖 / IDE 缓存目录。
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                if is_skipped_dir(name) {
+                    continue;
+                }
+            }
             walk(root, &path, out)?;
         } else if path.is_file() {
             let rel = path.strip_prefix(root).unwrap_or(&path);
@@ -1014,6 +1052,66 @@ mod tests {
         let out = Fixer.run(&ctx);
         assert!(!out.result.success, "Cargo.toml 也算测试框架，Fixer 应拒绝");
         assert!(out.result.summary.contains("已有测试框架"));
+    }
+
+    // ============================================================
+    // walk / list_files 过滤测试
+    // ============================================================
+
+    #[test]
+    fn walk_skips_vcs_and_build_dirs() {
+        let ws = tempfile::tempdir().unwrap();
+        let root = ws.path();
+
+        // 真实源码文件。
+        fs::write(root.join("main.rs"), "fn main(){}").unwrap();
+        fs::write(root.join("Cargo.toml"), "").unwrap();
+
+        // 应被跳过的目录及其内部文件。
+        fs::create_dir_all(root.join(".git").join("objects")).unwrap();
+        fs::write(root.join(".git").join("HEAD"), "ref: refs/heads/main").unwrap();
+        fs::write(root.join(".git").join("objects").join("abc"), "blob").unwrap();
+
+        fs::create_dir_all(root.join("target").join("debug")).unwrap();
+        fs::write(root.join("target").join("debug").join("app.exe"), "binary").unwrap();
+
+        fs::create_dir_all(root.join("node_modules").join("lib")).unwrap();
+        fs::write(
+            root.join("node_modules").join("lib").join("index.js"),
+            "module",
+        )
+        .unwrap();
+
+        fs::create_dir_all(root.join(".orcha").join("history")).unwrap();
+        fs::write(root.join(".orcha").join("history").join("r1.json"), "{}").unwrap();
+
+        // 大小写不敏感：TARGET 也应跳过。
+        fs::create_dir_all(root.join("BUILD")).unwrap();
+        fs::write(root.join("BUILD").join("out.txt"), "x").unwrap();
+
+        let files = list_files(root).unwrap();
+        // 仅保留真实源码文件。
+        assert!(
+            files.iter().all(|f| !f.starts_with(".git")
+                && !f.starts_with("target")
+                && !f.starts_with("node_modules")
+                && !f.starts_with(".orcha")
+                && !f.starts_with("BUILD")),
+            "应跳过 VCS/构建/依赖目录，实际: {files:?}"
+        );
+        assert!(files.contains(&"main.rs".to_string()));
+        assert!(files.contains(&"Cargo.toml".to_string()));
+        assert_eq!(files.len(), 2, "应仅保留 2 个源码文件，实际: {files:?}");
+    }
+
+    #[test]
+    fn is_skipped_dir_matches_case_insensitive() {
+        assert!(is_skipped_dir(".git"));
+        assert!(is_skipped_dir(".GIT"));
+        assert!(is_skipped_dir("Target"));
+        assert!(is_skipped_dir("NODE_MODULES"));
+        assert!(!is_skipped_dir("src"));
+        assert!(!is_skipped_dir("tests"));
     }
 
     #[test]

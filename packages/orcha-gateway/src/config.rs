@@ -43,6 +43,16 @@ pub struct GatewayConfig {
     /// 鉴权配置（白名单，M7）。
     #[serde(default)]
     pub auth: AuthConfig,
+
+    /// 人工审批配置（M7 P1，飞书卡片审批）。
+    /// 不配此段 = 审批关闭（NullApprovalHook 放行）。
+    #[serde(default)]
+    pub approval: ApprovalConfig,
+
+    /// 工作区配置（M7 P1，飞书触发任务的默认 repo 路径）。
+    /// 不配 = 用空目录（LLM 无 repo 可改，仅适合纯生成任务）。
+    #[serde(default)]
+    pub workspace: WorkspaceConfig,
 }
 
 fn default_home() -> PathBuf {
@@ -160,6 +170,125 @@ pub struct AuthConfig {
     pub whitelist: Vec<crate::auth::WhitelistEntry>,
 }
 
+/// 人工审批配置（M7 P1）。
+///
+/// 细粒度分三类：写文件 / 跑命令 / 删文件。每类独立配白名单，
+/// 与 `auth.whitelist` 同结构（`WhitelistEntry`）。
+///
+/// # 语义
+///
+/// - 不配 `[approval]` 段 → 审批关闭（`NullApprovalHook` 放行，CI / 默认行为）
+/// - 配了 `[approval]` 但某类没配 → 该类操作不需要审批（放行）
+/// - 配了 `[approval]` 且某类为空数组 → 该类操作全拒（fail-closed）
+/// - 配了 `[approval]` 且某类非空 → 走白名单校验
+///
+/// # 配置示例
+///
+/// ```toml
+/// [approval]
+/// timeout_secs = 300  # 超时秒数（默认 300，超时自动 reject）
+///
+/// [[approval.write]]        # 可审批写文件的人
+/// platform = "feishu"
+/// user = "ou_xxx"
+///
+/// [[approval.command]]      # 可审批跑命令的人
+/// platform = "feishu"
+/// user = "ou_yyy"
+/// ```
+///
+/// # 白名单校验位置
+///
+/// 校验在 Gateway 侧（Rust），不在 Adapter 侧（TS）。Adapter 只负责
+/// UI 与事件转发：把按钮点击事件通过 IPC 转给 Gateway，Gateway 查
+/// 白名单后回最终决策。这样配置统一在 config.toml，TS 侧不重复配置。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ApprovalConfig {
+    /// 审批超时秒数。Worker 发起审批后等这么久，超时自动 Rejected（fail-closed）。
+    /// 默认 300（5 分钟）。
+    #[serde(default = "default_approval_timeout")]
+    pub timeout_secs: u64,
+
+    /// 可审批「写文件」的白名单。
+    /// - None（不配）= 该类不需要审批
+    /// - Some(vec![]) = 该类全拒
+    /// - Some(非空) = 走白名单
+    #[serde(default)]
+    pub write: Option<Vec<crate::auth::WhitelistEntry>>,
+
+    /// 可审批「跑命令」的白名单。语义同 `write`。
+    #[serde(default)]
+    pub command: Option<Vec<crate::auth::WhitelistEntry>>,
+
+    /// 可审批「删文件」的白名单。语义同 `write`。
+    #[serde(default)]
+    pub delete: Option<Vec<crate::auth::WhitelistEntry>>,
+}
+
+fn default_approval_timeout() -> u64 {
+    1800
+}
+
+/// 工作区配置（M7 P1）。
+///
+/// 飞书触发任务时的默认 repo 路径。Gateway 会在该 repo 下创建
+/// GitWorktree 作为每任务隔离工作区，改动不污染原 repo。
+///
+/// 不配 `[workspace]` = 用空目录（LLM 无 repo 可改，仅适合纯生成任务）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceConfig {
+    /// 默认 repo 根路径（绝对路径或相对 cwd）。
+    /// 飞书触发任务时，Gateway 在此 repo 下 `git worktree add` 创建隔离工作区。
+    /// 非绝对路径会相对 Gateway cwd 解析。
+    #[serde(default)]
+    pub repo: Option<PathBuf>,
+
+    /// 是否启用 worktree 隔离（默认 true，仅当 repo 存在 .git 时生效）。
+    /// 设为 false 则直接在原 repo 原地修改（不推荐，并发会冲突）。
+    #[serde(default = "default_worktree_enabled")]
+    pub worktree: bool,
+}
+
+fn default_worktree_enabled() -> bool {
+    true
+}
+
+impl WorkspaceConfig {
+    /// 是否配置了 repo 路径。
+    pub fn has_repo(&self) -> bool {
+        self.repo
+            .as_ref()
+            .is_some_and(|p| !p.as_os_str().is_empty())
+    }
+}
+
+impl ApprovalConfig {
+    /// 审批是否启用（任何一类已配白名单即视为启用）。
+    pub fn enabled(&self) -> bool {
+        self.write.is_some() || self.command.is_some() || self.delete.is_some()
+    }
+
+    /// 超时 Duration。
+    pub fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.timeout_secs)
+    }
+
+    /// 按动作类型取出对应白名单。
+    /// 返回 `None` 表示该类不需要审批（放行）；
+    /// 返回 `Some(auth)` 表示走白名单校验（auth 可能为空 → 全拒）。
+    pub fn authenticator_for(
+        &self,
+        action: &orcha_core::ApprovalAction,
+    ) -> Option<crate::auth::Authenticator> {
+        let entries = match action {
+            orcha_core::ApprovalAction::WriteFile { .. } => self.write.as_ref(),
+            orcha_core::ApprovalAction::RunCommand { .. } => self.command.as_ref(),
+            orcha_core::ApprovalAction::DeleteFile { .. } => self.delete.as_ref(),
+        }?;
+        Some(crate::auth::Authenticator::new(entries.clone()))
+    }
+}
+
 impl GatewayConfig {
     /// 从 config.toml 文件加载；文件不存在则返回默认配置。
     pub fn load(path: &Path) -> Result<Self> {
@@ -199,9 +328,12 @@ impl GatewayConfig {
     }
 
     /// 构建任务存储（非 sqlite feature 时回退 FileTaskStore）。
+    /// 含 init()：创建 `home/store/` 目录，幂等。
     #[cfg(not(feature = "sqlite"))]
     pub fn build_task_store(&self) -> Result<orcha_core::FileTaskStore> {
-        Ok(orcha_core::FileTaskStore::new(&self.home))
+        let store = orcha_core::FileTaskStore::new(&self.home);
+        store.init().context("init task store")?;
+        Ok(store)
     }
 
     /// 从 `auth.whitelist` 构造 [`crate::auth::Authenticator`]（克隆条目）。
@@ -229,6 +361,8 @@ impl GatewayConfig {
             model: self.llm.model.clone(),
             timeout: std::time::Duration::from_secs(120),
             temperature: 0.2,
+            max_retries: 3,
+            retry_base_ms: 1000,
         };
         Some(std::sync::Arc::new(orcha_llm::OpenAiCompatibleClient::new(
             cfg,
@@ -247,6 +381,8 @@ impl Default for GatewayConfig {
             llm: LlmConfig::default(),
             im: ImConfig::default(),
             auth: AuthConfig::default(),
+            approval: ApprovalConfig::default(),
+            workspace: WorkspaceConfig::default(),
         }
     }
 }

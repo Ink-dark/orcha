@@ -54,8 +54,50 @@ pub enum AdapterToGateway {
     },
     /// Adapter 启动时询问 Gateway 当前用户/群是否在白名单。
     AuthCheck { user: String, group: Option<String> },
+    /// M7 P1：审批卡片按钮回调。Adapter 收到飞书 `card.action.trigger` 后转发，
+    /// Gateway 侧查白名单后决定最终决策。
+    ApprovalResponse {
+        /// 对应 ApprovalRequest 的 action_id，用于 Gateway 端匹配 pending 请求。
+        action_id: String,
+        /// 操作员在 IM 平台的 open_id（飞书 operator.open_id）。
+        operator_open_id: String,
+        /// 操作员所在群（私聊为 None）。
+        operator_chat_id: Option<String>,
+        /// Adapter 端用户给的初步决策（Gateway 会再过一遍白名单）。
+        decision: ApprovalDecisionDto,
+    },
     /// 心跳，Adapter 每 30s 发一次。
     Heartbeat { ts_ms: u64 },
+}
+
+/// IPC 传输用的审批决策（与 orcha_core::ApprovalDecision 对应，但跨 crate 序列化）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApprovalDecisionDto {
+    Approved,
+    Rejected { reason: String },
+}
+
+impl From<&orcha_core::ApprovalDecision> for ApprovalDecisionDto {
+    fn from(d: &orcha_core::ApprovalDecision) -> Self {
+        match d {
+            orcha_core::ApprovalDecision::Approved => ApprovalDecisionDto::Approved,
+            orcha_core::ApprovalDecision::Rejected(reason) => ApprovalDecisionDto::Rejected {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
+impl From<ApprovalDecisionDto> for orcha_core::ApprovalDecision {
+    fn from(d: ApprovalDecisionDto) -> Self {
+        match d {
+            ApprovalDecisionDto::Approved => orcha_core::ApprovalDecision::Approved,
+            ApprovalDecisionDto::Rejected { reason } => {
+                orcha_core::ApprovalDecision::Rejected(reason)
+            }
+        }
+    }
 }
 
 /// 触发来源元信息，用于鉴权与审计。
@@ -111,8 +153,70 @@ pub enum GatewayToAdapter {
         /// 拒绝原因（allowed=false 时填）。
         reason: Option<String>,
     },
+    /// M7 P1：审批请求。Gateway worker 要执行副作用前，发此消息给 Adapter，
+    /// Adapter 推一张带 [批准][拒绝] 按钮的飞书卡片，等管理员点击。
+    /// 管理员点击后 Adapter 通过 `ApprovalResponse` 回复。
+    ApprovalRequest {
+        /// 全局唯一 ID（UUID），用于匹配 response。
+        action_id: String,
+        /// 关联的 task_id，用于卡片标题展示。
+        task_id: String,
+        /// IM 会话标识（飞书 chat_id），用于推卡片到正确的会话。
+        session: String,
+        /// 待审批的动作详情。
+        action: ApprovalActionDto,
+    },
+    /// M7 P1：审批结果通知（Gateway 完成白名单校验后回推给 Adapter）。
+    /// Adapter 收到后 patch 原卡片显示 "✅ 已批准 / ❌ 已拒绝"。
+    ApprovalResult {
+        action_id: String,
+        /// 最终决策（已过白名单）。
+        decision: ApprovalDecisionDto,
+        /// 实际审批人（白名单校验通过的操作员）。
+        operator_open_id: Option<String>,
+    },
     /// 心跳 ack。
     HeartbeatAck { ts_ms: u64 },
+}
+
+/// IPC 传输用的审批动作（与 orcha_core::ApprovalAction 对应）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ApprovalActionDto {
+    WriteFile {
+        path: String,
+        content_preview: String,
+    },
+    DeleteFile {
+        path: String,
+    },
+    RunCommand {
+        program: String,
+        args: Vec<String>,
+    },
+}
+
+impl From<&orcha_core::ApprovalAction> for ApprovalActionDto {
+    fn from(a: &orcha_core::ApprovalAction) -> Self {
+        match a {
+            orcha_core::ApprovalAction::WriteFile {
+                path,
+                content_preview,
+            } => ApprovalActionDto::WriteFile {
+                path: path.clone(),
+                content_preview: content_preview.clone(),
+            },
+            orcha_core::ApprovalAction::DeleteFile { path } => {
+                ApprovalActionDto::DeleteFile { path: path.clone() }
+            }
+            orcha_core::ApprovalAction::RunCommand { program, args } => {
+                ApprovalActionDto::RunCommand {
+                    program: program.clone(),
+                    args: args.clone(),
+                }
+            }
+        }
+    }
 }
 
 /// 通知级别。

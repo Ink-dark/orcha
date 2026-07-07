@@ -20,8 +20,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use orcha_llm::{
-    build_reviewer_prompt, parse_planner_output, parse_reviewer_output, parse_worker_output,
-    ChatMessage, LlmClient, PLANNER_SYSTEM, WORKER_SYSTEM,
+    build_reviewer_prompt, parse_planner_output, parse_reviewer_output,
+    parse_worker_output_with_steps, ChatMessage, LlmClient, WorkerOutput, PLANNER_SYSTEM,
+    WORKER_SYSTEM,
 };
 use orcha_sdk::{Artifact, ArtifactType, Task};
 
@@ -29,7 +30,7 @@ use crate::cycleround::{build_round, persist_round};
 use crate::history::HistoryStore;
 use crate::memory::{MemoryEntry, MemoryStore};
 use crate::path_guard::PathGuard;
-use crate::plan::check_diff_scope;
+use crate::plan::{apply_step, check_diff_scope, PlanAction, PlanStep};
 use crate::sub_agent::{StepContext, StepOutput, SubAgent};
 use crate::sub_agents::{list_workspace_files, Fixer, Observer, Tester};
 use crate::tools::{all_tools, run_agent_loop, MAX_TOOL_TURNS};
@@ -92,6 +93,7 @@ impl LlmPlanner {
             "planner",
             None,
             MAX_TOOL_TURNS,
+            Some(ctx.approval.as_ref()),
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -195,6 +197,7 @@ impl LlmWorker {
             "worker",
             None,
             MAX_TOOL_TURNS,
+            Some(ctx.approval.as_ref()),
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -204,8 +207,9 @@ impl LlmWorker {
 
         append_memory(&self.memory, &ctx.task.id, round, "worker", &resp);
 
-        let files = match parse_worker_output(&resp) {
-            Ok(f) => f,
+        // 优先解析 steps（edit/create/delete，推荐）；无 steps 时回退 files（旧整文件格式）。
+        let output = match parse_worker_output_with_steps(&resp) {
+            Ok(o) => o,
             Err(e) => {
                 return StepOutput::failure(
                     "S-worker",
@@ -214,62 +218,152 @@ impl LlmWorker {
             }
         };
 
-        if files.is_empty() {
-            return StepOutput::failure("S-worker", "LLM 未产出任何文件");
-        }
-
-        // M4：使用已构造的 PathGuard + target_files 白名单。
-        // target_files 直接由 LLM 输出的 file 列表派生（每个 file 即声明要写的路径）。
-        // PathGuard 强制：路径不逃逸 workspace + 不在危险路径黑名单内 + 在 target_files 白名单内。
-        let target_files: Vec<String> = files.iter().map(|(p, _)| p.clone()).collect();
+        // target_files 由 LLM 输出派生：steps 取 step.path，files 取 file.0。
+        let target_files: Vec<String> = match &output {
+            WorkerOutput::Steps(steps) => steps.iter().map(|s| s.path.clone()).collect(),
+            WorkerOutput::Files(files) => files.iter().map(|(p, _)| p.clone()).collect(),
+        };
 
         let mut artifacts = Vec::new();
-        let mut written = Vec::new();
+        let mut written: Vec<String> = Vec::new();
         let mut combined_patch = String::new();
-        for (path, content) in &files {
-            // M4：统一走 PathGuard::validate_write，强制写边界。
-            let resolved = match guard.validate_write(path, &target_files) {
-                Ok(p) => p,
-                Err(e) => {
-                    return StepOutput::failure("S-worker", format!("写边界拒绝 {path}: {e}"));
+
+        match output {
+            WorkerOutput::Steps(steps) => {
+                if steps.is_empty() {
+                    return StepOutput::failure("S-worker", "LLM 未产出任何 step");
                 }
-            };
-            // M7 P1：PathGuard 之后、写文件之前调人工审批 hook。
-            // 默认 NullApprovalHook 直接放行；--approve 时走 StdinApprovalHook。
-            let preview: String = content.chars().take(200).collect();
-            let action = crate::approval::ApprovalAction::WriteFile {
-                path: path.clone(),
-                content_preview: preview,
-            };
-            match ctx.approval.request(&action) {
-                crate::approval::ApprovalDecision::Approved => {}
-                crate::approval::ApprovalDecision::Rejected(reason) => {
-                    return StepOutput::failure(
-                        "S-worker",
-                        format!("人工审批拒绝写 {path}: {reason}"),
-                    );
+                for ws in &steps {
+                    let plan_action = match ws.action.as_str() {
+                        "edit" => PlanAction::Edit,
+                        "create" => PlanAction::Create,
+                        "delete" => PlanAction::Delete,
+                        other => {
+                            return StepOutput::failure(
+                                "S-worker",
+                                format!(
+                                    "未知 action {}: {}（仅支持 edit/create/delete）",
+                                    other, ws.path
+                                ),
+                            );
+                        }
+                    };
+                    // 路径校验：edit/create 走 validate_write，delete 走 validate_delete。
+                    let path_check = match plan_action {
+                        PlanAction::Create | PlanAction::Edit => {
+                            guard.validate_write(&ws.path, &target_files)
+                        }
+                        PlanAction::Delete => guard.validate_delete(&ws.path, &target_files),
+                    };
+                    let resolved = match path_check {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return StepOutput::failure(
+                                "S-worker",
+                                format!("写边界拒绝 {}: {e}", ws.path),
+                            );
+                        }
+                    };
+                    // M7 P1：人工审批 hook。preview 取 content 或 replace 前 200 字符。
+                    let preview: String = ws
+                        .content
+                        .as_deref()
+                        .or(ws.replace.as_deref())
+                        .map(|s| s.chars().take(200).collect())
+                        .unwrap_or_default();
+                    let action = crate::approval::ApprovalAction::WriteFile {
+                        path: ws.path.clone(),
+                        content_preview: preview,
+                    };
+                    match ctx.approval.request(&action) {
+                        crate::approval::ApprovalDecision::Approved => {}
+                        crate::approval::ApprovalDecision::Rejected(reason) => {
+                            return StepOutput::failure(
+                                "S-worker",
+                                format!("人工审批拒绝写 {}: {reason}", ws.path),
+                            );
+                        }
+                    }
+                    // 转 PlanStep 调 apply_step：复用 plan.rs 的 search/replace 唯一匹配校验
+                    // 与 unified diff 生成（M4 已实现并测试）。
+                    let step = PlanStep {
+                        action: plan_action,
+                        path: ws.path.clone(),
+                        content: ws.content.clone(),
+                        search: ws.search.clone(),
+                        replace: ws.replace.clone(),
+                    };
+                    let applied = match apply_step(&ctx.workspace, &step) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            return StepOutput::failure(
+                                "S-worker",
+                                format!("apply_step 失败 {} ({:?}): {e}", ws.path, plan_action),
+                            );
+                        }
+                    };
+                    combined_patch.push_str(&applied.diff);
+                    artifacts.push(Artifact {
+                        artifact_id: next_artifact_id(&ctx.prior_artifacts, "worker"),
+                        artifact_type: ArtifactType::CodeDiff,
+                        commit_sha: None,
+                        patch: Some(applied.diff),
+                        url: Some(format!("file:///{}", resolved.display())),
+                    });
+                    written.push(ws.path.clone());
                 }
             }
-            // validate_write 已校验路径，但仍走 create_dir_all + write 流程（保留 M2 行为）。
-            if let Some(parent) = resolved.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
-                    return StepOutput::failure("S-worker", format!("创建目录失败: {e}"));
+            WorkerOutput::Files(files) => {
+                if files.is_empty() {
+                    return StepOutput::failure("S-worker", "LLM 未产出任何文件");
+                }
+                for (path, content) in &files {
+                    // M4：统一走 PathGuard::validate_write，强制写边界。
+                    let resolved = match guard.validate_write(path, &target_files) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return StepOutput::failure(
+                                "S-worker",
+                                format!("写边界拒绝 {path}: {e}"),
+                            );
+                        }
+                    };
+                    // M7 P1：PathGuard 之后、写文件之前调人工审批 hook。
+                    let preview: String = content.chars().take(200).collect();
+                    let action = crate::approval::ApprovalAction::WriteFile {
+                        path: path.clone(),
+                        content_preview: preview,
+                    };
+                    match ctx.approval.request(&action) {
+                        crate::approval::ApprovalDecision::Approved => {}
+                        crate::approval::ApprovalDecision::Rejected(reason) => {
+                            return StepOutput::failure(
+                                "S-worker",
+                                format!("人工审批拒绝写 {path}: {reason}"),
+                            );
+                        }
+                    }
+                    if let Some(parent) = resolved.parent() {
+                        if let Err(e) = std::fs::create_dir_all(parent) {
+                            return StepOutput::failure("S-worker", format!("创建目录失败: {e}"));
+                        }
+                    }
+                    let normalized = ensure_trailing_newline(content);
+                    if let Err(e) = std::fs::write(&resolved, &normalized) {
+                        return StepOutput::failure("S-worker", format!("写文件失败 {path}: {e}"));
+                    }
+                    let patch = make_create_diff(path, &normalized).unwrap_or_default();
+                    combined_patch.push_str(&patch);
+                    artifacts.push(Artifact {
+                        artifact_id: next_artifact_id(&ctx.prior_artifacts, "worker"),
+                        artifact_type: ArtifactType::CodeDiff,
+                        commit_sha: None,
+                        patch: Some(patch),
+                        url: Some(format!("file:///{}", resolved.display())),
+                    });
+                    written.push(path.clone());
                 }
             }
-            let normalized = ensure_trailing_newline(content);
-            if let Err(e) = std::fs::write(&resolved, &normalized) {
-                return StepOutput::failure("S-worker", format!("写文件失败 {path}: {e}"));
-            }
-            let patch = make_create_diff(path, &normalized).unwrap_or_default();
-            combined_patch.push_str(&patch);
-            artifacts.push(Artifact {
-                artifact_id: next_artifact_id(&ctx.prior_artifacts, "worker"),
-                artifact_type: ArtifactType::CodeDiff,
-                commit_sha: None,
-                patch: Some(patch),
-                url: Some(format!("file:///{}", resolved.display())),
-            });
-            written.push(path.clone());
         }
 
         // M4：自检 patch 改动文件集合 ⊆ target_files（防 patch 被篡改含未声明文件）。
@@ -351,7 +445,13 @@ impl LlmReviewer {
             .iter()
             .filter_map(|a| {
                 let u = a.url.as_ref()?;
-                let p = u.strip_prefix("file://")?;
+                // 兼容 file:///（标准）和 file://（Windows UNC）两种前缀。
+                // Windows worktree 路径可能是 \\?\C:\... 形式，url 构造时
+                // file:/// + display() 产生 file:///\\?\C:\...，
+                // strip "file:///" 后得到 \\?\C:\... 才是有效路径。
+                let p = u
+                    .strip_prefix("file:///")
+                    .or_else(|| u.strip_prefix("file://"))?;
                 let path = Path::new(p);
                 let rel = path.strip_prefix(&ctx.workspace).unwrap_or(path);
                 let content = std::fs::read_to_string(path).unwrap_or_default();
@@ -1257,6 +1357,244 @@ mod tests {
         assert!(
             memory_part.contains("[round 1][worker]"),
             "round 2 prompt 应包含 round 1 worker 输出"
+        );
+    }
+
+    // ============================================================
+    // #2 search/replace edit action 端到端测试
+    // ============================================================
+
+    /// 辅助：构造一个带 planner artifact 的 StepContext。
+    fn worker_ctx_with_plan(workspace: &Path, task_desc: &str) -> StepContext {
+        let task = Task::new("T-edit".into(), task_desc.into());
+        let plan_artifact = Artifact {
+            artifact_id: "ART-planner-001".into(),
+            artifact_type: ArtifactType::Report,
+            commit_sha: None,
+            patch: None,
+            url: None,
+        };
+        StepContext::new(workspace, task).with_prior(
+            orcha_sdk::Step {
+                id: "S-planner".into(),
+                name: "planner".into(),
+                agent: "planner".into(),
+                status: orcha_sdk::StepStatus::Succeeded,
+            },
+            vec![plan_artifact],
+        )
+    }
+
+    #[test]
+    fn llm_worker_applies_edit_step() {
+        // 预置 src/hello.py 存在，LLM 输出 edit step 把 print('hi') → print('hello')。
+        let ws = tempfile::tempdir().unwrap();
+        let hello = ws.path().join("hello.py");
+        std::fs::create_dir_all(ws.path().join("src")).unwrap();
+        std::fs::write(&hello, "print('hi')\n").unwrap();
+
+        let client = MockLlmClient::new(vec![
+            r#"{"steps":[{"action":"edit","path":"hello.py","search":"print('hi')","replace":"print('hello')"}]}"#.into(),
+        ]);
+        let ctx = worker_ctx_with_plan(ws.path(), "修改 hello.py 打印 hello");
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(out.result.success, "summary: {}", out.result.summary);
+        let updated = std::fs::read_to_string(&hello).unwrap();
+        assert_eq!(updated, "print('hello')\n");
+        // 旧内容应被替换，不应残留。
+        assert!(!updated.contains("print('hi')"));
+    }
+
+    #[test]
+    fn llm_worker_applies_create_step() {
+        // workspace 中没有 new.py，LLM 输出 create step。
+        let ws = tempfile::tempdir().unwrap();
+        let client = MockLlmClient::new(vec![
+            r#"{"steps":[{"action":"create","path":"new.py","content":"print(1)\n"}]}"#.into(),
+        ]);
+        let ctx = worker_ctx_with_plan(ws.path(), "创建 new.py");
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(out.result.success, "summary: {}", out.result.summary);
+        let content = std::fs::read_to_string(ws.path().join("new.py")).unwrap();
+        assert_eq!(content, "print(1)\n");
+    }
+
+    #[test]
+    fn llm_worker_applies_delete_step() {
+        // 预置 old.py 存在，LLM 输出 delete step。
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("old.py"), "deprecated\n").unwrap();
+        let client = MockLlmClient::new(vec![
+            r#"{"steps":[{"action":"delete","path":"old.py"}]}"#.into()
+        ]);
+        let ctx = worker_ctx_with_plan(ws.path(), "删除 old.py");
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(out.result.success, "summary: {}", out.result.summary);
+        assert!(!ws.path().join("old.py").exists(), "old.py 应被删除");
+    }
+
+    #[test]
+    fn llm_worker_applies_multiple_steps_in_order() {
+        // 一个 LLM 输出含 3 个 step：edit a.py + create b.py + delete c.py。
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.py"), "x = 1\n").unwrap();
+        std::fs::write(ws.path().join("c.py"), "to remove\n").unwrap();
+
+        let client = MockLlmClient::new(vec![r#"{"steps":[
+                {"action":"edit","path":"a.py","search":"x = 1","replace":"x = 2"},
+                {"action":"create","path":"b.py","content":"new\n"},
+                {"action":"delete","path":"c.py"}
+            ]}"#
+        .into()]);
+        let ctx = worker_ctx_with_plan(ws.path(), "重构 a/b/c");
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(out.result.success, "summary: {}", out.result.summary);
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("a.py")).unwrap(),
+            "x = 2\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("b.py")).unwrap(),
+            "new\n"
+        );
+        assert!(!ws.path().join("c.py").exists());
+    }
+
+    #[test]
+    fn llm_worker_edit_fails_when_search_not_found() {
+        // search 字符串在原文件中不存在 → apply_step 应失败。
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.py"), "print('hello')\n").unwrap();
+        let client = MockLlmClient::new(vec![
+            r#"{"steps":[{"action":"edit","path":"a.py","search":"no_such_text","replace":"x"}]}"#
+                .into(),
+        ]);
+        let ctx = worker_ctx_with_plan(ws.path(), "x");
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(!out.result.success);
+        assert!(
+            out.result.summary.contains("apply_step 失败"),
+            "应报 apply_step 失败, got: {}",
+            out.result.summary
+        );
+        // 文件未被改动。
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("a.py")).unwrap(),
+            "print('hello')\n"
+        );
+    }
+
+    #[test]
+    fn llm_worker_edit_fails_when_search_matches_multiple() {
+        // search 字符串在原文件中匹配多次 → apply_step 应失败（必须唯一）。
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.py"), "x = 1\nx = 1\n").unwrap();
+        let client = MockLlmClient::new(vec![
+            r#"{"steps":[{"action":"edit","path":"a.py","search":"x = 1","replace":"x = 2"}]}"#
+                .into(),
+        ]);
+        let ctx = worker_ctx_with_plan(ws.path(), "x");
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(!out.result.success);
+        assert!(
+            out.result.summary.contains("apply_step 失败"),
+            "应报 apply_step 失败（多次匹配）, got: {}",
+            out.result.summary
+        );
+    }
+
+    #[test]
+    fn llm_worker_steps_reject_path_traversal() {
+        // steps 中的 path 含 .. 应被 PathGuard 拦下。
+        let ws = tempfile::tempdir().unwrap();
+        let client = MockLlmClient::new(vec![
+            r#"{"steps":[{"action":"create","path":"../evil.py","content":"x"}]}"#.into(),
+        ]);
+        let ctx = worker_ctx_with_plan(ws.path(), "x");
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(!out.result.success);
+        assert!(
+            out.result.summary.contains("写边界拒绝"),
+            "应拒绝路径越界, got: {}",
+            out.result.summary
+        );
+        assert!(!ws.path().join("../evil.py").exists());
+    }
+
+    #[test]
+    fn llm_worker_steps_reject_dangerous_path() {
+        // steps 中 path 是 .git/hooks/pre-commit 应被危险路径黑名单拒绝。
+        let ws = tempfile::tempdir().unwrap();
+        let client = MockLlmClient::new(vec![
+            r#"{"steps":[{"action":"create","path":".git/hooks/pre-commit","content":"evil"}]}"#
+                .into(),
+        ]);
+        let ctx = worker_ctx_with_plan(ws.path(), "x");
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(!out.result.success);
+        assert!(out.result.summary.contains("写边界拒绝"));
+    }
+
+    #[test]
+    fn llm_worker_unknown_action_rejected() {
+        // action 不是 edit/create/delete 之一应失败。
+        let ws = tempfile::tempdir().unwrap();
+        let client = MockLlmClient::new(vec![
+            r#"{"steps":[{"action":"append","path":"a.py","content":"x"}]}"#.into(),
+        ]);
+        let ctx = worker_ctx_with_plan(ws.path(), "x");
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(!out.result.success);
+        assert!(
+            out.result.summary.contains("未知 action"),
+            "应报未知 action, got: {}",
+            out.result.summary
+        );
+    }
+
+    #[test]
+    fn llm_worker_files_format_still_works() {
+        // 兼容旧 {files:[...]} 格式：LlmWorker 应走整文件写路径。
+        let ws = tempfile::tempdir().unwrap();
+        let client = MockLlmClient::new(vec![
+            r#"{"files":[{"path":"legacy.py","content":"print('old')\n"}]}"#.into(),
+        ]);
+        let ctx = worker_ctx_with_plan(ws.path(), "x");
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(out.result.success, "summary: {}", out.result.summary);
+        assert_eq!(
+            std::fs::read_to_string(ws.path().join("legacy.py")).unwrap(),
+            "print('old')\n"
+        );
+    }
+
+    #[test]
+    fn llm_worker_edit_produces_unified_diff_artifact() {
+        // edit step 产出的 artifact.patch 应是 unified diff 格式（含 @@ hunk 头）。
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.py"), "print('hi')\n").unwrap();
+        let client = MockLlmClient::new(vec![
+            r#"{"steps":[{"action":"edit","path":"a.py","search":"print('hi')","replace":"print('hello')"}]}"#.into(),
+        ]);
+        let ctx = worker_ctx_with_plan(ws.path(), "x");
+        let out = LlmWorker::new(client).run(&ctx);
+        assert!(out.result.success, "summary: {}", out.result.summary);
+        // 至少一个 CodeDiff artifact，patch 含 @@ 标记。
+        let diff_artifacts: Vec<_> = out
+            .artifacts
+            .iter()
+            .filter(|a| a.artifact_type == ArtifactType::CodeDiff)
+            .collect();
+        assert!(!diff_artifacts.is_empty(), "应有 CodeDiff artifact");
+        let patch = diff_artifacts[0].patch.as_ref().expect("patch 不为空");
+        assert!(
+            patch.contains("@@"),
+            "patch 应含 unified diff hunk 头, got: {patch}"
+        );
+        assert!(patch.contains("-print('hi')"), "patch 应含删除行: {patch}");
+        assert!(
+            patch.contains("+print('hello')"),
+            "patch 应含新增行: {patch}"
         );
     }
 }

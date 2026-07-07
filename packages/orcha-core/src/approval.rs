@@ -39,10 +39,7 @@ pub enum ApprovalAction {
     /// 删除文件。
     DeleteFile { path: String },
     /// 跑 shell 命令（Tester / Fixer）。
-    RunCommand {
-        program: String,
-        args: Vec<String>,
-    },
+    RunCommand { program: String, args: Vec<String> },
 }
 
 impl ApprovalAction {
@@ -54,7 +51,11 @@ impl ApprovalAction {
                 content_preview,
             } => {
                 let preview = if content_preview.len() > 100 {
-                    format!("{}...(共 {} 字节)", &content_preview[..100], content_preview.len())
+                    format!(
+                        "{}...(共 {} 字节)",
+                        &content_preview[..100],
+                        content_preview.len()
+                    )
                 } else {
                     content_preview.clone()
                 };
@@ -131,10 +132,7 @@ impl StdinApprovalHook {
 
 impl ApprovalHook for StdinApprovalHook {
     fn request(&self, action: &ApprovalAction) -> ApprovalDecision {
-        let prompt = format!(
-            "\n[审批请求] {}\n批准？[y/n] (默认 y): ",
-            action.describe()
-        );
+        let prompt = format!("\n[审批请求] {}\n批准？[y/n] (默认 y): ", action.describe());
         // 用 stderr 输出提示（避免污染 stdout 的 JSON 输出）。
         if let Err(e) = io::stderr().write_all(prompt.as_bytes()) {
             return ApprovalDecision::Rejected(format!("输出提示失败: {e}"));
@@ -156,9 +154,7 @@ impl ApprovalHook for StdinApprovalHook {
                     "n" | "no" => {
                         ApprovalDecision::Rejected("管理员拒绝（stdin 输入 n）".to_string())
                     }
-                    other => {
-                        ApprovalDecision::Rejected(format!("管理员输入未知响应: {other}"))
-                    }
+                    other => ApprovalDecision::Rejected(format!("管理员输入未知响应: {other}")),
                 }
             }
             Err(e) => ApprovalDecision::Rejected(format!("读 stdin 失败: {e}")),
@@ -259,7 +255,9 @@ mod tests {
 
     #[test]
     fn action_describe_delete_file() {
-        let a = ApprovalAction::DeleteFile { path: "tmp.txt".into() };
+        let a = ApprovalAction::DeleteFile {
+            path: "tmp.txt".into(),
+        };
         let s = a.describe();
         assert!(s.contains("删除文件"));
         assert!(s.contains("tmp.txt"));

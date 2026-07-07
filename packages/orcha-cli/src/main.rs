@@ -9,8 +9,8 @@ use anyhow::{bail, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 use orcha_core::{
     transition, CycleConfig, CycleOutcome, Cycleround, FailureReason, FileHistoryStore,
-    FileMemoryStore, FileTaskStore, HistoryStore, RecoverStrategy, Recovery, RecoveryReport,
-    RoundRecord, TaskStore,
+    FileMemoryStore, FileTaskStore, GitWorktree, HistoryStore, RecoverStrategy, Recovery,
+    RecoveryReport, RoundRecord, TaskStore,
 };
 use orcha_sdk::{Artifact, Task, TaskStatus};
 
@@ -104,6 +104,13 @@ enum Command {
         /// 默认关闭（CI / 自动化路径用 NullApprovalHook 直接放行）。
         #[arg(long, default_value_t = false)]
         approve: bool,
+
+        /// 启用 Git worktree 隔离（M4）：检测到 workspace 是 git repo 时，
+        /// 自动 `git worktree add` 创建独立工作区，所有改动落 worktree 不污染原 repo。
+        /// 跑完后打印 worktree 的 `git diff`，drop 时自动 `git worktree remove --force` 清理。
+        /// 非 git repo 时忽略此 flag。默认关闭（原地修改模式）。
+        #[arg(long, default_value_t = false)]
+        worktree: bool,
     },
 
     /// 崩溃恢复：扫描 store，把中断的 RUNNING Task 迁移到 BLOCKED 或 FAILED。
@@ -194,6 +201,7 @@ fn main() -> Result<()> {
             llm,
             ai,
             approve,
+            worktree,
         }) => {
             let exit_code = run_fix(
                 &resolve_home(cli.home.as_deref()),
@@ -204,6 +212,7 @@ fn main() -> Result<()> {
                 llm,
                 ai,
                 approve,
+                worktree,
             )?;
             // 直接 exit 以保证调用方能区分成功/失败（脚本/CI 用 $? 判断）。
             std::process::exit(exit_code);
@@ -285,6 +294,7 @@ fn run_fix(
     llm: bool,
     ai: bool,
     approve: bool,
+    worktree: bool,
 ) -> Result<i32> {
     if !workspace.is_dir() {
         bail!("workspace 不存在或不是目录: {}", workspace.display());
@@ -292,6 +302,34 @@ fn run_fix(
     if approve && !(ai && llm) {
         bail!("`--approve` 需配合 `--ai --llm` 使用");
     }
+
+    // M4：可选 Git worktree 隔离。检测到 workspace 是 git repo 时创建独立工作区，
+    // 所有改动落 worktree 不污染原 repo。drop 时自动 `git worktree remove --force` 清理。
+    // 创建失败（非 git repo / git 不可用）时回退到原地修改模式。
+    let worktree_guard = if worktree && workspace.join(".git").exists() {
+        match GitWorktree::new(workspace) {
+            Ok(wt) => {
+                eprintln!(
+                    "[worktree] 已创建隔离工作区: {} (源 repo: {})",
+                    wt.path().display(),
+                    workspace.display()
+                );
+                Some(wt)
+            }
+            Err(e) => {
+                eprintln!("[worktree] 创建失败，回退到原地修改: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // 实际 workspace：worktree 路径（若有）或原 workspace。
+    let effective_workspace: &Path = worktree_guard
+        .as_ref()
+        .map(|wt| wt.path())
+        .unwrap_or(workspace);
 
     let task_store = FileTaskStore::new(home);
     task_store.init()?;
@@ -339,7 +377,7 @@ fn run_fix(
                 Some(memory),
                 approval,
             );
-            cycle.run_with_history(&task, workspace, &history_store)
+            cycle.run_with_history(&task, effective_workspace, &history_store)
         }
         #[cfg(not(feature = "llm"))]
         {
@@ -357,7 +395,7 @@ fn run_fix(
             let memory = std::sync::Arc::new(FileMemoryStore::new(home));
             memory.init()?;
             let cycle = orcha_core::LlmCycleround::with_memory(config, client, memory);
-            cycle.run_with_history(&task, workspace, &history_store)
+            cycle.run_with_history(&task, effective_workspace, &history_store)
         }
         #[cfg(not(feature = "llm"))]
         {
@@ -365,7 +403,7 @@ fn run_fix(
         }
     } else {
         let cycle = Cycleround::new(config);
-        cycle.run_with_history(&task, workspace, &history_store)
+        cycle.run_with_history(&task, effective_workspace, &history_store)
     };
 
     // 按结果迁移 Task 状态。
@@ -376,10 +414,43 @@ fn run_fix(
     transition(&mut task, status)?;
     task_store.update(&task)?;
 
+    // M4：若启用了 worktree，跑完后打印 git diff 摘要（让用户看到改动）。
+    // worktree_guard drop 时会自动 `git worktree remove --force` 清理。
+    if let Some(wt) = &worktree_guard {
+        print_worktree_diff(wt);
+    }
+
     // 打印 JSON 结果到 stdout。
     let result = build_fix_result(&task.id, &outcome, &history_store);
     println!("{}", serde_json::to_string_pretty(&result)?);
     Ok(exit_code)
+}
+
+/// 打印 worktree 相对 HEAD 的 git diff 摘要。
+///
+/// 仅打印 stat（文件 + 行数变更），不打印完整 diff（避免输出过长）。
+/// 完整 diff 用户可 `cd <worktree_path> && git diff` 查看。
+fn print_worktree_diff(wt: &GitWorktree) {
+    let output = std::process::Command::new("git")
+        .args(["-C", &wt.path().to_string_lossy(), "diff", "--stat"])
+        .output();
+    match output {
+        Ok(o) if o.status.success() => {
+            let stat = String::from_utf8_lossy(&o.stdout);
+            if stat.trim().is_empty() {
+                eprintln!("[worktree] 无改动（HEAD 与 worktree 一致）");
+            } else {
+                eprintln!("[worktree] 改动摘要:\n{stat}");
+            }
+        }
+        Ok(o) => {
+            let stderr = String::from_utf8_lossy(&o.stderr);
+            eprintln!("[worktree] git diff 失败: {stderr}");
+        }
+        Err(e) => {
+            eprintln!("[worktree] 执行 git diff 失败: {e}");
+        }
+    }
 }
 
 /// 从 `CycleOutcome` 聚合 artifacts。
@@ -539,6 +610,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 0, "成功路径退出码应为 0");
@@ -581,6 +653,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 0);
@@ -617,6 +690,7 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .expect("run_fix should not error");
         assert_eq!(exit, 1, "失败路径退出码应为 1");
@@ -647,9 +721,96 @@ mod tests {
             false,
             false,
             false,
+            false,
         )
         .unwrap_err();
         assert!(err.to_string().contains("workspace 不存在"));
+    }
+
+    /// GT-CLI-WT: `--worktree` 在 git repo 中应创建隔离工作区，
+    /// 原 repo 的文件不被修改（改动落 worktree，drop 后自动清理）。
+    #[test]
+    fn fix_cli_worktree_isolates_changes_from_source_repo() {
+        if find_python().is_none() {
+            eprintln!("skipping: no python interpreter on PATH");
+            return;
+        }
+        // 检查 git 是否可用。
+        let git_check = std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !git_check {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+
+        let home = tempdir().unwrap();
+        let ws = tempdir().unwrap();
+
+        // 在 ws 里初始化 git repo + 写 test.py + commit（worktree 需要至少 1 个 commit）。
+        fs::write(
+            ws.path().join("test.py"),
+            "assert open('hello.py').read().strip() == 'hello'\n",
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(ws.path())
+                .output()
+                .expect("git command")
+        };
+        git(&["init"]);
+        git(&["add", "."]);
+        // commit 需要作者信息；CI 环境可能没配，显式传入。
+        git(&[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@test",
+            "commit",
+            "-m",
+            "init",
+        ]);
+
+        // 跑 run_fix with worktree=true。改动应落 worktree，原 repo 不被污染。
+        let exit = run_fix(
+            home.path(),
+            ws.path(),
+            "创建 hello.py 输出 hello".into(),
+            5,
+            3,
+            false,
+            false,
+            false,
+            true, // 启用 worktree 隔离
+        )
+        .expect("run_fix should not error");
+        assert_eq!(exit, 0, "worktree 路径也应成功");
+
+        // 原 repo 不应有 hello.py（改动落 worktree，drop 后已清理）。
+        assert!(
+            !ws.path().join("hello.py").exists(),
+            "原 repo 不应被污染：hello.py 不应存在"
+        );
+
+        // 原 repo 的 test.py 仍应原样存在。
+        assert!(ws.path().join("test.py").exists(), "test.py 应仍在原 repo");
+
+        // `git worktree list` 不应残留（drop 时应已 remove）。
+        let list = std::process::Command::new("git")
+            .args(["-C", &ws.path().to_string_lossy(), "worktree", "list"])
+            .output()
+            .expect("git worktree list");
+        let out = String::from_utf8_lossy(&list.stdout);
+        // worktree list 第一行是主 repo 自身，不应有第二行（worktree 已清理）。
+        assert_eq!(
+            out.lines().count(),
+            1,
+            "worktree 应已清理，实际 list:\n{out}"
+        );
     }
 
     /// build_fix_result 在 Success / Failed 两种路径都应产出合法 JSON。
@@ -968,6 +1129,7 @@ mod tests {
             "创建 hello.py 输出 hello".into(),
             5,
             3,
+            false,
             false,
             false,
             false,

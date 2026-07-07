@@ -248,13 +248,26 @@ fn apply_edit(target: &Path, step: &PlanStep) -> Result<AppliedStep> {
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("edit step 缺 replace"))?;
 
-    // 唯一性校验：search 必须在原文件中精确匹配且唯一
-    let occurrences = original.matches(search).count();
+    // 换行符归一化匹配：LLM 输出的 search/replace 通常用 LF（\n），
+    // 但 Windows 上的文件可能是 CRLF（\r\n）。直接匹配会因换行符不一致而失败。
+    // 策略：把原文件、search、replace 都归一化到 LF 做匹配 + 唯一性校验，
+    // 替换后再根据原文件是否含 CRLF 决定写回的换行符风格（保持原文件风格）。
+    let original_is_crlf = original.contains("\r\n");
+    let original_lf = if original_is_crlf {
+        original.replace("\r\n", "\n")
+    } else {
+        original.clone()
+    };
+    let search_lf = search.replace("\r\n", "\n");
+    let replace_lf = replace.replace("\r\n", "\n");
+
+    // 唯一性校验：search 必须在归一化后的原文件中精确匹配且唯一
+    let occurrences = original_lf.matches(&search_lf).count();
     if occurrences == 0 {
         bail!(
             "edit 失败：search 字符串在 {} 中未找到匹配。search={:?}",
             step.path,
-            search
+            search_lf
         );
     }
     if occurrences > 1 {
@@ -262,11 +275,17 @@ fn apply_edit(target: &Path, step: &PlanStep) -> Result<AppliedStep> {
             "edit 失败：search 字符串在 {} 中匹配 {} 次（必须唯一）。search={:?}",
             step.path,
             occurrences,
-            search
+            search_lf
         );
     }
 
-    let updated = original.replacen(search, replace, 1);
+    let updated_lf = original_lf.replacen(&search_lf, &replace_lf, 1);
+    // 写回时保持原文件换行符风格：原文件是 CRLF 则把 LF 转回 CRLF
+    let updated = if original_is_crlf {
+        updated_lf.replace('\n', "\r\n")
+    } else {
+        updated_lf
+    };
     std::fs::write(target, &updated)
         .with_context(|| format!("write edited file: {}", target.display()))?;
 
@@ -691,6 +710,67 @@ mod tests {
         assert_eq!(content, "print('hello, world')\n");
         assert!(applied.diff.contains("-print('hello')"));
         assert!(applied.diff.contains("+print('hello, world')"));
+    }
+
+    #[test]
+    fn apply_edit_normalizes_crlf_in_search() {
+        // 文件用 CRLF 换行符（Windows），search/replace 用 LF。
+        // apply_edit 应归一化匹配，且写回时保持 CRLF 风格。
+        let dir = tempdir().unwrap();
+        // 构造 CRLF 文件：print('hi')\r\nx = 1\r\n
+        let original = "print('hi')\r\nx = 1\r\n";
+        fs::write(dir.path().join("a.py"), original).unwrap();
+        let step = PlanStep {
+            action: PlanAction::Edit,
+            path: "a.py".into(),
+            content: None,
+            // search 用 LF（LLM 常见输出）
+            search: Some("print('hi')\nx = 1".into()),
+            replace: Some("print('hello')\nx = 2".into()),
+        };
+        let applied = apply_step(dir.path(), &step).unwrap();
+        let content = fs::read_to_string(dir.path().join("a.py")).unwrap();
+        // 写回应保持 CRLF
+        assert_eq!(content, "print('hello')\r\nx = 2\r\n");
+        // diff 应反映改动
+        assert!(applied.diff.contains("-print('hi')"));
+        assert!(applied.diff.contains("+print('hello')"));
+    }
+
+    #[test]
+    fn apply_edit_preserves_lf_file_when_search_uses_lf() {
+        // 文件是 LF，search 也是 LF：正常匹配，写回保持 LF（不引入 CRLF）。
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.py"), "print('hi')\nx = 1\n").unwrap();
+        let step = PlanStep {
+            action: PlanAction::Edit,
+            path: "a.py".into(),
+            content: None,
+            search: Some("print('hi')".into()),
+            replace: Some("print('hello')".into()),
+        };
+        apply_step(dir.path(), &step).unwrap();
+        let content = fs::read_to_string(dir.path().join("a.py")).unwrap();
+        assert_eq!(content, "print('hello')\nx = 1\n");
+        // 不应引入 CRLF
+        assert!(!content.contains("\r\n"));
+    }
+
+    #[test]
+    fn apply_edit_handles_crlf_search_in_crlf_file() {
+        // 文件 CRLF，search 也 CRLF：也应正常匹配。
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.py"), "print('hi')\r\nx = 1\r\n").unwrap();
+        let step = PlanStep {
+            action: PlanAction::Edit,
+            path: "a.py".into(),
+            content: None,
+            search: Some("print('hi')\r\nx = 1".into()),
+            replace: Some("print('hello')\r\nx = 2".into()),
+        };
+        apply_step(dir.path(), &step).unwrap();
+        let content = fs::read_to_string(dir.path().join("a.py")).unwrap();
+        assert_eq!(content, "print('hello')\r\nx = 2\r\n");
     }
 
     #[test]

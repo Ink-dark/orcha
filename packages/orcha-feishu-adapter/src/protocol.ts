@@ -60,11 +60,43 @@ export interface HeartbeatMsg {
   ts_ms: number;
 }
 
+// ============================================================
+// M7 P1：审批相关（与 Rust 端 ApprovalActionDto / ApprovalDecisionDto 对齐）
+// ============================================================
+
+/** 待审批的动作（与 Rust enum 对齐，tag snake_case）。 */
+export type ApprovalActionDto =
+  | { type: 'write_file'; path: string; content_preview: string }
+  | { type: 'delete_file'; path: string }
+  | { type: 'run_command'; program: string; args: string[] };
+
+/** 审批决策（与 Rust enum 对齐）。 */
+export type ApprovalDecisionDto =
+  | { type: 'approved' }
+  | { type: 'rejected'; reason: string };
+
+/**
+ * M7 P1：审批卡片按钮回调。Adapter 收到飞书 `card.action.trigger` 后转发，
+ * Gateway 侧查白名单后决定最终决策。
+ */
+export interface ApprovalResponseMsg {
+  type: 'approval_response';
+  /** 对应 ApprovalRequest 的 action_id，用于 Gateway 端匹配 pending 请求。 */
+  action_id: string;
+  /** 操作员在 IM 平台的 open_id（飞书 operator.open_id）。 */
+  operator_open_id: string;
+  /** 操作员所在群（私聊为 null）。 */
+  operator_chat_id: string | null;
+  /** Adapter 端用户给的初步决策（Gateway 会再过一遍白名单）。 */
+  decision: ApprovalDecisionDto;
+}
+
 /** Adapter → Gateway 的所有消息（discriminated union）。 */
 export type AdapterToGateway =
   | TriggerMsg
   | ReplyMsg
   | AuthCheckMsg
+  | ApprovalResponseMsg
   | HeartbeatMsg;
 
 // ============================================================
@@ -117,6 +149,35 @@ export interface AuthResultMsg {
   reason: string | null;
 }
 
+/**
+ * M7 P1：审批请求。Gateway worker 要执行副作用前，发此消息给 Adapter，
+ * Adapter 推一张带 [批准][拒绝] 按钮的飞书卡片，等管理员点击。
+ */
+export interface ApprovalRequestMsg {
+  type: 'approval_request';
+  /** 全局唯一 ID（UUID），用于匹配 response。 */
+  action_id: string;
+  /** 关联的 task_id，用于卡片标题展示。 */
+  task_id: string;
+  /** IM 会话标识（飞书 chat_id），用于推卡片到正确的会话。 */
+  session: string;
+  /** 待审批的动作详情。 */
+  action: ApprovalActionDto;
+}
+
+/**
+ * M7 P1：审批结果通知（Gateway 完成白名单校验后回推给 Adapter）。
+ * Adapter 收到后 patch 原卡片显示 "✅ 已批准 / ❌ 已拒绝"。
+ */
+export interface ApprovalResultMsg {
+  type: 'approval_result';
+  action_id: string;
+  /** 最终决策（已过白名单）。 */
+  decision: ApprovalDecisionDto;
+  /** 实际审批人（白名单校验通过的操作员）。 */
+  operator_open_id: string | null;
+}
+
 /** 心跳 ack。 */
 export interface HeartbeatAckMsg {
   type: 'heartbeat_ack';
@@ -129,6 +190,8 @@ export type GatewayToAdapter =
   | NotifyMsg
   | TaskResultMsg
   | AuthResultMsg
+  | ApprovalRequestMsg
+  | ApprovalResultMsg
   | HeartbeatAckMsg;
 
 // ============================================================

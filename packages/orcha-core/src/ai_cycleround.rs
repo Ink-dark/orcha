@@ -229,12 +229,8 @@ impl AiDrivenCycleround {
                     let summary = format!("调度 LLM 决策失败: {e}");
                     let fail = StepOutput::failure(&fail_step, &summary);
                     steps_total.push(fail.result.clone());
-                    let rec = build_round(
-                        step_idx,
-                        started_at,
-                        vec![fail.result.clone()],
-                        Vec::new(),
-                    );
+                    let rec =
+                        build_round(step_idx, started_at, vec![fail.result.clone()], Vec::new());
                     persist_round(history_store, &task.id, &rec);
                     history.push(rec);
                     // 决策失败也算「调度器」连续失败，纳入 max_retries 计数。
@@ -340,10 +336,9 @@ impl AiDrivenCycleround {
             "reviewer" => self.reviewer.run_at(ctx, round),
             "fixer" => self.fixer.run(ctx),
             "exit" => StepOutput::success(format!("S-exit-{round}"), "调度结束"),
-            other => StepOutput::failure(
-                format!("S-unknown-{round}"),
-                format!("未知 agent: {other}"),
-            ),
+            other => {
+                StepOutput::failure(format!("S-unknown-{round}"), format!("未知 agent: {other}"))
+            }
         }
     }
 }
@@ -397,9 +392,7 @@ fn parse_decision(resp: &ChatResponse) -> Result<AiDecision, LlmError> {
     for call in &resp.tool_calls {
         if call.function.name == "decide_next_agent" {
             let args: serde_json::Value = serde_json::from_str(&call.function.arguments)
-                .map_err(|e| {
-                    LlmError::Parse(format!("解析 decide_next_agent 参数失败: {e}"))
-                })?;
+                .map_err(|e| LlmError::Parse(format!("解析 decide_next_agent 参数失败: {e}")))?;
             let agent = args
                 .get("agent")
                 .and_then(|v| v.as_str())
@@ -459,12 +452,7 @@ fn run_inner_streaming(
                     });
                     let fail = StepOutput::failure(&fail_step, &summary);
                     steps_total.push(fail.result.clone());
-                    let rec = build_round(
-                        step_idx,
-                        started_at,
-                        vec![fail.result],
-                        Vec::new(),
-                    );
+                    let rec = build_round(step_idx, started_at, vec![fail.result], Vec::new());
                     let _ = tx.send(RoundEvent::RoundFinished {
                         round: step_idx,
                         record: rec.clone(),
@@ -714,10 +702,7 @@ mod tests {
                 artifacts,
             } => {
                 // 6 步决策：observer / planner / worker / tester / reviewer / exit
-                assert_eq!(
-                    rounds, 6,
-                    "应在第 6 步（exit 决策）成功，实际: {rounds}"
-                );
+                assert_eq!(rounds, 6, "应在第 6 步（exit 决策）成功，实际: {rounds}");
                 assert!(!artifacts.is_empty(), "应累积 artifacts");
                 assert_eq!(history.len(), 6, "history 应有 6 条 round 记录");
                 // hello.py 应由 Worker 真实落盘
@@ -802,10 +787,7 @@ mod tests {
                     "应因 planner 连续失败熔断"
                 );
                 // 第 2 次 planner 失败即触发（max_retries=2）
-                assert_eq!(
-                    rounds, 2,
-                    "应在第 2 次 planner 失败时熔断，实际: {rounds}"
-                );
+                assert_eq!(rounds, 2, "应在第 2 次 planner 失败时熔断，实际: {rounds}");
                 assert_eq!(history.len(), 2);
             }
             other => panic!("expected Failed(MaxRetriesExceeded), got {other:?}"),
@@ -834,7 +816,9 @@ mod tests {
 
         let outcome = cycle.run(&task, ws.path());
         match outcome {
-            CycleOutcome::Success { rounds, history, .. } => {
+            CycleOutcome::Success {
+                rounds, history, ..
+            } => {
                 assert_eq!(rounds, 2, "应在第 2 步 exit 后成功");
                 assert_eq!(history.len(), 2);
                 // 第 1 步应是失败的未知 agent
@@ -923,8 +907,14 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, RoundEvent::RoundFinished { .. }))
             .count();
-        assert!(started_count >= 6, "应至少 6 个 AgentStarted, got {started_count}");
-        assert!(finished_count >= 6, "应至少 6 个 AgentFinished, got {finished_count}");
+        assert!(
+            started_count >= 6,
+            "应至少 6 个 AgentStarted, got {started_count}"
+        );
+        assert!(
+            finished_count >= 6,
+            "应至少 6 个 AgentFinished, got {finished_count}"
+        );
         assert_eq!(round_count, 6, "应恰好 6 个 RoundFinished");
 
         // 终态应为 Success
