@@ -657,10 +657,8 @@ mod tests {
         // 真实场景：DeepSeek 在 search/replace 字段值中输出字面换行符
         // （违反 JSON 规范，serde_json 会拒绝解析）。parse_planner_output 应做容错预处理。
         // 这里用 format! 构造含字面换行符的 JSON 字符串值。
-        let raw = format!(
-            "{{\n  \"target_files\": [\"a.py\"],\n  \"steps\": [\n    {{\n      \"action\": \"edit\",\n      \"path\": \"a.py\",\n      \"search\": \"line1\nline2\",\n      \"replace\": \"new1\nnew2\"\n    }}\n  ]\n}}"
-        );
-        let parsed = parse_planner_output(&raw).unwrap();
+        let raw = "{\n  \"target_files\": [\"a.py\"],\n  \"steps\": [\n    {\n      \"action\": \"edit\",\n      \"path\": \"a.py\",\n      \"search\": \"line1\nline2\",\n      \"replace\": \"new1\nnew2\"\n    }\n  ]\n}";
+        let parsed = parse_planner_output(raw).unwrap();
         assert!(parsed.contains("steps"));
         // 解析后的 JSON 应是合法的（serde_json::to_string 会正确转义）
         let reparsed: serde_json::Value = serde_json::from_str(&parsed).unwrap();
