@@ -114,11 +114,20 @@ group = "*"
     Write-Ok "config.toml 已存在"
 }
 
-# ---- 阶段 2：检查编译产物 ---------------------------------------------
-$gatewayExe = Join-Path $repoRoot "target\debug\orcha-gateway.exe"
+# ---- 阶段 2：检查二进制（优先根目录分发包，其次 target/debug 开发版）-----
+$gatewayExe = $null
+$candidates = @(
+    (Join-Path $repoRoot "orcha-gateway.exe"),           # 分发包
+    (Join-Path $repoRoot "target\release\orcha-gateway.exe"),
+    (Join-Path $repoRoot "target\debug\orcha-gateway.exe")
+)
+foreach ($cand in $candidates) {
+    if (Test-Path $cand) { $gatewayExe = $cand; break }
+}
+
 $adapterMain = Join-Path $repoRoot "packages\orcha-feishu-adapter\dist\main.js"
 
-if (-not (Test-Path $gatewayExe)) {
+if (-not $gatewayExe) {
     Write-Step "Gateway 未编译，开始 cargo build"
     Push-Location $repoRoot
     $prevEAP = $ErrorActionPreference
@@ -131,8 +140,9 @@ if (-not (Test-Path $gatewayExe)) {
         Write-Err "Gateway 编译失败"
         exit 1
     }
+    $gatewayExe = Join-Path $repoRoot "target\debug\orcha-gateway.exe"
 }
-Write-Ok "Gateway 已编译"
+Write-Ok "Gateway: $gatewayExe"
 
 if (-not (Test-Path $adapterMain)) {
     Write-Step "Adapter 未编译，开始 npm build"
