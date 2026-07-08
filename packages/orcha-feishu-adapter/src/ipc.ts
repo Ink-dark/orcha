@@ -210,9 +210,12 @@ export class IpcClient {
         return;
       }
       try {
-        this.handlers.onMessage(msg);
+        // onMessage 可能是 async 函数；用 Promise.resolve 统一处理，防止 unhandledRejection 崩进程
+        Promise.resolve(this.handlers.onMessage(msg)).catch((e: unknown) => {
+          console.error('[ipc] onMessage handler error:', e);
+        });
       } catch (e) {
-        // 上层回调出错不影响连接本身，只 log
+        // 同步错误也兜底，不影响连接
         console.error('[ipc] onMessage handler threw:', e);
       }
     }

@@ -19,7 +19,10 @@ use orcha_sdk::{Artifact, ArtifactType};
 
 use crate::{StepContext, StepOutput, SubAgent};
 
-/// 观察者：扫描 workspace，报告当前已存在哪些文件。
+/// 观察者：扫描 workspace，检测项目类型并报告文件结构。
+///
+/// 不再拍平列出全部文件（LLM 难以从 100+ 文件名字符串中识别项目类型），
+/// 而是先检测项目类型（Rust / JS / Python / Go 等），再按模块分组列出文件。
 pub struct Observer;
 
 impl SubAgent for Observer {
@@ -32,11 +35,7 @@ impl SubAgent for Observer {
         let summary = if files.is_empty() {
             "workspace 为空，无已有文件".to_string()
         } else {
-            format!(
-                "workspace 已有 {} 个文件: {}",
-                files.len(),
-                files.join(", ")
-            )
+            summarize_project(&files)
         };
 
         let artifact = Artifact {
@@ -48,6 +47,146 @@ impl SubAgent for Observer {
         };
         StepOutput::success("S-observer", summary).with_artifacts(vec![artifact])
     }
+}
+
+/// 检测项目类型并生成结构化摘要，帮助 Planner LLM 理解项目技术栈。
+///
+/// 策略：根据标志性文件判断语言/构建系统 → 按顶级目录/模块分组文件 →
+/// 标注关键配置文件。避免把 100+ 文件路径拍平成一行。
+fn summarize_project(files: &[String]) -> String {
+    // 1. 检测项目类型
+    let has_cargo = files.iter().any(|f| f == "Cargo.toml" || f.ends_with("/Cargo.toml"));
+    let has_go_mod = files.iter().any(|f| f == "go.mod" || f.ends_with("/go.mod"));
+    let has_package_json = files.iter().any(|f| f == "package.json" || f.ends_with("/package.json"));
+    let has_pyproject = files.iter().any(|f| f == "pyproject.toml" || f.ends_with("/pyproject.toml"));
+    let has_setup_py = files.iter().any(|f| f == "setup.py" || f.ends_with("/setup.py"));
+    let has_cmake = files.iter().any(|f| f == "CMakeLists.txt" || f.ends_with("/CMakeLists.txt"));
+
+    let project_type = if has_cargo {
+        "Rust（Cargo workspace）"
+    } else if has_go_mod {
+        "Go"
+    } else if has_package_json {
+        "Node.js / TypeScript"
+    } else if has_pyproject || has_setup_py {
+        "Python"
+    } else if has_cmake {
+        "C / C++（CMake）"
+    } else {
+        "未知项目类型"
+    };
+
+    // 2. 收集顶级目录和文件（使用 owned String 避免生命周期问题）
+    let mut top_files: Vec<String> = Vec::new();
+    let mut dirs: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+
+    for f in files {
+        let normalized = f.replace('\\', "/");
+        // 跳过隐藏目录和构建产物
+        if normalized.starts_with('.')
+            || normalized.starts_with("target/")
+            || normalized.starts_with("node_modules/")
+        {
+            continue;
+        }
+        if let Some(slash_idx) = normalized.find('/') {
+            let dir = normalized[..slash_idx].to_string();
+            let rest = normalized[slash_idx + 1..].to_string();
+            dirs.entry(dir).or_default().push(rest);
+        } else {
+            top_files.push(normalized);
+        }
+    }
+
+    // 3. 构建摘要
+    let mut s = format!(
+        "项目类型：{project_type}\n\
+         总文件数：{total}\n\n",
+        total = files.len()
+    );
+
+    // 关键配置文件
+    let is_key_file = |name: &str| -> bool {
+        matches!(
+            name,
+            "Cargo.toml"
+                | "Cargo.lock"
+                | "go.mod"
+                | "package.json"
+                | "tsconfig.json"
+                | "pyproject.toml"
+                | "Makefile"
+                | "Dockerfile"
+                | "README.md"
+                | "LICENSE"
+                | ".gitignore"
+        ) || name.ends_with(".md")
+    };
+
+    let key_files: Vec<&str> = top_files
+        .iter()
+        .filter(|f| is_key_file(f))
+        .map(|f| f.as_str())
+        .collect();
+
+    if !key_files.is_empty() {
+        s.push_str("关键文件：");
+        s.push_str(&key_files.join(", "));
+        s.push('\n');
+    }
+    // 非关键的根目录文件
+    let other_top: Vec<&str> = top_files
+        .iter()
+        .filter(|f| !is_key_file(f))
+        .map(|f| f.as_str())
+        .collect();
+    if !other_top.is_empty() {
+        s.push_str("根目录其他文件：");
+        s.push_str(&other_top.join(", "));
+        s.push('\n');
+    }
+    if !key_files.is_empty() || !other_top.is_empty() {
+        s.push('\n');
+    }
+
+    // 各目录
+    let mut dir_counts: Vec<(&str, usize)> = dirs
+        .iter()
+        .map(|(d, files)| (d.as_str(), files.len()))
+        .collect();
+    dir_counts.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+    let max_dirs = 8.min(dir_counts.len());
+
+    s.push_str("目录结构：\n");
+    for (dir, count) in dir_counts.iter().take(max_dirs) {
+        // 列出该目录下前 10 个文件
+        let entries = &dirs[*dir];
+        let preview: Vec<&str> = entries
+            .iter()
+            .take(10)
+            .map(|e| e.as_str())
+            .collect();
+        let suffix = if entries.len() > 10 {
+            format!(" … 等 {} 个文件", entries.len())
+        } else {
+            String::new()
+        };
+        s.push_str(&format!(
+            "  {dir}/ ({count} 文件): {preview}{suffix}\n",
+            preview = preview.join(", ")
+        ));
+    }
+
+    if dir_counts.len() > max_dirs {
+        let remaining: usize = dir_counts.iter().skip(max_dirs).map(|(_, c)| c).sum();
+        s.push_str(&format!(
+            "  … 其余 {} 个目录（共 {} 文件）\n",
+            dir_counts.len() - max_dirs,
+            remaining
+        ));
+    }
+
+    s
 }
 
 /// 规划者：从任务描述解析目标文件名与期望内容，产出执行计划。
@@ -188,7 +327,8 @@ impl SubAgent for Tester {
             args: cmd.args.clone(),
         };
         match ctx.approval.request(&action) {
-            crate::approval::ApprovalDecision::Approved => {}
+            crate::approval::ApprovalDecision::Approved
+            | crate::approval::ApprovalDecision::ApproveAndWhitelist => {}
             crate::approval::ApprovalDecision::Rejected(reason) => {
                 return StepOutput::failure(
                     "S-tester",

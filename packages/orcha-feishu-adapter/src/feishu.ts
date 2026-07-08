@@ -253,6 +253,12 @@ function buildApprovalCardContent(
           },
           {
             tag: 'button',
+            text: { tag: 'plain_text', content: '\u{1F4CB} 批准并加入白名单' },
+            type: 'primary',
+            value: { action_id: actionId, decision: 'approve_and_whitelist' },
+          },
+          {
+            tag: 'button',
             text: { tag: 'plain_text', content: '\u274C 拒绝' },
             type: 'danger',
             value: { action_id: actionId, decision: 'reject' },
@@ -273,13 +279,15 @@ function buildApprovalResultContent(
   const actionDesc = formatApprovalAction(action);
   const decisionDesc = decision.type === 'approved'
     ? '\u2705 已批准'
-    : `\u274C 已拒绝：${decision.reason}`;
+    : decision.type === 'approve_and_whitelist'
+      ? '\u{1F4CB} 已批准并加入白名单'
+      : `\u274C 已拒绝：${decision.reason}`;
   const operatorDesc = operatorOpenId ? `\n**审批人**: ${operatorOpenId}` : '';
   return JSON.stringify({
     config: { wide_screen_mode: true },
     header: {
-      title: { tag: 'plain_text', content: decision.type === 'approved' ? '\u2705 审批通过' : '\u274C 审批拒绝' },
-      template: decision.type === 'approved' ? 'green' : 'red',
+      title: { tag: 'plain_text', content: decision.type === 'approved' || decision.type === 'approve_and_whitelist' ? '\u2705 审批通过' : '\u274C 审批拒绝' },
+      template: decision.type === 'approved' || decision.type === 'approve_and_whitelist' ? 'green' : 'red',
     },
     elements: [
       { tag: 'div', text: { tag: 'lark_md', content: `**任务 ID**\n${taskId}` } },
@@ -735,7 +743,7 @@ function parseApprovalCardEvent(payload: unknown): ApprovalCardEvent | null {
     return null;
   }
   const decisionRaw = v.decision;
-  if (decisionRaw !== 'approve' && decisionRaw !== 'reject') {
+  if (decisionRaw !== 'approve' && decisionRaw !== 'reject' && decisionRaw !== 'approve_and_whitelist') {
     return null;
   }
 
@@ -752,7 +760,9 @@ function parseApprovalCardEvent(payload: unknown): ApprovalCardEvent | null {
   const decision: ApprovalDecisionDto =
     decisionRaw === 'approve'
       ? { type: 'approved' }
-      : { type: 'rejected', reason: '管理员点击拒绝按钮' };
+      : decisionRaw === 'reject'
+        ? { type: 'rejected', reason: '管理员点击拒绝按钮' }
+        : { type: 'approve_and_whitelist', reason: '管理员点击批准并加入白名单' };
 
   return {
     actionId,

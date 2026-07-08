@@ -46,6 +46,7 @@ use orcha_core::{ApprovalAction, ApprovalDecision, ApprovalHook};
 use crate::adapter_registry::AdapterRegistry;
 use crate::config::ApprovalConfig;
 use crate::protocol::{ApprovalActionDto, ApprovalDecisionDto, GatewayToAdapter};
+use crate::runtime_whitelist::SharedRuntimeWhitelist;
 
 /// Pending map：action_id → PendingEntry。
 /// 由 Worker 线程 insert，Reader 线程 remove。两者共享 `Arc<Mutex<...>>`。
@@ -78,6 +79,8 @@ pub struct GatewayApprovalHook {
     session: String,
     /// 超时时长。超时自动 Rejected（fail-closed）。
     timeout: Duration,
+    /// 运行时白名单（跨任务共享，命中则直接放行不发起审批）。
+    runtime_whitelist: SharedRuntimeWhitelist,
 }
 
 impl GatewayApprovalHook {
@@ -87,6 +90,7 @@ impl GatewayApprovalHook {
         task_id: String,
         session: String,
         timeout: Duration,
+        runtime_whitelist: SharedRuntimeWhitelist,
     ) -> Self {
         Self {
             pending,
@@ -94,12 +98,21 @@ impl GatewayApprovalHook {
             task_id,
             session,
             timeout,
+            runtime_whitelist,
         }
     }
 }
 
 impl ApprovalHook for GatewayApprovalHook {
     fn request(&self, action: &ApprovalAction) -> ApprovalDecision {
+        // 0. 先检查运行时白名单：命中则直接放行，不发起审批
+        if let Ok(wl) = self.runtime_whitelist.lock() {
+            if wl.matches(action) {
+                eprintln!("[gateway] 审批操作命中运行时白名单，自动放行: {action:?}");
+                return ApprovalDecision::Approved;
+            }
+        }
+
         let action_id = uuid_v4_simple();
         let (tx, rx) = mpsc::sync_channel::<ApprovalDecision>(1);
 
@@ -156,8 +169,10 @@ impl ApprovalHook for GatewayApprovalHook {
 /// 1. 通过 action_id 查 pending map
 /// 2. 按 action 类型查白名单
 /// 3. 白名单通过 → 用 Adapter 给的决策；不通过 → 强制 Rejected
-/// 4. 通过 oneshot 把最终决策回传 worker
-/// 5. 返回 (action, final_decision) 用于回推 ApprovalResult 给 Adapter
+/// 4. 若决策是 ApproveAndWhitelist，把操作加入运行时白名单并持久化
+/// 5. 通过 oneshot 把最终决策回传 worker
+/// 6. 返回 (action, final_decision) 用于回推 ApprovalResult 给 Adapter
+#[allow(clippy::too_many_arguments)]
 pub fn handle_approval_response(
     pending: &PendingMap,
     config: &ApprovalConfig,
@@ -165,6 +180,8 @@ pub fn handle_approval_response(
     operator_open_id: &str,
     operator_chat_id: Option<&str>,
     adapter_decision: ApprovalDecisionDto,
+    runtime_whitelist: &SharedRuntimeWhitelist,
+    wl_path: &std::path::Path,
 ) -> Option<(ApprovalAction, ApprovalDecision, Option<String>)> {
     // 1. 取出 pending entry
     let entry = {
@@ -191,7 +208,28 @@ pub fn handle_approval_response(
             match auth.check(&src) {
                 crate::auth::AuthResult::Allowed => {
                     // 白名单通过：用 Adapter 给的决策
-                    adapter_decision.into()
+                    let core_decision: ApprovalDecision = adapter_decision.clone().into();
+                    // 若是 ApproveAndWhitelist：把操作加入运行时白名单
+                    if matches!(
+                        core_decision,
+                        ApprovalDecision::ApproveAndWhitelist
+                    ) {
+                        if let Ok(mut wl) = runtime_whitelist.lock() {
+                            let added = wl.add(&entry.action);
+                            if let Err(e) = wl.save(wl_path) {
+                                eprintln!("[gateway] 运行时白名单保存失败: {e}");
+                            } else if added {
+                                eprintln!(
+                                    "[gateway] 操作已加入运行时白名单并持久化: {:?}",
+                                    entry.action
+                                );
+                            }
+                        }
+                        // 对 worker 返回 Approved（执行该操作）
+                        ApprovalDecision::Approved
+                    } else {
+                        core_decision
+                    }
                 }
                 crate::auth::AuthResult::Denied { reason: _ } => {
                     // 白名单不通过：强制 Rejected，忽略 Adapter 决策
@@ -236,7 +274,17 @@ fn uuid_v4_simple() -> String {
 mod tests {
     use super::*;
     use crate::auth::WhitelistEntry;
+    use crate::runtime_whitelist::RuntimeWhitelist;
     use std::sync::mpsc;
+
+    /// 测试辅助：构造共享运行时白名单 + 临时文件路径。
+    fn make_runtime_wl() -> (SharedRuntimeWhitelist, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime_whitelist.toml");
+        // dir 在函数返回后 drop，但测试跑得快，path 仍可用
+        std::mem::forget(dir);
+        (Arc::new(Mutex::new(RuntimeWhitelist::default())), path)
+    }
 
     #[test]
     fn uuid_v4_simple_is_unique() {
@@ -250,6 +298,7 @@ mod tests {
     fn handle_response_returns_none_for_unknown_action_id() {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let cfg = ApprovalConfig::default();
+        let (wl, wl_path) = make_runtime_wl();
         let r = handle_approval_response(
             &pending,
             &cfg,
@@ -257,6 +306,8 @@ mod tests {
             "ou_x",
             None,
             ApprovalDecisionDto::Approved,
+            &wl,
+            &wl_path,
         );
         assert!(r.is_none(), "未知 action_id 应返回 None");
     }
@@ -266,6 +317,7 @@ mod tests {
         // 该类未配白名单（None）= 不需要审批 = 直接放行 Adapter 给的决策
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let cfg = ApprovalConfig::default(); // write/command/delete 全 None
+        let (wl, wl_path) = make_runtime_wl();
 
         let (tx, rx) = mpsc::sync_channel(1);
         pending.lock().unwrap().insert(
@@ -286,6 +338,8 @@ mod tests {
             "ou_anyone",
             None,
             ApprovalDecisionDto::Approved,
+            &wl,
+            &wl_path,
         );
         let (action, decision, operator) = r.unwrap();
         assert!(matches!(action, ApprovalAction::WriteFile { .. }));
@@ -308,6 +362,7 @@ mod tests {
             command: None,
             delete: None,
         };
+        let (wl, wl_path) = make_runtime_wl();
 
         let (tx, rx) = mpsc::sync_channel(1);
         pending.lock().unwrap().insert(
@@ -328,6 +383,8 @@ mod tests {
             "ou_anyone",
             None,
             ApprovalDecisionDto::Approved, // Adapter 给 Approved
+            &wl,
+            &wl_path,
         );
         let (_action, decision, operator) = r.unwrap();
         // Gateway 应强制 Rejected（白名单为空）
@@ -336,11 +393,13 @@ mod tests {
                 assert!(reason.contains("不在审批白名单"), "reason: {reason}")
             }
             ApprovalDecision::Approved => panic!("空白名单应拒绝"),
+            ApprovalDecision::ApproveAndWhitelist => panic!("不应返回 ApproveAndWhitelist"),
         }
         assert!(operator.is_none(), "拒绝时不应有 operator");
         match rx.recv_timeout(Duration::from_secs(1)).unwrap() {
             ApprovalDecision::Rejected(_) => {}
             ApprovalDecision::Approved => panic!("worker 应收到 Rejected"),
+            ApprovalDecision::ApproveAndWhitelist => panic!("worker 不应收到 ApproveAndWhitelist"),
         }
     }
 
@@ -358,6 +417,7 @@ mod tests {
             command: None,
             delete: None,
         };
+        let (wl, wl_path) = make_runtime_wl();
 
         // 场景 1：白名单内用户 → 通过
         let (tx1, _rx1) = mpsc::sync_channel(1);
@@ -378,6 +438,8 @@ mod tests {
             "ou_admin",
             None,
             ApprovalDecisionDto::Approved,
+            &wl,
+            &wl_path,
         );
         let (_, decision, _) = r.unwrap();
         assert_eq!(decision, ApprovalDecision::Approved);
@@ -401,6 +463,8 @@ mod tests {
             "ou_other",
             None,
             ApprovalDecisionDto::Approved, // 即使 Adapter 给 Approved
+            &wl,
+            &wl_path,
         );
         let (_, decision, _) = r.unwrap();
         match decision {
@@ -408,6 +472,7 @@ mod tests {
                 assert!(reason.contains("不在审批白名单"))
             }
             ApprovalDecision::Approved => panic!("白名单外应拒绝"),
+            ApprovalDecision::ApproveAndWhitelist => panic!("不应返回 ApproveAndWhitelist"),
         }
     }
 
@@ -430,6 +495,7 @@ mod tests {
             }]),
             delete: None,
         };
+        let (wl, wl_path) = make_runtime_wl();
 
         // ou_ops 审批写文件 → 拒绝（不在 write 白名单）
         let (tx1, _rx1) = mpsc::sync_channel(1);
@@ -450,6 +516,8 @@ mod tests {
             "ou_ops",
             None,
             ApprovalDecisionDto::Approved,
+            &wl,
+            &wl_path,
         )
         .unwrap();
         assert!(matches!(d, ApprovalDecision::Rejected(_)));
@@ -473,8 +541,117 @@ mod tests {
             "ou_ops",
             None,
             ApprovalDecisionDto::Approved,
+            &wl,
+            &wl_path,
         )
         .unwrap();
         assert_eq!(d, ApprovalDecision::Approved);
+    }
+
+    #[test]
+    fn handle_response_approve_and_whitelist_adds_to_runtime_wl() {
+        // 管理员点击"批准并加入白名单"：操作应加入 runtime_whitelist 并持久化
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let cfg = ApprovalConfig {
+            timeout_secs: 60,
+            command: Some(vec![WhitelistEntry {
+                platform: "feishu".into(),
+                user: Some("ou_admin".into()),
+                group: None,
+            }]),
+            write: None,
+            delete: None,
+        };
+        let (wl, wl_path) = make_runtime_wl();
+
+        let (tx, _rx) = mpsc::sync_channel(1);
+        pending.lock().unwrap().insert(
+            "id-wl".into(),
+            PendingEntry {
+                action: ApprovalAction::RunCommand {
+                    program: "cargo".into(),
+                    args: vec!["test".into()],
+                },
+                tx,
+            },
+        );
+
+        let r = handle_approval_response(
+            &pending,
+            &cfg,
+            "id-wl",
+            "ou_admin",
+            None,
+            ApprovalDecisionDto::ApproveAndWhitelist,
+            &wl,
+            &wl_path,
+        );
+        let (_, decision, operator) = r.unwrap();
+        // worker 收到 Approved（不是 ApproveAndWhitelist）
+        assert_eq!(decision, ApprovalDecision::Approved);
+        assert_eq!(operator, Some("ou_admin".to_string()));
+
+        // runtime_whitelist 应包含该命令
+        let wl_guard = wl.lock().unwrap();
+        assert!(
+            wl_guard.command.contains(&"cargo:test".to_string()),
+            "runtime_whitelist 应包含 cargo:test，实际: {:?}",
+            wl_guard.command
+        );
+
+        // 文件应已持久化
+        assert!(wl_path.exists(), "runtime_whitelist.toml 应已创建");
+    }
+
+    #[test]
+    fn handle_response_approve_and_whitelist_rejected_for_non_admin() {
+        // 非白名单用户点击"批准并加入白名单"：应被拒绝，不加入 runtime_whitelist
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let cfg = ApprovalConfig {
+            timeout_secs: 60,
+            command: Some(vec![WhitelistEntry {
+                platform: "feishu".into(),
+                user: Some("ou_admin".into()),
+                group: None,
+            }]),
+            write: None,
+            delete: None,
+        };
+        let (wl, wl_path) = make_runtime_wl();
+
+        let (tx, _rx) = mpsc::sync_channel(1);
+        pending.lock().unwrap().insert(
+            "id-wl2".into(),
+            PendingEntry {
+                action: ApprovalAction::RunCommand {
+                    program: "cargo".into(),
+                    args: vec!["test".into()],
+                },
+                tx,
+            },
+        );
+
+        let r = handle_approval_response(
+            &pending,
+            &cfg,
+            "id-wl2",
+            "ou_other", // 非白名单用户
+            None,
+            ApprovalDecisionDto::ApproveAndWhitelist,
+            &wl,
+            &wl_path,
+        );
+        let (_, decision, _) = r.unwrap();
+        assert!(
+            matches!(decision, ApprovalDecision::Rejected(_)),
+            "非白名单用户应被拒绝"
+        );
+
+        // runtime_whitelist 不应包含该命令
+        let wl_guard = wl.lock().unwrap();
+        assert!(
+            wl_guard.command.is_empty(),
+            "非白名单用户的操作不应加入 runtime_whitelist"
+        );
     }
 }

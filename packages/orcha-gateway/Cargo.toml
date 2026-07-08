@@ -30,3 +30,5 @@ sqlite = ["orcha-core/sqlite"]
 # 启用 LLM 驱动调度（M7）：拉入 orcha-llm + orcha-core/llm，
 # 让 Gateway 能构造 LlmCycleround。无 LLM 场景用 --no-default-features。
 llm = ["dep:orcha-llm", "orcha-core/llm"]
+# Smoke 测试端点（纯文本 TCP，仅本地开发调试，生产关闭）
+smoke = []

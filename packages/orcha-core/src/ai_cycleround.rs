@@ -66,6 +66,13 @@ const SCHEDULER_SYSTEM: &str = r#"你是 Orcha 的调度大脑。根据任务和
 - 任何步骤失败，思考是重新执行（重新 planner / worker）还是调 fixer
 - 避免重复犯错：仔细看前序步骤的失败原因，换思路而非换写法
 
+策略切换规则（防止死循环）：
+- 同一 agent 连续失败 2 次后，必须换不同策略，不得反复调同一 agent
+  （例如 planner 连续失败 2 次，不要再调 planner，应改调 worker 直接执行，或调 fixer 修复基础设施）
+- Observer 只需调一次就够了，不要重复调用（workspace 状态已在历史摘要中）
+- Tester 失败后应调 fixer 或重新 worker，不要在 tester 上死循环
+- 若当前路径明显走不通（如 planner 多次生成的 JSON 都无法解析），换一条路径绕过去
+
 输出：调用 decide_next_agent 工具，给出 agent 名和决策理由。"#;
 
 /// AI 决策产出的下一步动作。
@@ -218,10 +225,14 @@ impl AiDrivenCycleround {
         let mut steps_total: Vec<StepResult> = Vec::new();
         let mut last_failed_agent: Option<String> = None;
         let mut consecutive_failures: u32 = 0;
+        // 硬约束跟踪：防止调度 LLM 产出无效决策序列
+        let mut observer_calls: u32 = 0; // Observer 总调用次数
+        let mut last_successful_worker_step: u32 = 0; // 最后一次 Worker 成功的 step_idx
+        let mut last_planner_step: u32 = 0; // 最后一次 Planner 成功的 step_idx
 
         for step_idx in 1..=self.config.max_rounds {
             let started_at = chrono::Utc::now();
-            let decision = match self.ai_decide(task, &steps_total, step_idx) {
+            let raw_decision = match self.ai_decide(task, &steps_total, step_idx) {
                 Ok(d) => d,
                 Err(e) => {
                     // 调度 LLM 决策失败：本步记失败，但继续下一轮，不死循环。
@@ -251,6 +262,16 @@ impl AiDrivenCycleround {
                 }
             };
 
+            // 硬约束校验：修正调度 LLM 的无效决策
+            let decision = self.validate_and_correct_decision(
+                raw_decision,
+                step_idx,
+                observer_calls,
+                last_successful_worker_step,
+                last_planner_step,
+                &steps_total,
+            );
+
             // AI 决策 exit → 任务完成
             if decision.agent == "exit" {
                 let rec = build_round(step_idx, started_at, Vec::new(), Vec::new());
@@ -263,11 +284,25 @@ impl AiDrivenCycleround {
                 };
             }
 
+            // 更新硬约束跟踪计数器
+            if decision.agent == "observer" {
+                observer_calls += 1;
+            }
+
             // 调对应 agent
             let ctx = StepContext::new(workspace, task.clone())
                 .with_priors(&Vec::new(), &artifacts)
                 .with_approval(self.approval.clone());
             let out = self.dispatch(&decision.agent, &ctx, step_idx);
+
+            // 成功时更新跟踪状态
+            if out.result.success {
+                match decision.agent.as_str() {
+                    "planner" => last_planner_step = step_idx,
+                    "worker" => last_successful_worker_step = step_idx,
+                    _ => {}
+                }
+            }
 
             let one_step = vec![out.result.clone()];
             let rec = build_round(step_idx, started_at, one_step, out.artifacts.clone());
@@ -302,6 +337,91 @@ impl AiDrivenCycleround {
             reason: FailureReason::MaxRoundsExceeded,
             history,
         }
+    }
+
+    /// 硬约束校验：修正调度 LLM 可能产出的无效决策。
+    ///
+    /// 这些规则是 prompt 约束之外的**代码级兜底**，确保即使 LLM 忽略
+    /// prompt 中的策略规则，也不会陷入重复 observer / 跳过 worker 调 reviewer
+    /// 等死循环。
+    fn validate_and_correct_decision(
+        &self,
+        decision: AiDecision,
+        step_idx: u32,
+        observer_calls: u32,
+        last_successful_worker_step: u32,
+        last_planner_step: u32,
+        steps_total: &[StepResult],
+    ) -> AiDecision {
+        // 规则 1：Observer 最多调 2 次，超过时强制改为 planner
+        if decision.agent == "observer" && observer_calls >= 2 {
+            eprintln!(
+                "[ai_cycleround] 第 {step_idx} 步：调度 LLM 决定调 observer，但已调 {observer_calls} 次，强制改为 planner"
+            );
+            return AiDecision {
+                agent: "planner".to_string(),
+                reason: format!(
+                    "（硬约束覆盖：observer 已调 {observer_calls} 次，强制切换）原决策: {}",
+                    decision.reason
+                ),
+            };
+        }
+
+        // 规则 2：Reviewer 必须在 Worker 成功后调用。
+        // 若自上次 Planner 成功以来没有 Worker 成功过，Reviewer 无产出可审。
+        if decision.agent == "reviewer"
+            && (last_successful_worker_step == 0
+                || last_successful_worker_step < last_planner_step)
+        {
+            eprintln!(
+                "[ai_cycleround] 第 {step_idx} 步：调度 LLM 决定调 reviewer，但尚无成功的 worker（last_worker={last_successful_worker_step} last_planner={last_planner_step}），强制改为 worker"
+            );
+            return AiDecision {
+                agent: "worker".to_string(),
+                reason: format!(
+                    "（硬约束覆盖：无 Worker 产出可供审核，强制改为 worker）原决策: {}",
+                    decision.reason
+                ),
+            };
+        }
+
+        // 规则 3：连续 3 次同一 agent 失败时，强制换一个不同 agent。
+        // 这里检查前序步骤：若最近 3 步都是同一 agent 且全部失败，当前决策仍是
+        // 同一 agent 则强制更换。
+        if steps_total.len() >= 3 {
+            let last_3: Vec<&StepResult> =
+                steps_total.iter().rev().take(3).collect();
+            if last_3.len() == 3
+                && last_3.iter().all(|s| !s.success)
+                && last_3
+                    .iter()
+                    .all(|s| s.step_id.contains(&decision.agent))
+                && decision.agent != "exit"
+            {
+                // 强制换一个不同的 agent
+                let fallback = match decision.agent.as_str() {
+                    "planner" => "worker",
+                    "worker" => "planner",
+                    "reviewer" => "planner",
+                    "fixer" => "planner",
+                    "tester" => "fixer",
+                    _ => "planner",
+                };
+                eprintln!(
+                    "[ai_cycleround] 第 {step_idx} 步：{agent} 已连续失败 3 次，强制改为 {fallback}",
+                    agent = decision.agent
+                );
+                return AiDecision {
+                    agent: fallback.to_string(),
+                    reason: format!(
+                        "（硬约束覆盖：{} 连续失败 3 次，强制切换为 {}）原决策: {}",
+                        decision.agent, fallback, decision.reason
+                    ),
+                };
+            }
+        }
+
+        decision
     }
 
     /// 调用调度 LLM 产出下一步决策。
@@ -369,19 +489,74 @@ fn decide_next_agent_tool() -> ToolDefinition {
 /// 把前序 StepResult 列表压缩成调度 LLM 可读的摘要。
 ///
 /// 格式：`{idx}. [✓|✗] {step_id}: {summary}`
+///
+/// 策略：
+/// - 只保留最近 15 步（避免超长历史撑爆调度 LLM 的 prompt）
+/// - 超过 15 步时前缀标注 "… 前 N 步已省略"
+/// - 对 planner step，在 summary 中补充 target_files 前 3 项的摘要（助调度 LLM 判断方向）
 fn summarize_steps(steps: &[StepResult]) -> String {
     if steps.is_empty() {
         return "（无）".to_string();
     }
-    steps
-        .iter()
-        .enumerate()
-        .map(|(i, s)| {
-            let status = if s.success { "✓" } else { "✗" };
-            format!("{}. [{status}] {}: {}", i + 1, s.step_id, s.summary)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+
+    let max_recent = 15;
+    let total = steps.len();
+    let skip = total.saturating_sub(max_recent);
+
+    let mut lines: Vec<String> = Vec::new();
+
+    if skip > 0 {
+        lines.push(format!("… 前 {skip} 步已省略（共 {total} 步），仅显示最近 {max_recent} 步："));
+    }
+
+    for (i, s) in steps.iter().skip(skip).enumerate() {
+        let idx = skip + i + 1;
+        let status = if s.success { "✓" } else { "✗" };
+
+        // planner 的 summary 只有 "LLM 计划已生成（N 字节）"，对调度没有帮助。
+        // 对失败的 planner，保留完整错误信息；对成功的，简化为一行。
+        let short_summary = if s.step_id.contains("planner") {
+            if s.success {
+                "✅ 计划已生成".to_string()
+            } else {
+                // 保留解析错误的前 120 字符，让调度 LLM 知道为什么失败
+                let trimmed = s.summary.chars().take(120).collect::<String>();
+                if s.summary.len() > 120 {
+                    format!("❌ {trimmed}…")
+                } else {
+                    format!("❌ {trimmed}")
+                }
+            }
+        } else if s.summary.len() > 200 {
+            let trimmed: String = s.summary.chars().take(200).collect();
+            format!("{trimmed}…")
+        } else {
+            s.summary.clone()
+        };
+
+        lines.push(format!("{idx}. [{status}] {}: {short_summary}", s.step_id));
+    }
+
+    // 额外提示：如果最近几步都是同一 agent 反复失败，加一个明确的警告
+    if steps.len() >= 3 {
+        let last_3: Vec<&StepResult> = steps.iter().rev().take(3).collect();
+        if last_3.len() == 3
+            && last_3.iter().all(|s| !s.success)
+            && last_3[0].step_id.contains(&last_3[1].step_id[2..4])
+            && last_3[1].step_id.contains(&last_3[2].step_id[2..4])
+        {
+            let agent_hint = last_3[0]
+                .step_id
+                .split('-')
+                .nth(1)
+                .unwrap_or("unknown");
+            lines.push(format!(
+                "⚠️ 警告：{agent_hint} 已连续失败 3 次，请务必换不同策略！"
+            ));
+        }
+    }
+
+    lines.join("\n")
 }
 
 /// 解析 LLM 响应为 [`AiDecision`]。
@@ -432,10 +607,14 @@ fn run_inner_streaming(
         let mut steps_total: Vec<StepResult> = Vec::new();
         let mut last_failed_agent: Option<String> = None;
         let mut consecutive_failures: u32 = 0;
+        // 硬约束跟踪
+        let mut observer_calls: u32 = 0;
+        let mut last_successful_worker_step: u32 = 0;
+        let mut last_planner_step: u32 = 0;
 
         for step_idx in 1..=cycle.config.max_rounds {
             let started_at = chrono::Utc::now();
-            let decision = match cycle.ai_decide(&task, &steps_total, step_idx) {
+            let raw_decision = match cycle.ai_decide(&task, &steps_total, step_idx) {
                 Ok(d) => d,
                 Err(e) => {
                     let fail_step = format!("S-scheduler-{step_idx}");
@@ -476,6 +655,16 @@ fn run_inner_streaming(
                 }
             };
 
+            // 硬约束校验
+            let decision = cycle.validate_and_correct_decision(
+                raw_decision,
+                step_idx,
+                observer_calls,
+                last_successful_worker_step,
+                last_planner_step,
+                &steps_total,
+            );
+
             if decision.agent == "exit" {
                 let _ = tx.send(RoundEvent::AgentStarted {
                     round: step_idx,
@@ -500,6 +689,11 @@ fn run_inner_streaming(
                 };
             }
 
+            // 更新硬约束跟踪计数器
+            if decision.agent == "observer" {
+                observer_calls += 1;
+            }
+
             let ctx = StepContext::new(&workspace, task.clone())
                 .with_priors(&Vec::new(), &artifacts)
                 .with_approval(cycle.approval.clone());
@@ -514,6 +708,15 @@ fn run_inner_streaming(
                 success: out.result.success,
                 message: out.result.summary.clone(),
             });
+
+            // 成功时更新跟踪状态
+            if out.result.success {
+                match decision.agent.as_str() {
+                    "planner" => last_planner_step = step_idx,
+                    "worker" => last_successful_worker_step = step_idx,
+                    _ => {}
+                }
+            }
 
             let one_step = vec![out.result.clone()];
             let rec = build_round(step_idx, started_at, one_step, out.artifacts.clone());
@@ -756,12 +959,13 @@ mod tests {
     fn max_retries_exceeded_on_repeated_agent_failure() {
         // AI 反复决策 planner，但 planner LLM 每次返回非法 JSON，连续失败 3 次。
         // 触达 max_retries=2 时熔断。
+        // 注：Planner 解析失败后会重试一次（再调一次 chat），所以每轮 planner 需要 2 个 text。
         let ws = tempfile::tempdir().unwrap();
         let mut responses = Vec::new();
-        // 3 轮：decide(planner) + planner 返回非法 JSON
         for _ in 0..10 {
             responses.push(AiTestClient::tool_call("planner", "重试规划"));
             responses.push(AiTestClient::text("not a json"));
+            responses.push(AiTestClient::text("still not json"));
         }
         let client = AiTestClient::new(responses);
         let cycle = AiDrivenCycleround::new(

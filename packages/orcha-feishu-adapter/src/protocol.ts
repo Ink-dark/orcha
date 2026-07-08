@@ -73,7 +73,8 @@ export type ApprovalActionDto =
 /** 审批决策（与 Rust enum 对齐）。 */
 export type ApprovalDecisionDto =
   | { type: 'approved' }
-  | { type: 'rejected'; reason: string };
+  | { type: 'rejected'; reason: string }
+  | { type: 'approve_and_whitelist'; reason?: string };
 
 /**
  * M7 P1：审批卡片按钮回调。Adapter 收到飞书 `card.action.trigger` 后转发，

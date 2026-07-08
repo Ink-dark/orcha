@@ -174,6 +174,20 @@ function createIpcClient(cfg: AdapterConfig, feishuClient: FeishuClient): IpcCli
 
 /** 飞书触发 → 转 IPC Trigger 消息。 */
 function onWebhookTrigger(event: FeishuEvent, ipcClient: IpcClient): void {
+  const trimmed = event.description.trim();
+  // /stop / /cancel：发 Reply 消息让 Gateway 取消任务，不发 Trigger
+  if (trimmed === '/stop' || trimmed === '/cancel' || trimmed.startsWith('/stop ') || trimmed.startsWith('/cancel ')) {
+    const replyMsg: AdapterToGateway = {
+      type: 'reply',
+      task_id: '',
+      content: event.description,
+      session: event.session,
+    };
+    const ok = ipcClient.send(replyMsg);
+    console.log(`[adapter] 取消命令已转发: session=${event.session} content=${event.description} ok=${ok}`);
+    return;
+  }
+
   const source = eventToTriggerSource(event);
   // task_id 留空，让 Gateway 用 Task::generate_id() 生成
   const msg: AdapterToGateway = {
