@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: .exe
+            rustflags: ''
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            ext: ''
+            rustflags: ''
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build Gateway
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build -p orcha-gateway --features "llm,smoke" --release --target ${{ matrix.target }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build Adapter
+        run: |
+          cd packages/orcha-feishu-adapter
+          npm ci
+          npm run build
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $pkg = "orcha-v${{ github.ref_name }}-windows-x86_64"
+          New-Item -ItemType Directory -Path $pkg -Force
+          Copy-Item target/${{ matrix.target }}/release/orcha-gateway${{ matrix.ext }} $pkg/
+          Copy-Item install.ps1 $pkg/
+          Copy-Item -Recurse scripts $pkg/scripts
+          Copy-Item -Recurse packages/orcha-feishu-adapter/dist $pkg/packages/orcha-feishu-adapter/dist
+          Copy-Item -Recurse docs $pkg/docs
+          Copy-Item README.md $pkg/
+          Compress-Archive -Path $pkg -DestinationPath "$pkg.zip"
+          echo "asset=$pkg.zip" >> $env:GITHUB_ENV
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          pkg="orcha-${{ github.ref_name }}-linux-x86_64"
+          mkdir -p "$pkg/scripts" "$pkg/packages/orcha-feishu-adapter/dist" "$pkg/docs"
+          cp target/${{ matrix.target }}/release/orcha-gateway "$pkg/"
+          cp -r scripts/*.sh scripts/dev-env.ps1.example "$pkg/scripts/" 2>/dev/null || true
+          cp -r packages/orcha-feishu-adapter/dist "$pkg/packages/orcha-feishu-adapter/"
+          cp -r docs "$pkg/"
+          cp README.md "$pkg/"
+          tar -czf "$pkg.tar.gz" "$pkg"
+          echo "asset=$pkg.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ runner.os }}-binary
+          path: ${{ env.asset }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: '*'
+          merge-multiple: true
+
+      - name: List Assets
+        run: ls -la artifacts/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Orcha ${{ github.ref_name }}
+          body_path: RELEASE_v0.1.0-beta.md
+          files: artifacts/*
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
