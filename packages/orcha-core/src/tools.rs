@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use orcha_llm::{ChatMessage, LlmClient, LlmError, ToolDefinition, strip_xml_tool_calls};
+use orcha_llm::{strip_xml_tool_calls, ChatMessage, LlmClient, LlmError, ToolDefinition};
 
 use crate::approval::{ApprovalAction, ApprovalDecision, ApprovalHook};
 use crate::audit::AuditLogger;
@@ -703,19 +703,9 @@ pub fn run_agent_loop(
             for (name, args_json) in &dsml_calls {
                 let args: serde_json::Value =
                     serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
-                let result = execute_tool(
-                    name,
-                    &args,
-                    workspace,
-                    guard,
-                    agent_name,
-                    audit,
-                    approval,
-                );
-                messages.push(ChatMessage::tool(
-                    format!("dsml-{name}"),
-                    result,
-                ));
+                let result =
+                    execute_tool(name, &args, workspace, guard, agent_name, audit, approval);
+                messages.push(ChatMessage::tool(format!("dsml-{name}"), result));
             }
             continue;
         }
@@ -750,7 +740,11 @@ pub fn run_agent_loop(
     let text = client.chat(&messages)?;
     let cleaned = strip_xml_tool_calls(&text);
     if cleaned != text {
-        eprintln!("[{agent_name}] 最终输出剥除了 DSML 块（{} → {} 字节）", text.len(), cleaned.len());
+        eprintln!(
+            "[{agent_name}] 最终输出剥除了 DSML 块（{} → {} 字节）",
+            text.len(),
+            cleaned.len()
+        );
     }
     Ok(cleaned)
 }
@@ -834,7 +828,10 @@ fn parse_dsml_tool_calls(content: &str) -> Vec<(String, String)> {
 
                 // 去掉可能的前后空白
                 let trimmed_value = value.trim();
-                params.insert(p_name.to_string(), serde_json::Value::String(trimmed_value.to_string()));
+                params.insert(
+                    p_name.to_string(),
+                    serde_json::Value::String(trimmed_value.to_string()),
+                );
             }
 
             let args_json = serde_json::to_string(&serde_json::Value::Object(params))

@@ -370,8 +370,7 @@ impl AiDrivenCycleround {
         // 规则 2：Reviewer 必须在 Worker 成功后调用。
         // 若自上次 Planner 成功以来没有 Worker 成功过，Reviewer 无产出可审。
         if decision.agent == "reviewer"
-            && (last_successful_worker_step == 0
-                || last_successful_worker_step < last_planner_step)
+            && (last_successful_worker_step == 0 || last_successful_worker_step < last_planner_step)
         {
             eprintln!(
                 "[ai_cycleround] 第 {step_idx} 步：调度 LLM 决定调 reviewer，但尚无成功的 worker（last_worker={last_successful_worker_step} last_planner={last_planner_step}），强制改为 worker"
@@ -389,13 +388,10 @@ impl AiDrivenCycleround {
         // 这里检查前序步骤：若最近 3 步都是同一 agent 且全部失败，当前决策仍是
         // 同一 agent 则强制更换。
         if steps_total.len() >= 3 {
-            let last_3: Vec<&StepResult> =
-                steps_total.iter().rev().take(3).collect();
+            let last_3: Vec<&StepResult> = steps_total.iter().rev().take(3).collect();
             if last_3.len() == 3
                 && last_3.iter().all(|s| !s.success)
-                && last_3
-                    .iter()
-                    .all(|s| s.step_id.contains(&decision.agent))
+                && last_3.iter().all(|s| s.step_id.contains(&decision.agent))
                 && decision.agent != "exit"
             {
                 // 强制换一个不同的 agent
@@ -506,7 +502,9 @@ fn summarize_steps(steps: &[StepResult]) -> String {
     let mut lines: Vec<String> = Vec::new();
 
     if skip > 0 {
-        lines.push(format!("… 前 {skip} 步已省略（共 {total} 步），仅显示最近 {max_recent} 步："));
+        lines.push(format!(
+            "… 前 {skip} 步已省略（共 {total} 步），仅显示最近 {max_recent} 步："
+        ));
     }
 
     for (i, s) in steps.iter().skip(skip).enumerate() {
@@ -545,11 +543,7 @@ fn summarize_steps(steps: &[StepResult]) -> String {
             && last_3[0].step_id.contains(&last_3[1].step_id[2..4])
             && last_3[1].step_id.contains(&last_3[2].step_id[2..4])
         {
-            let agent_hint = last_3[0]
-                .step_id
-                .split('-')
-                .nth(1)
-                .unwrap_or("unknown");
+            let agent_hint = last_3[0].step_id.split('-').nth(1).unwrap_or("unknown");
             lines.push(format!(
                 "⚠️ 警告：{agent_hint} 已连续失败 3 次，请务必换不同策略！"
             ));
