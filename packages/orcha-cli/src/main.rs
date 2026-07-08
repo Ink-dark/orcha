@@ -491,6 +491,7 @@ fn build_fix_result(
                 FailureReason::MaxRoundsExceeded => "MaxRoundsExceeded",
                 FailureReason::MaxRetriesExceeded => "MaxRetriesExceeded",
                 FailureReason::Panic => "Panic",
+                FailureReason::Cancelled => "Cancelled",
             }),
             history.len(),
         ),

@@ -30,10 +30,10 @@ use crate::cycleround::{build_round, persist_round};
 use crate::history::HistoryStore;
 use crate::memory::{MemoryEntry, MemoryStore};
 use crate::path_guard::PathGuard;
-use crate::plan::{apply_step, check_diff_scope, PlanAction, PlanStep};
+use crate::plan::{apply_step, check_diff_scope, extract_changed_files, PlanAction, PlanStep};
 use crate::sub_agent::{StepContext, StepOutput, SubAgent};
 use crate::sub_agents::{list_workspace_files, Fixer, Observer, Tester};
-use crate::tools::{all_tools, run_agent_loop, MAX_TOOL_TURNS};
+use crate::tools::{readonly_tools, run_agent_loop, MAX_TOOL_TURNS};
 use crate::{CycleConfig, CycleOutcome, FailureReason, RoundRecord};
 
 /// LLM 驱动的 Planner：调 LLM 产出 JSON 计划。
@@ -67,7 +67,7 @@ impl LlmPlanner {
             files.join(", ")
         };
 
-        let guard = match PathGuard::new(&ctx.workspace) {
+        let _guard = match PathGuard::new(&ctx.workspace) {
             Ok(g) => g,
             Err(e) => {
                 return StepOutput::failure("S-planner", format!("PathGuard 初始化失败: {e}"));
@@ -77,24 +77,18 @@ impl LlmPlanner {
         let mut msgs = vec![
             ChatMessage::system(PLANNER_SYSTEM),
             ChatMessage::user(format!(
-                "任务：{}\n\n当前 workspace 文件：{files_str}\n\n先用工具探索 workspace，然后输出 JSON 计划。",
+                "任务：{}\n\n\
+                 workspace 摘要（Observer 自动检测）：\n{files_str}\n\n\
+                 注意：以上摘要已标明项目类型和语言，你只能在该技术栈范围内制定计划。\n\
+                 直接输出 JSON 计划，不要调用工具，不要输出解释性文字。",
                 ctx.task.description
             )),
         ];
         inject_memory(&mut msgs, &self.memory, &ctx.task.id);
 
-        let tools = all_tools();
-        let resp = match run_agent_loop(
-            self.client.as_ref(),
-            msgs,
-            &tools,
-            &ctx.workspace,
-            &guard,
-            "planner",
-            None,
-            MAX_TOOL_TURNS,
-            Some(ctx.approval.as_ref()),
-        ) {
+        // Planner 直接用 chat()，不传 tools，避免 DeepSeek 进入 tool-calling 模式
+        // 输出 XML 而非 JSON 计划。
+        let resp = match self.client.chat(&msgs) {
             Ok(s) => s,
             Err(e) => {
                 return StepOutput::failure("S-planner", format!("LLM 调用失败: {e}"));
@@ -105,11 +99,12 @@ impl LlmPlanner {
 
         match parse_planner_output(&resp) {
             Ok(plan_json) => {
+                // 把 plan JSON 原文存到 artifact.patch，Worker 可以直接读到完整计划
                 let artifact = Artifact {
                     artifact_id: next_artifact_id(&ctx.prior_artifacts, "planner"),
                     artifact_type: ArtifactType::Report,
                     commit_sha: None,
-                    patch: None,
+                    patch: Some(plan_json.clone()),
                     url: None,
                 };
                 StepOutput::success(
@@ -118,8 +113,55 @@ impl LlmPlanner {
                 )
                 .with_artifacts(vec![artifact])
             }
-            Err(e) => {
-                StepOutput::failure("S-planner", format!("解析 LLM 输出失败: {e}; raw={resp}"))
+            Err(first_err) => {
+                // 重试一次：把解析错误喂回 LLM，让它修正 JSON 格式
+                let retry_msgs = vec![
+                    ChatMessage::system(PLANNER_SYSTEM),
+                    ChatMessage::user(format!(
+                        "你上一次的输出 JSON 解析失败，错误信息：{first_err}\n\n\
+                         请检查 JSON 格式，确保：\n\
+                         1. 字符串值中的换行符用 \\\\n 转义，不得出现字面换行\n\
+                         2. 不要在 JSON 前后输出任何解释文字\n\
+                         3. 第一个字符必须是 '{{'\n\n\
+                         任务：{}\n当前 workspace 文件：{files_str}\n\n\
+                         请重新输出正确的 JSON 计划。",
+                        ctx.task.description
+                    )),
+                ];
+                let retry_resp = match self.client.chat(&retry_msgs) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return StepOutput::failure(
+                            "S-planner",
+                            format!("LLM 重试调用失败: {e}（首次错误: {first_err}）"),
+                        );
+                    }
+                };
+                append_memory(&self.memory, &ctx.task.id, round, "planner", &retry_resp);
+                match parse_planner_output(&retry_resp) {
+                    Ok(plan_json) => {
+                        let artifact = Artifact {
+                            artifact_id: next_artifact_id(&ctx.prior_artifacts, "planner"),
+                            artifact_type: ArtifactType::Report,
+                            commit_sha: None,
+                            patch: Some(plan_json.clone()),
+                            url: None,
+                        };
+                        StepOutput::success(
+                            "S-planner",
+                            format!("LLM 计划已生成（{} 字节，重试后成功）", plan_json.len()),
+                        )
+                        .with_artifacts(vec![artifact])
+                    }
+                    Err(retry_err) => {
+                        StepOutput::failure(
+                            "S-planner",
+                            format!(
+                                "解析 LLM 输出失败（重试后仍失败）: {retry_err}; 首次错误: {first_err}"
+                            ),
+                        )
+                    }
+                }
             }
         }
     }
@@ -157,18 +199,22 @@ impl LlmWorker {
     }
 
     pub fn run_at(&self, ctx: &StepContext, round: u32) -> StepOutput {
-        let plan_text = ctx
+        // 从 Planner artifact 中提取 plan JSON 原文。
+        // patch 字段存储的是 Planner 输出的完整 JSON 计划（含 target_files + steps）。
+        let plan_json: Option<String> = ctx
             .prior_artifacts
             .iter()
             .rev()
             .find(|a| a.artifact_id.contains("planner"))
-            .map(|a| a.artifact_id.clone())
-            .unwrap_or_default();
+            .and_then(|a| a.patch.clone());
 
-        let plan_summary = if plan_text.is_empty() {
-            "(无前序 plan，请直接产出文件)".to_string()
-        } else {
-            format!("参考 planner artifact {}", plan_text)
+        let plan_section = match &plan_json {
+            Some(json) => format!(
+                "Planner 的详细计划（JSON）：\n```json\n{json}\n```\n\n\
+                 请严格按照以上计划执行：每个 step 的 action / path / search / replace / content 都已指定。\
+                 如果某 step 是 edit 但目标文件不存在，改为 create 并用 replace 作为 content。"
+            ),
+            None => "(无前序 plan，请基于任务描述和工具探查自行决定)。".to_string(),
         };
 
         let guard = match PathGuard::new(&ctx.workspace) {
@@ -181,13 +227,15 @@ impl LlmWorker {
         let mut msgs = vec![
             ChatMessage::system(WORKER_SYSTEM),
             ChatMessage::user(format!(
-                "任务：{}\n\n计划摘要：{plan_summary}\n\n先用工具读取需要修改的文件，确认内容后再输出 JSON。",
+                "任务：{}\n\n{plan_section}\n\n先用工具读取需要修改的文件，确认内容后再输出 JSON。",
                 ctx.task.description
             )),
         ];
         inject_memory(&mut msgs, &self.memory, &ctx.task.id);
 
-        let tools = all_tools();
+        // Worker 只用只读工具（read_file/grep/glob/list_dir），不能跑命令。
+        // 编译验证是 Tester 的职责——Worker 的任务是读文件、理解代码、输出改动 JSON。
+        let tools = readonly_tools();
         let resp = match run_agent_loop(
             self.client.as_ref(),
             msgs,
@@ -208,13 +256,44 @@ impl LlmWorker {
         append_memory(&self.memory, &ctx.task.id, round, "worker", &resp);
 
         // 优先解析 steps（edit/create/delete，推荐）；无 steps 时回退 files（旧整文件格式）。
+        // 解析失败时重试一次：把错误喂回 LLM 让它修正 JSON。
         let output = match parse_worker_output_with_steps(&resp) {
             Ok(o) => o,
-            Err(e) => {
-                return StepOutput::failure(
-                    "S-worker",
-                    format!("解析 LLM 输出失败: {e}; raw={resp}"),
-                );
+            Err(first_err) => {
+                let retry_msgs = vec![
+                    ChatMessage::system(WORKER_SYSTEM),
+                    ChatMessage::user(format!(
+                        "你上一次的输出 JSON 解析失败，错误信息：{first_err}\n\n\
+                         请检查 JSON 格式，确保：\n\
+                         1. 字符串值中的换行符用 \\\\n 转义，不得出现字面换行\n\
+                         2. 不要在 JSON 前后输出解释文字，第一个字符必须是 '{{'\n\
+                         3. 使用 edit（search/replace）修改已存在文件\n\n\
+                         任务：{}\n{plan_section}\n\n\
+                         请重新输出正确的 JSON。",
+                        ctx.task.description
+                    )),
+                ];
+                let retry_resp = match self.client.chat(&retry_msgs) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        return StepOutput::failure(
+                            "S-worker",
+                            format!("LLM 重试调用失败: {e}（首次错误: {first_err}）"),
+                        );
+                    }
+                };
+                append_memory(&self.memory, &ctx.task.id, round, "worker", &retry_resp);
+                match parse_worker_output_with_steps(&retry_resp) {
+                    Ok(o) => o,
+                    Err(retry_err) => {
+                        return StepOutput::failure(
+                            "S-worker",
+                            format!(
+                                "解析 LLM 输出失败（重试后仍失败）: {retry_err}; 首次错误: {first_err}"
+                            ),
+                        );
+                    }
+                }
             }
         };
 
@@ -276,7 +355,8 @@ impl LlmWorker {
                         content_preview: preview,
                     };
                     match ctx.approval.request(&action) {
-                        crate::approval::ApprovalDecision::Approved => {}
+                        crate::approval::ApprovalDecision::Approved
+                        | crate::approval::ApprovalDecision::ApproveAndWhitelist => {}
                         crate::approval::ApprovalDecision::Rejected(reason) => {
                             return StepOutput::failure(
                                 "S-worker",
@@ -296,10 +376,44 @@ impl LlmWorker {
                     let applied = match apply_step(&ctx.workspace, &step) {
                         Ok(a) => a,
                         Err(e) => {
-                            return StepOutput::failure(
-                                "S-worker",
-                                format!("apply_step 失败 {} ({:?}): {e}", ws.path, plan_action),
-                            );
+                            // 自动修复：edit 失败因为文件不存在 → 降级为 create
+                            let err_msg = e.to_string();
+                            if plan_action == PlanAction::Edit
+                                && err_msg.contains("文件不存在")
+                                && ws.replace.is_some()
+                            {
+                                eprintln!(
+                                    "[worker] edit 失败（文件不存在），自动降级为 create: {}",
+                                    ws.path
+                                );
+                                let create_step = PlanStep {
+                                    action: PlanAction::Create,
+                                    path: ws.path.clone(),
+                                    content: ws.replace.clone(),
+                                    search: None,
+                                    replace: None,
+                                };
+                                match apply_step(&ctx.workspace, &create_step) {
+                                    Ok(a) => a,
+                                    Err(e2) => {
+                                        return StepOutput::failure(
+                                            "S-worker",
+                                            format!(
+                                                "apply_step 失败 {} (降级 create 仍失败): {e2}",
+                                                ws.path
+                                            ),
+                                        );
+                                    }
+                                }
+                            } else {
+                                return StepOutput::failure(
+                                    "S-worker",
+                                    format!(
+                                        "apply_step 失败 {} ({:?}): {e}",
+                                        ws.path, plan_action
+                                    ),
+                                );
+                            }
                         }
                     };
                     combined_patch.push_str(&applied.diff);
@@ -335,7 +449,8 @@ impl LlmWorker {
                         content_preview: preview,
                     };
                     match ctx.approval.request(&action) {
-                        crate::approval::ApprovalDecision::Approved => {}
+                        crate::approval::ApprovalDecision::Approved
+                        | crate::approval::ApprovalDecision::ApproveAndWhitelist => {}
                         crate::approval::ApprovalDecision::Rejected(reason) => {
                             return StepOutput::failure(
                                 "S-worker",
@@ -428,13 +543,24 @@ impl LlmReviewer {
         }
 
         // 收集 worker 产出的 patch 文本，做 diff scope 校验。
-        // target_files 派生：从 task.description 抽取声明路径（兼容旧路径，无声明则不强制）。
         let combined_patch: String = worker_artifacts
             .iter()
             .filter_map(|a| a.patch.as_deref())
             .collect::<Vec<_>>()
             .join("\n");
-        let target_files = derive_target_files_from_task(&ctx.task.description);
+
+        // target_files 派生优先级：
+        // 1. 从 Planner plan JSON 中提取 target_files（新路径，M7）
+        // 2. 从 task.description 解析（旧格式兼容）
+        // 3. 上述都失败：从 patch 本身提取文件列表作为回退白名单
+        let mut target_files = extract_target_files_from_plan(&ctx.prior_artifacts);
+        if target_files.is_empty() {
+            target_files = derive_target_files_from_task(&ctx.task.description);
+        }
+        if target_files.is_empty() {
+            // 回退：从 patch 中提取改动的文件路径，至少确保不超出 Worker 自声明范围
+            target_files = extract_changed_files(&combined_patch);
+        }
         if !target_files.is_empty() {
             if let Err(e) = check_diff_scope(&combined_patch, &target_files) {
                 return StepOutput::failure("S-reviewer", format!("diff 范围越界: {e}"));
@@ -501,26 +627,59 @@ impl LlmReviewer {
     }
 }
 
-/// 从 task.description 派生 target_files 期望集合。
+/// 从 task.description 和 Planner plan artifact 中派生 target_files 期望集合。
 ///
-/// 兼容 M2/M3 任务描述格式 `"创建 <filename> 输出 <content>"`：派生为 `[filename]`。
-/// M4 新格式（待 Planner 产 Plan 后启用）：直接从 Plan.target_files 取。
-/// 无法派生时返回空 Vec，表示不强制（兼容老测试）。
+/// 优先级：
+/// 1. 优先从 Planner artifact 的 patch 中解析 plan JSON，提取 target_files
+/// 2. 兼容 M2/M3 旧格式 `"创建 <filename> 输出 <content>"`：派生为 `[filename]`
+/// 3. 上述两种都失败时：从 Worker 本身的 diff 中提取改动文件列表作为回退白名单
+///    （至少能校验 patch 没有超出 Worker 自己声明的范围）
 fn derive_target_files_from_task(desc: &str) -> Vec<String> {
-    let desc = desc.trim();
     // 兼容旧格式
-    if let Some(after) = desc
-        .strip_prefix("创建 ")
-        .or_else(|| desc.strip_prefix("create "))
-    {
-        if let Some(output_idx) = after.find(" 输出 ").or_else(|| after.find(" output ")) {
-            let filename = after[..output_idx].trim().to_string();
-            if !filename.is_empty() {
-                return vec![filename];
+    if let Some(files) = try_parse_old_format(desc) {
+        return files;
+    }
+    Vec::new()
+}
+
+/// 从 Planner artifact 的 plan JSON 中提取 target_files。
+///
+/// Planner 把 plan JSON 存在 `artifact.patch` 字段（M7）。
+/// 解析出 `target_files` 数组作为 Reviewer scope check 的白名单。
+fn extract_target_files_from_plan(artifacts: &[Artifact]) -> Vec<String> {
+    for a in artifacts.iter().rev() {
+        if !a.artifact_id.contains("planner") {
+            continue;
+        }
+        if let Some(json_str) = &a.patch {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(json_str) {
+                if let Some(arr) = v.get("target_files").and_then(|f| f.as_array()) {
+                    let files: Vec<String> = arr
+                        .iter()
+                        .filter_map(|f| f.as_str().map(String::from))
+                        .collect();
+                    if !files.is_empty() {
+                        return files;
+                    }
+                }
             }
         }
     }
     Vec::new()
+}
+
+/// 从 task description 解析 M2/M3 旧格式 "创建 <filename> 输出 <content>"。
+fn try_parse_old_format(desc: &str) -> Option<Vec<String>> {
+    let desc = desc.trim();
+    let after = desc
+        .strip_prefix("创建 ")
+        .or_else(|| desc.strip_prefix("create "))?;
+    let output_idx = after.find(" 输出 ").or_else(|| after.find(" output "))?;
+    let filename = after[..output_idx].trim().to_string();
+    if filename.is_empty() {
+        return None;
+    }
+    Some(vec![filename])
 }
 
 impl SubAgent for LlmReviewer {

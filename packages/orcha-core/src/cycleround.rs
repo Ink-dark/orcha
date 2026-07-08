@@ -114,6 +114,8 @@ pub enum FailureReason {
     /// 仅事件流路径会出现此原因；同步 [`Cycleround::run`] /
     /// [`Cycleround::run_with_history`] 不捕获 panic，直接传播给调用方。
     Panic,
+    /// 管理员通过 `/stop` 命令手动取消任务。
+    Cancelled,
 }
 
 /// M6 事件流：`run_streaming` 在每步前后推送的事件，供 Gateway 实时消费进度。

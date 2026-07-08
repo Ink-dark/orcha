@@ -77,6 +77,12 @@ pub struct IpcConfig {
     /// TCP 端口（kind=tcp 或 fallback 时使用，默认 7422）。
     #[serde(default = "default_ipc_port")]
     pub port: u16,
+
+    /// Smoke 测试端口（纯文本 TCP，一行 = 一个任务）。0 = 禁用。默认 7423。
+    /// 仅 `smoke` feature 启用时编译。
+    #[cfg(feature = "smoke")]
+    #[serde(default = "default_smoke_port")]
+    pub smoke_port: u16,
 }
 
 fn default_ipc_kind() -> String {
@@ -86,12 +92,18 @@ fn default_ipc_kind() -> String {
 fn default_ipc_port() -> u16 {
     7422
 }
+#[cfg(feature = "smoke")]
+fn default_smoke_port() -> u16 {
+    7423
+}
 
 impl Default for IpcConfig {
     fn default() -> Self {
         Self {
             kind: default_ipc_kind(),
             port: default_ipc_port(),
+            #[cfg(feature = "smoke")]
+            smoke_port: default_smoke_port(),
         }
     }
 }
@@ -108,7 +120,10 @@ pub struct CycleConfigToml {
 }
 
 fn default_max_rounds() -> u32 {
-    10
+    // AI 驱动模式下每步 = 1 次 LLM 决策 + 1 次 agent 执行，
+    // 一个完整的 Plan→Code→Test→Review→exit 链路约需 6-8 步，
+    // 含重试和回退需要更多余量。默认 30 步保证复杂任务有足够空间。
+    30
 }
 fn default_max_retries() -> u32 {
     3
@@ -361,6 +376,7 @@ impl GatewayConfig {
             model: self.llm.model.clone(),
             timeout: std::time::Duration::from_secs(120),
             temperature: 0.2,
+            max_tokens: Some(16384),
             max_retries: 3,
             retry_base_ms: 1000,
         };
@@ -395,7 +411,7 @@ mod tests {
     fn default_config_has_sensible_values() {
         let cfg = GatewayConfig::default();
         assert_eq!(cfg.workers, 2);
-        assert_eq!(cfg.cycle.max_rounds, 10);
+        assert_eq!(cfg.cycle.max_rounds, 30);
         assert_eq!(cfg.cycle.max_retries, 3);
         assert_eq!(cfg.cycle.cool_down_secs, 60);
     }
@@ -436,7 +452,7 @@ mod tests {
     fn cycle_config_conversion() {
         let cfg = GatewayConfig::default();
         let cc = cfg.cycle_config();
-        assert_eq!(cc.max_rounds, 10);
+        assert_eq!(cc.max_rounds, 30);
         assert_eq!(cc.max_retries, 3);
         assert_eq!(cc.cool_down, std::time::Duration::from_secs(60));
     }

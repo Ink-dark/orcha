@@ -1,17 +1,19 @@
 use std::path::Path;
 use std::process::Command;
 
-use orcha_llm::{ChatMessage, LlmClient, LlmError, ToolDefinition};
+use orcha_llm::{ChatMessage, LlmClient, LlmError, ToolDefinition, strip_xml_tool_calls};
 
 use crate::approval::{ApprovalAction, ApprovalDecision, ApprovalHook};
 use crate::audit::AuditLogger;
 use crate::path_guard::PathGuard;
 
 /// agent loop 最大工具调用轮次。
-pub const MAX_TOOL_TURNS: usize = 5;
+pub const MAX_TOOL_TURNS: usize = 10;
 
-/// 构建所有可用工具的定义。
-pub fn all_tools() -> Vec<ToolDefinition> {
+/// 构建只读工具（用于 Worker agent loop）。
+/// Worker 只能读文件、搜索、浏览目录，不能跑命令。
+/// 编译验证是 Tester 的职责，Worker 不应越权。
+pub fn readonly_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::new(
             "read_file",
@@ -21,7 +23,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "相对于 workspace 根目录的文件路径，例如 src/main.py"
+                        "description": "相对于 workspace 根目录的文件路径，例如 src/main.rs"
                     }
                 },
                 "required": ["path"]
@@ -53,7 +55,7 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "glob 模式，例如 **/*.py 或 src/**/*.rs"
+                        "description": "glob 模式，例如 **/*.rs 或 src/**/*.rs"
                     }
                 },
                 "required": ["pattern"]
@@ -73,26 +75,32 @@ pub fn all_tools() -> Vec<ToolDefinition> {
                 "required": []
             }),
         ),
-        ToolDefinition::new(
-            "run_command",
-            "在 workspace 中执行 shell 命令（如 cargo build / npm test / git diff），返回 stdout+stderr 与退出码。命令在 workspace 根目录执行，无法访问 workspace 外文件。每个命令需经人工审批（--approve 模式下会询问）。输出截断到 4000 字符。",
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "program": {
-                        "type": "string",
-                        "description": "要执行的程序，例如 cargo / npm / git / python / pytest"
-                    },
-                    "args": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "参数列表，例如 [\"build\", \"--release\"] 或 [\"test\", \"-q\"]"
-                    }
-                },
-                "required": ["program"]
-            }),
-        ),
     ]
+}
+
+/// 构建所有可用工具的定义（含 run_command，供 Tester 等需要执行命令的阶段使用）。
+pub fn all_tools() -> Vec<ToolDefinition> {
+    let mut tools = readonly_tools();
+    tools.push(ToolDefinition::new(
+        "run_command",
+        "在 workspace 中执行 shell 命令（如 cargo build / npm test / git diff），返回 stdout+stderr 与退出码。命令在 workspace 根目录执行，无法访问 workspace 外文件。每个命令需经人工审批（--approve 模式下会询问）。输出截断到 4000 字符。",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "program": {
+                    "type": "string",
+                    "description": "要执行的程序，例如 cargo / npm / git / python / pytest"
+                },
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "参数列表，例如 [\"build\", \"--release\"] 或 [\"test\", \"-q\"]"
+                }
+            },
+            "required": ["program"]
+        }),
+    ));
+    tools
 }
 
 /// 执行单个工具调用并返回结果文本。
@@ -366,6 +374,9 @@ fn execute_list_dir(
 /// run_command 工具输出字符上限。超过则截断尾部，避免 LLM 上下文爆炸。
 const MAX_COMMAND_OUTPUT_CHARS: usize = 4000;
 
+/// Worker 工具执行的命令超时（秒）。编译/测试可能很久，给 10 分钟。
+const COMMAND_TIMEOUT_SECS: u64 = 600;
+
 fn execute_run_command(
     args: &serde_json::Value,
     workspace: &Path,
@@ -393,7 +404,7 @@ fn execute_run_command(
     };
     match approval {
         Some(hook) => match hook.request(&action) {
-            ApprovalDecision::Approved => {}
+            ApprovalDecision::Approved | ApprovalDecision::ApproveAndWhitelist => {}
             ApprovalDecision::Rejected(reason) => {
                 eprintln!(
                     "[{agent_name}] 命令被审批拒绝: {program} {} - {reason}",
@@ -410,19 +421,33 @@ fn execute_run_command(
     }
 
     eprintln!(
-        "[{agent_name}] 执行命令: {program} {} (cwd: {})",
+        "[{agent_name}] 执行命令: {program} {} (cwd: {}, timeout={COMMAND_TIMEOUT_SECS}s)",
         cmd_args.join(" "),
         workspace.display()
     );
 
-    let output = match Command::new(&program)
-        .args(&cmd_args)
-        .current_dir(workspace)
-        .output()
-    {
-        Ok(o) => o,
-        Err(e) => {
+    // 在新线程中执行命令，超时则杀进程
+    let program_clone = program.clone();
+    let cmd_args_clone = cmd_args.clone();
+    let ws_clone = workspace.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = Command::new(&program_clone)
+            .args(&cmd_args_clone)
+            .current_dir(&ws_clone)
+            .output();
+        let _ = tx.send(result);
+    });
+
+    let output = match rx.recv_timeout(std::time::Duration::from_secs(COMMAND_TIMEOUT_SECS)) {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => {
             return format!("执行 {program} 失败: {e}");
+        }
+        Err(_timeout) => {
+            return format!(
+                "执行 {program} 超时（>{COMMAND_TIMEOUT_SECS} 秒），已终止。请简化命令或分步执行。"
+            );
         }
     };
 
@@ -656,12 +681,44 @@ pub fn run_agent_loop(
     for _turn in 0..max_turns {
         let response = match client.chat_with_tools(&messages, tools) {
             Ok(r) => r,
-            Err(LlmError::Parse(_)) if _turn > 0 => {
+            Err(LlmError::Parse(_)) => {
+                // Parse 错误（DSML 或 JSON 格式异常）：降级为不带 tools 的 chat 调用。
+                // 无论第几轮都降级，避免第一轮 parse 失败直接报错退出。
                 let text = client.chat(&messages)?;
                 return Ok(text);
             }
             Err(e) => return Err(e),
         };
+
+        // DeepSeek 可能在 content 中输出 XML 格式的 tool_calls 而非 OpenAI 标准格式。
+        // 检测并解析这些 XML tool_calls，执行对应工具。
+        let content = response.content.clone().unwrap_or_default();
+        let dsml_calls = parse_dsml_tool_calls(&content);
+        if !dsml_calls.is_empty() {
+            eprintln!(
+                "[{agent_name}] 检测到 DeepSeek XML tool_calls（{} 个），正在执行...",
+                dsml_calls.len()
+            );
+            messages.push(ChatMessage::assistant(content.clone()));
+            for (name, args_json) in &dsml_calls {
+                let args: serde_json::Value =
+                    serde_json::from_str(args_json).unwrap_or(serde_json::Value::Null);
+                let result = execute_tool(
+                    name,
+                    &args,
+                    workspace,
+                    guard,
+                    agent_name,
+                    audit,
+                    approval,
+                );
+                messages.push(ChatMessage::tool(
+                    format!("dsml-{name}"),
+                    result,
+                ));
+            }
+            continue;
+        }
 
         if !response.has_tool_calls() {
             return Ok(response.content.unwrap_or_default());
@@ -691,7 +748,102 @@ pub fn run_agent_loop(
     }
 
     let text = client.chat(&messages)?;
-    Ok(text)
+    let cleaned = strip_xml_tool_calls(&text);
+    if cleaned != text {
+        eprintln!("[{agent_name}] 最终输出剥除了 DSML 块（{} → {} 字节）", text.len(), cleaned.len());
+    }
+    Ok(cleaned)
+}
+
+/// 解析 DeepSeek 的 XML 格式 tool_calls。
+///
+/// 格式：
+/// ```text
+/// <｜｜DSML｜｜tool_calls>
+/// <｜｜DSML｜｜invoke name="read_file">
+/// <｜｜DSML｜｜parameter name="path" string="true">src/main.rs</｜｜DSML｜｜parameter>
+/// </｜｜DSML｜｜invoke>
+/// </｜｜DSML｜｜tool_calls>
+/// ```
+///
+/// 返回 `(tool_name, arguments_json)` 列表。
+fn parse_dsml_tool_calls(content: &str) -> Vec<(String, String)> {
+    let marker = "<｜｜DSML｜｜tool_calls>";
+    if !content.contains(marker) {
+        return vec![];
+    }
+
+    let mut results = Vec::new();
+    let mut remaining = content;
+
+    while let Some(start) = remaining.find(marker) {
+        let after_start = &remaining[start + marker.len()..];
+        let end_marker = "</｜｜DSML｜｜tool_calls>";
+        let end = match after_start.find(end_marker) {
+            Some(e) => e,
+            None => break,
+        };
+        let block = &after_start[..end];
+        remaining = &after_start[end + end_marker.len()..];
+
+        // 解析每个 <｜｜DSML｜｜invoke name="XXX"> 块
+        let invoke_marker = "<｜｜DSML｜｜invoke name=\"";
+        let mut block_remaining = block;
+        while let Some(inv_start) = block_remaining.find(invoke_marker) {
+            let after_inv = &block_remaining[inv_start + invoke_marker.len()..];
+            let name_end = match after_inv.find("\">") {
+                Some(e) => e,
+                None => break,
+            };
+            let name = &after_inv[..name_end];
+            let after_name = &after_inv[name_end + 2..];
+
+            let invoke_end = "</｜｜DSML｜｜invoke>";
+            let inv_end = match after_name.find(invoke_end) {
+                Some(e) => e,
+                None => break,
+            };
+            let invoke_body = &after_name[..inv_end];
+            block_remaining = &after_name[inv_end + invoke_end.len()..];
+
+            // 解析参数 <｜｜DSML｜｜parameter name="YYY" string="true">VALUE</｜｜DSML｜｜parameter>
+            let mut params = serde_json::Map::new();
+            let param_marker = "<｜｜DSML｜｜parameter name=\"";
+            let mut param_remaining = invoke_body;
+            while let Some(p_start) = param_remaining.find(param_marker) {
+                let after_p = &param_remaining[p_start + param_marker.len()..];
+                let p_name_end = match after_p.find("\"") {
+                    Some(e) => e,
+                    None => break,
+                };
+                let p_name = &after_p[..p_name_end];
+                // 跳过 " string="true"> 或 ">
+                let after_p_name = &after_p[p_name_end..];
+                let val_start = match after_p_name.find(">") {
+                    Some(e) => e + 1,
+                    None => break,
+                };
+                let after_val_start = &after_p_name[val_start..];
+                let param_end = "</｜｜DSML｜｜parameter>";
+                let val_end = match after_val_start.find(param_end) {
+                    Some(e) => e,
+                    None => break,
+                };
+                let value = &after_val_start[..val_end];
+                param_remaining = &after_val_start[val_end + param_end.len()..];
+
+                // 去掉可能的前后空白
+                let trimmed_value = value.trim();
+                params.insert(p_name.to_string(), serde_json::Value::String(trimmed_value.to_string()));
+            }
+
+            let args_json = serde_json::to_string(&serde_json::Value::Object(params))
+                .unwrap_or_else(|_| "{}".to_string());
+            results.push((name.to_string(), args_json));
+        }
+    }
+
+    results
 }
 
 #[cfg(test)]
@@ -856,5 +1008,70 @@ mod tests {
             );
             assert!(result.contains("已截断"), "应截断: {result}");
         }
+    }
+
+    #[test]
+    fn parse_dsml_tool_calls_parses_single_invoke() {
+        let content = r#"让我先读取文件。
+
+<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="read_file">
+<｜｜DSML｜｜parameter name="path" string="true">src/main.rs</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>"#;
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "read_file");
+        let args: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(args["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn parse_dsml_tool_calls_parses_multiple_invokes() {
+        let content = r#"<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="grep">
+<｜｜DSML｜｜parameter name="pattern" string="true">#[allow(dead_code)]</｜｜DSML｜｜parameter>
+<｜｜DSML｜｜parameter name="path" string="true">src/lib.rs</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+<｜｜DSML｜｜invoke name="read_file">
+<｜｜DSML｜｜parameter name="path" string="true">src/main.rs</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>"#;
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "grep");
+        assert_eq!(calls[1].0, "read_file");
+        let args0: serde_json::Value = serde_json::from_str(&calls[0].1).unwrap();
+        assert_eq!(args0["pattern"], "#[allow(dead_code)]");
+        assert_eq!(args0["path"], "src/lib.rs");
+    }
+
+    #[test]
+    fn parse_dsml_tool_calls_returns_empty_for_plain_text() {
+        let calls = parse_dsml_tool_calls("普通文本，没有 tool_calls");
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn parse_dsml_tool_calls_handles_multiple_blocks() {
+        let content = r#"第一轮
+
+<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="read_file">
+<｜｜DSML｜｜parameter name="path" string="true">a.rs</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>
+
+第二轮
+
+<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="grep">
+<｜｜DSML｜｜parameter name="pattern" string="true">fn main</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>"#;
+        let calls = parse_dsml_tool_calls(content);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "read_file");
+        assert_eq!(calls[1].0, "grep");
     }
 }

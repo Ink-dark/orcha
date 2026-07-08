@@ -78,6 +78,8 @@ impl ApprovalAction {
 pub enum ApprovalDecision {
     /// 批准执行。
     Approved,
+    /// 批准执行，并将该操作加入运行时白名单，以后同类操作自动通过。
+    ApproveAndWhitelist,
     /// 拒绝执行，附带理由（用于审计 / 日志）。
     Rejected(String),
 }
@@ -276,7 +278,9 @@ mod tests {
         assert_eq!(h.request(&action), ApprovalDecision::Approved);
         match h.request(&action) {
             ApprovalDecision::Rejected(r) => assert_eq!(r, "理由"),
-            ApprovalDecision::Approved => panic!("应拒绝"),
+            ApprovalDecision::Approved | ApprovalDecision::ApproveAndWhitelist => {
+                panic!("应拒绝")
+            }
         }
     }
 

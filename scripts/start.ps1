@@ -123,7 +123,7 @@ if (-not (Test-Path $gatewayExe)) {
     Push-Location $repoRoot
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    & cargo build -p orcha-gateway
+    & cargo build -p orcha-gateway --features "llm,smoke"
     $code = $LASTEXITCODE
     $ErrorActionPreference = $prevEAP
     Pop-Location

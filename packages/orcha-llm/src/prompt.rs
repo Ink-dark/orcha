@@ -13,13 +13,14 @@ use orcha_sdk::{Artifact, ArtifactType};
 /// Planner 的 system 指令。
 pub const PLANNER_SYSTEM: &str = r#"你是 Orcha 的规划者。你的任务是理解用户需求与 workspace 现状，输出一个 JSON 计划。
 
-你可以使用以下工具来探索 workspace：
-- list_dir：列出目录内容
-- read_file：读取文件内容（带行号）
-- grep：在文件中搜索文本
-- glob：按模式查找文件
+当前 workspace 摘要（项目类型 + 目录结构 + 关键文件）已在下方给出。
+你不需要调用任何工具，直接基于摘要制定计划。
 
-先用工具充分了解 workspace 的代码结构和文件内容，再制定计划。
+**关键规则**：
+- 严格遵守项目已有的技术栈！如果项目是 Rust，你只能改 .rs 文件和 Cargo.toml；
+  如果项目是 Go，只能改 .go 文件和 go.mod；绝不能引入新语言或框架。
+- edit 用于修改已存在文件，create 用于新建文件。先用 read_file 确认文件存在再选择动作。
+- 如果 workspace 已有完整的项目结构，优先在现有文件中定位并修改，不要创建不相关的新文件。
 
 最终输出格式（仅 JSON，无多余文字）：
 {
@@ -36,7 +37,8 @@ pub const PLANNER_SYSTEM: &str = r#"你是 Orcha 的规划者。你的任务是�
 - edit 步骤必须提供 search 和 replace，search 必须在原文件中精确唯一匹配
 - create 步骤必须提供 content，content 末尾应有换行
 - target_files 列出本计划涉及的所有文件路径
-- 仅输出 JSON，第一个字符必须是 '{'"#;
+- 不要输出任何工具调用，不要输出解释性文字，第一个字符必须是 '{'
+- JSON 字符串值中不得包含字面换行符或制表符；多行内容必须用 \\n 转义（例如 "line1\\nline2"），不得直接在字符串中换行"#;
 
 /// Worker 的 system 指令。
 pub const WORKER_SYSTEM: &str = r#"你是 Orcha 的执行者。按 Planner 的计划在 workspace 中执行文件操作。
@@ -67,6 +69,7 @@ pub const WORKER_SYSTEM: &str = r#"你是 Orcha 的执行者。按 Planner 的�
 - 完整删除一段内容用 replace: ""
 - path 不得含 ".." 或绝对路径
 - 仅输出 JSON，第一个字符必须是 '{'
+- JSON 字符串值中不得包含字面换行符或制表符；多行内容必须用 \\n 转义（例如 "line1\\nline2"），不得直接在字符串中换行
 
 兼容格式（仅当无法用 edit 时使用，不推荐）：
 {"files":[{"path":"<路径>","content":"<完整文件内容>"}]}"#;
@@ -119,7 +122,10 @@ pub fn build_planner_prompt(task_desc: &str, workspace_files: &[String]) -> Vec<
     vec![
         ChatMessage::system(PLANNER_SYSTEM),
         ChatMessage::user(format!(
-            "任务：{task_desc}\n\n当前 workspace 文件：{files}\n\n输出 JSON 计划。"
+            "任务：{task_desc}\n\n\
+             workspace 摘要（Observer 自动检测）：\n{files}\n\n\
+             注意：以上摘要已标明项目类型和语言，你只能在该技术栈范围内制定计划。\n\
+             直接输出 JSON 计划，不要调用工具，不要输出解释性文字。"
         )),
     ]
 }
@@ -159,11 +165,16 @@ pub fn build_reviewer_prompt(
 pub fn parse_worker_output(output: &str) -> Result<Vec<(String, String)>, String> {
     // 容忍 LLM 在 JSON 前后包了 markdown ```json fence。
     let trimmed = strip_markdown_fence(output);
-    let v: serde_json::Value = serde_json::from_str(trimmed)
+    // 剥除可能残留的 DeepSeek XML tool_calls 块
+    let cleaned = strip_xml_tool_calls(trimmed);
+    // 修复 JSON 字符串值中的未转义字面换行符
+    let escaped = escape_raw_control_chars_in_strings(&cleaned);
+    let v: serde_json::Value = serde_json::from_str(&escaped)
         .or_else(|_| {
             // fallback：LLM 在 JSON 前有说明文字且无 fence，提取第一个 {...}
-            let extracted = extract_json_object(trimmed);
-            serde_json::from_str(extracted)
+            let extracted = extract_json_object(&escaped);
+            let extracted_escaped = escape_raw_control_chars_in_strings(extracted);
+            serde_json::from_str(&extracted_escaped)
         })
         .map_err(|e| format!("解析 Worker JSON 失败: {e}"))?;
     let arr = v
@@ -197,11 +208,16 @@ pub fn parse_worker_output(output: &str) -> Result<Vec<(String, String)>, String
 /// - [`WorkerOutput::Files`]：直接 `fs::write` 整文件（兼容旧路径）
 pub fn parse_worker_output_with_steps(output: &str) -> Result<WorkerOutput, String> {
     let trimmed = strip_markdown_fence(output);
-    let v: serde_json::Value = serde_json::from_str(trimmed)
+    // 剥除可能残留的 DeepSeek XML tool_calls 块
+    let cleaned = strip_xml_tool_calls(trimmed);
+    // 修复 JSON 字符串值中的未转义字面换行符
+    let escaped = escape_raw_control_chars_in_strings(&cleaned);
+    let v: serde_json::Value = serde_json::from_str(&escaped)
         .or_else(|_| {
             // fallback：LLM 在 JSON 前有说明文字且无 fence，提取第一个 {...}
-            let extracted = extract_json_object(trimmed);
-            serde_json::from_str(extracted)
+            let extracted = extract_json_object(&escaped);
+            let extracted_escaped = escape_raw_control_chars_in_strings(extracted);
+            serde_json::from_str(&extracted_escaped)
         })
         .map_err(|e| format!("解析 Worker JSON 失败: {e}"))?;
 
@@ -258,18 +274,25 @@ pub fn parse_worker_output_with_steps(output: &str) -> Result<WorkerOutput, Stri
 /// 从 Planner 的 JSON 输出解析出 plan 文本（原样返回，留给 Worker 用）。
 pub fn parse_planner_output(output: &str) -> Result<String, String> {
     let trimmed = strip_markdown_fence(output);
-    let v: serde_json::Value = serde_json::from_str(trimmed)
+    // DeepSeek 可能在输出中夹带 XML 格式的 tool_calls（<｜｜DSML｜｜tool_calls>...），
+    // 先剥掉这些块，再尝试解析 JSON。
+    let cleaned = strip_xml_tool_calls(trimmed);
+    // 修复 JSON 字符串值中的未转义字面换行符（DeepSeek 常见问题）。
+    // serde_json 拒绝解析含字面控制字符的字符串，这里做一次容错预处理。
+    let escaped = escape_raw_control_chars_in_strings(&cleaned);
+    let v: serde_json::Value = serde_json::from_str(&escaped)
         .or_else(|_| {
             // fallback：LLM 在 JSON 前有说明文字且无 fence，提取第一个 {...}
-            let extracted = extract_json_object(trimmed);
-            serde_json::from_str(extracted)
+            let extracted = extract_json_object(&escaped);
+            let extracted_escaped = escape_raw_control_chars_in_strings(extracted);
+            serde_json::from_str(&extracted_escaped)
         })
         .map_err(|e| format!("解析 Planner JSON 失败: {e}"))?;
     if v.get("steps").is_none() {
         return Err("输出缺 steps".into());
     }
     // 返回提取后的纯 JSON 文本（去掉前置说明文字），让 Worker 拿到干净 plan。
-    Ok(serde_json::to_string(&v).unwrap_or_else(|_| trimmed.to_string()))
+    Ok(serde_json::to_string(&v).unwrap_or_else(|_| escaped.clone()))
 }
 
 /// 从 Reviewer 的 JSON 输出解析是否通过 + 问题列表。
@@ -344,6 +367,96 @@ fn extract_json_object(s: &str) -> &str {
         return t;
     }
     t[first_brace..=last_brace].trim()
+}
+
+/// 剥除 DeepSeek 等模型可能输出的 XML 格式 tool_calls 块。
+///
+/// 形如：
+/// ```text
+/// <｜｜DSML｜｜tool_calls>
+/// <｜｜DSML｜｜invoke name="read_file">
+/// <｜｜DSML｜｜parameter name="path" string="true">xxx</｜｜DSML｜｜parameter>
+/// </｜｜DSML｜｜invoke>
+/// </｜｜DSML｜｜tool_calls>
+/// ```
+///
+/// 这些块不是 JSON，会污染解析。连续剥除所有匹配的块后返回剩余文本。
+pub fn strip_xml_tool_calls(s: &str) -> String {
+    let mut result = s.to_string();
+    loop {
+        // 找 tool_calls 开始标记
+        if let Some(start) = result.find("<｜｜DSML｜｜tool_calls>") {
+            // 找结束标记
+            if let Some(end) = result[start..].find("</｜｜DSML｜｜tool_calls>") {
+                let block_end = start + end + "</｜｜DSML｜｜tool_calls>".len();
+                // 去掉整个 tool_calls 块（含前后换行）
+                let before = &result[..start];
+                let after = &result[block_end..];
+                result = format!("{}{}", before.trim_end(), after.trim_start());
+                continue;
+            }
+        }
+        break;
+    }
+    result.trim().to_string()
+}
+
+/// 修复 JSON 字符串值中的未转义控制字符。
+///
+/// DeepSeek 等 LLM 有时会在 JSON 字符串值中输出字面换行符（`\n` 字符），
+/// 这违反 JSON 规范（RFC 8259 要求控制字符必须转义）。serde_json 会拒绝
+/// 解析这样的 JSON，报 "control character (\\n) found while parsing a string"
+/// 或 "EOF while parsing a string"。
+///
+/// 本函数用状态机扫描输入，仅替换字符串值（`"..."` 内部）中的字面控制字符
+/// 为转义形式，不影响 JSON 结构空白（键值对之间的换行）。
+///
+/// 处理的控制字符：
+/// - `\n`（换行）→ `\\n`
+/// - `\r`（回车）→ `\\r`
+/// - `\t`（制表符）→ `\\t`
+///
+/// 正确处理 `\"` 转义引号，不会误判字符串边界。
+fn escape_raw_control_chars_in_strings(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let chars = s.chars();
+    let mut in_string = false;
+    // 字符串内：上一个字符是否是反斜杠（用于判断 \" 是否是转义引号）
+    let mut prev_was_backslash = false;
+
+    for c in chars {
+        if !in_string {
+            result.push(c);
+            if c == '"' {
+                in_string = true;
+                prev_was_backslash = false;
+            }
+        } else {
+            // 当前在字符串值内
+            if prev_was_backslash {
+                // 前一个字符是反斜杠，当前字符是转义序列的一部分（如 n, ", \, / 等）
+                result.push(c);
+                // 只有反斜杠本身会延续转义状态（\\ 后面不再是转义）
+                prev_was_backslash = c == '\\';
+            } else if c == '\\' {
+                result.push(c);
+                prev_was_backslash = true;
+            } else if c == '"' {
+                result.push(c);
+                in_string = false;
+            } else if c == '\n' {
+                result.push_str("\\n");
+            } else if c == '\r' {
+                result.push_str("\\r");
+            } else if c == '\t' {
+                result.push_str("\\t");
+            } else {
+                result.push(c);
+            }
+        }
+    }
+
+    result
 }
 
 /// 从 artifacts 中提取 Worker 写出的文件列表（path → content）。
@@ -504,6 +617,87 @@ mod tests {
             extract_json_object("text {\"a\":{\"b\":2}} tail"),
             "{\"a\":{\"b\":2}}"
         );
+    }
+
+    #[test]
+    fn strip_xml_tool_calls_removes_deepseek_xml_blocks() {
+        let raw = "分析文件结构。\n\n<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"read_file\">\n<｜｜DSML｜｜parameter name=\"path\" string=\"true\">a.py</｜｜DSML｜｜parameter>\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>\n\n{\"steps\":[]}";
+        let cleaned = strip_xml_tool_calls(raw);
+        assert!(!cleaned.contains("tool_calls"), "应剥除 XML tool_calls 块");
+        assert!(cleaned.contains("steps"), "应保留 JSON");
+    }
+
+    #[test]
+    fn strip_xml_tool_calls_handles_multiple_blocks() {
+        let raw = "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"read_file\">\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>\n{\"steps\":[1]}\n<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"grep\">\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>";
+        let cleaned = strip_xml_tool_calls(raw);
+        assert!(!cleaned.contains("tool_calls"), "应剥除所有 XML tool_calls 块");
+        assert!(cleaned.contains("steps"), "应保留 JSON");
+    }
+
+    #[test]
+    fn strip_xml_tool_calls_passes_clean_text() {
+        let raw = "{\"steps\":[{\"action\":\"edit\",\"path\":\"a.py\",\"search\":\"x\",\"replace\":\"y\"}]}";
+        let cleaned = strip_xml_tool_calls(raw);
+        assert_eq!(cleaned, raw, "无 XML 块时应原样返回");
+    }
+
+    #[test]
+    fn parse_planner_output_tolerates_xml_tool_calls() {
+        let raw = "让我先读取文件。\n\n<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"read_file\">\n<｜｜DSML｜｜parameter name=\"path\" string=\"true\">a.py</｜｜DSML｜｜parameter>\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>\n\n```json\n{\"steps\":[{\"action\":\"edit\",\"path\":\"a.py\",\"search\":\"x\",\"replace\":\"y\"}]}\n```";
+        let parsed = parse_planner_output(raw).unwrap();
+        assert!(parsed.contains("steps"));
+    }
+
+    #[test]
+    fn parse_planner_output_tolerates_unescaped_newlines_in_strings() {
+        // 真实场景：DeepSeek 在 search/replace 字段值中输出字面换行符
+        // （违反 JSON 规范，serde_json 会拒绝解析）。parse_planner_output 应做容错预处理。
+        // 这里用 format! 构造含字面换行符的 JSON 字符串值。
+        let raw = format!(
+            "{{\n  \"target_files\": [\"a.py\"],\n  \"steps\": [\n    {{\n      \"action\": \"edit\",\n      \"path\": \"a.py\",\n      \"search\": \"line1\nline2\",\n      \"replace\": \"new1\nnew2\"\n    }}\n  ]\n}}"
+        );
+        let parsed = parse_planner_output(&raw).unwrap();
+        assert!(parsed.contains("steps"));
+        // 解析后的 JSON 应是合法的（serde_json::to_string 会正确转义）
+        let reparsed: serde_json::Value = serde_json::from_str(&parsed).unwrap();
+        let search = reparsed["steps"][0]["search"].as_str().unwrap();
+        assert_eq!(search, "line1\nline2");
+    }
+
+    #[test]
+    fn escape_control_chars_preserves_structure_whitespace() {
+        // JSON 结构中的换行（键值对之间）应保留，字符串值内的换行应转义
+        let input = "{\n  \"key\": \"value with\nnewline\",\n  \"num\": 1\n}";
+        let escaped = escape_raw_control_chars_in_strings(input);
+        // 结构换行保留
+        assert!(escaped.starts_with("{\n"));
+        // 字符串内换行被转义
+        assert!(escaped.contains("value with\\nnewline"));
+        // 应能被 serde_json 解析
+        let v: serde_json::Value = serde_json::from_str(&escaped).unwrap();
+        assert_eq!(v["key"].as_str().unwrap(), "value with\nnewline");
+        assert_eq!(v["num"].as_i64().unwrap(), 1);
+    }
+
+    #[test]
+    fn escape_control_chars_handles_escaped_quote_correctly() {
+        // 字符串值中的 \" 不应被误判为字符串结束
+        let input = "{\"k\": \"has \\\"quoted\\\" line\nbreak\"}";
+        let escaped = escape_raw_control_chars_in_strings(input);
+        let v: serde_json::Value = serde_json::from_str(&escaped).unwrap();
+        assert_eq!(v["k"].as_str().unwrap(), "has \"quoted\" line\nbreak");
+    }
+
+    #[test]
+    fn escape_control_chars_handles_backslash_n_already_escaped() {
+        // 已正确转义的 \n（反斜杠+n 两个字符）不应被重复转义
+        let input = "{\"k\": \"line1\\nline2\"}";
+        let escaped = escape_raw_control_chars_in_strings(input);
+        // 不应变（已经是合法 JSON）
+        assert_eq!(escaped, input);
+        let v: serde_json::Value = serde_json::from_str(&escaped).unwrap();
+        assert_eq!(v["k"].as_str().unwrap(), "line1\nline2");
     }
 
     // ---- parse_worker_output_with_steps: edit/create/delete steps 解析 ----

@@ -154,6 +154,9 @@ pub struct LlmConfig {
     pub timeout: Duration,
     /// 采样温度。
     pub temperature: f32,
+    /// 最大输出 token 数。None = 由服务端决定（可能太小导致 JSON 被截断）。
+    /// 默认 16384，适配 DeepSeek 等模型。
+    pub max_tokens: Option<u32>,
     /// 失败重试次数（仅对可重试错误生效：429 / 5xx / 网络错误）。
     /// 默认 3。0 = 不重试。
     pub max_retries: u32,
@@ -182,6 +185,7 @@ impl LlmConfig {
             model,
             timeout: Duration::from_secs(120),
             temperature: 0.2,
+            max_tokens: Some(16384),
             max_retries: 3,
             retry_base_ms: 1000,
         })
@@ -237,6 +241,9 @@ impl OpenAiCompatibleClient {
                 body["tools"] = serde_json::to_value(tools).unwrap_or_default();
                 body["tool_choice"] = serde_json::json!("auto");
             }
+        }
+        if let Some(mt) = self.config.max_tokens {
+            body["max_tokens"] = serde_json::json!(mt);
         }
 
         // 重试循环：仅对可重试错误（429 / 5xx / 网络错误）退避重试。

@@ -75,6 +75,7 @@ pub enum AdapterToGateway {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ApprovalDecisionDto {
     Approved,
+    ApproveAndWhitelist,
     Rejected { reason: String },
 }
 
@@ -82,6 +83,9 @@ impl From<&orcha_core::ApprovalDecision> for ApprovalDecisionDto {
     fn from(d: &orcha_core::ApprovalDecision) -> Self {
         match d {
             orcha_core::ApprovalDecision::Approved => ApprovalDecisionDto::Approved,
+            orcha_core::ApprovalDecision::ApproveAndWhitelist => {
+                ApprovalDecisionDto::ApproveAndWhitelist
+            }
             orcha_core::ApprovalDecision::Rejected(reason) => ApprovalDecisionDto::Rejected {
                 reason: reason.clone(),
             },
@@ -93,6 +97,9 @@ impl From<ApprovalDecisionDto> for orcha_core::ApprovalDecision {
     fn from(d: ApprovalDecisionDto) -> Self {
         match d {
             ApprovalDecisionDto::Approved => orcha_core::ApprovalDecision::Approved,
+            ApprovalDecisionDto::ApproveAndWhitelist => {
+                orcha_core::ApprovalDecision::ApproveAndWhitelist
+            }
             ApprovalDecisionDto::Rejected { reason } => {
                 orcha_core::ApprovalDecision::Rejected(reason)
             }

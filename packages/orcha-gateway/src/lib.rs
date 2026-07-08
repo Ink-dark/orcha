@@ -16,6 +16,7 @@ pub mod config;
 pub mod ipc;
 pub mod protocol;
 pub mod queue;
+pub mod runtime_whitelist;
 
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -37,6 +38,7 @@ use crate::protocol::{
     AdapterToGateway, ApprovalDecisionDto, GatewayToAdapter, NotifyLevel, TriggerSource,
 };
 use crate::queue::{TaskQueue, TaskSubmitter};
+use crate::runtime_whitelist::{RuntimeWhitelist, SharedRuntimeWhitelist};
 
 /// reader read 超时（略大于 Adapter 心跳间隔 30s）。
 const READ_TIMEOUT_SECS: u64 = 35;
@@ -98,6 +100,22 @@ pub fn run(config: GatewayConfig) -> Result<()> {
 
     let registry = AdapterRegistry::new();
 
+    // M7 P2：加载运行时审批白名单（由"批准并加入白名单"按钮持久化）
+    let runtime_wl_path = config.home.join("runtime_whitelist.toml");
+    let runtime_whitelist: SharedRuntimeWhitelist =
+        Arc::new(std::sync::Mutex::new(RuntimeWhitelist::load(&runtime_wl_path)));
+    {
+        let wl = runtime_whitelist.lock().unwrap();
+        if !wl.write.is_empty() || !wl.command.is_empty() || !wl.delete.is_empty() {
+            eprintln!(
+                "[gateway] 运行时白名单已加载（write={} cmd={} del={}）",
+                wl.write.len(),
+                wl.command.len(),
+                wl.delete.len()
+            );
+        }
+    }
+
     // 2. TaskQueue + worker
     let queue = TaskQueue::new(
         task_store,
@@ -110,6 +128,7 @@ pub fn run(config: GatewayConfig) -> Result<()> {
         pending.clone(),
         approval_config.clone(),
         Arc::new(config.workspace.clone()),
+        runtime_whitelist.clone(),
     );
 
     // 3. IPC server
@@ -118,10 +137,15 @@ pub fn run(config: GatewayConfig) -> Result<()> {
     eprintln!("[gateway] IPC listening on {}", format_ipc_addr(&ipc_addr));
 
     let submitter = queue.submitter();
+    #[cfg(feature = "smoke")]
+    let smoke_cancel_map = queue.cancel_map().clone();
+    let accept_cancel_map = queue.cancel_map().clone();
     let accept_registry = registry.clone();
     let accept_auth = authenticator;
     let accept_pending = pending.clone();
     let accept_approval = approval_config.clone();
+    let accept_wl = runtime_whitelist.clone();
+    let accept_wl_path = runtime_wl_path.clone();
     thread::Builder::new()
         .name("orcha-accept".into())
         .spawn(move || {
@@ -132,13 +156,124 @@ pub fn run(config: GatewayConfig) -> Result<()> {
                 accept_auth,
                 accept_pending,
                 accept_approval,
+                accept_wl,
+                accept_wl_path,
+                accept_cancel_map,
             )
         })
         .context("spawn accept thread")?;
 
-    // 4. 阻塞主线程（Ctrl-C 由 systemd / launchd 处理，M7 不引入 ctrl-c crate）
+    // 4. Smoke 测试端点（仅 `smoke` feature，纯文本 TCP，一行触发一个任务）
+    #[cfg(feature = "smoke")]
+    {
+        let smoke_port = config.ipc.smoke_port;
+        if smoke_port > 0 {
+            let smoke_submitter = queue.submitter();
+            thread::Builder::new()
+                .name("orcha-smoke".into())
+                .spawn(move || {
+                    smoke_listen(smoke_port, smoke_submitter, smoke_cancel_map);
+                })
+                .context("spawn smoke listener thread")?;
+        }
+    }
+
+    // 5. 阻塞主线程（Ctrl-C 由 systemd / launchd 处理，M7 不引入 ctrl-c crate）
     queue.blocking_serve();
     Ok(())
+}
+
+/// Smoke 测试 TCP 监听：接受纯文本连接，每行 = 一个任务描述，直接入队。
+///
+/// 用法：`echo "帮我修复 xxx" | nc 127.0.0.1 7423`
+/// 无需认证、无需 IPC 协议，仅用于本地开发调试。
+/// 仅 `smoke` feature 启用时编译。
+#[cfg(feature = "smoke")]
+fn smoke_listen(port: u16, submitter: TaskSubmitter, cancel_map: crate::queue::TaskCancelMap) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpListener;
+
+    let addr = format!("127.0.0.1:{port}");
+    let listener = match TcpListener::bind(&addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("[gateway] smoke 端口 {port} 绑定失败: {e}");
+            return;
+        }
+    };
+    eprintln!("[gateway] smoke 测试端点: nc 127.0.0.1 {port}（一行 = 一个任务，/stop 取消全部）");
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let submitter = submitter.clone();
+                let cancel_map = cancel_map.clone();
+                thread::spawn(move || {
+                    let peer = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
+                    let mut reader = BufReader::new(&stream);
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => { /* EOF */ }
+                        Ok(_) => {
+                            let desc = line.trim().to_string();
+                            if desc.is_empty() {
+                                return;
+                            }
+                            // /stop / /cancel：取消所有运行中任务
+                            if desc == "/stop" || desc == "/cancel" {
+                                let map = cancel_map.lock().unwrap();
+                                let ids: Vec<String> = map.keys().cloned().collect();
+                                for id in &ids {
+                                    if let Some(t) = map.get(id) {
+                                        t.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    }
+                                }
+                                let msg = if ids.is_empty() {
+                                    "没有运行中的任务".to_string()
+                                } else {
+                                    format!("已取消 {} 个任务: {}", ids.len(), ids.join(", "))
+                                };
+                                eprintln!("[gateway] smoke /stop: {msg}");
+                                let _ = writeln!(&stream, "{msg}");
+                                return;
+                            }
+                            // /stop <id>：取消指定任务
+                            if let Some(id) = desc.strip_prefix("/stop ") {
+                                let map = cancel_map.lock().unwrap();
+                                let msg = if let Some(t) = map.get(id) {
+                                    t.store(true, std::sync::atomic::Ordering::SeqCst);
+                                    format!("已取消 {id}")
+                                } else {
+                                    format!("未找到任务 {id}")
+                                };
+                                eprintln!("[gateway] smoke /stop {id}: {msg}");
+                                let _ = writeln!(&stream, "{msg}");
+                                return;
+                            }
+                            // 普通文本 → 入队任务
+                            eprintln!("[gateway] smoke 触发: {desc}");
+                            let task = Task::new(Task::generate_id(), desc.clone());
+                            let source = TriggerSource {
+                                platform: "smoke".into(),
+                                user: "smoke-test".into(),
+                                group: None,
+                                raw: desc.clone(),
+                            };
+                            if let Err(e) = submitter.enqueue(task, "smoke".into(), source) {
+                                eprintln!("[gateway] smoke enqueue 失败: {e}");
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[gateway] smoke 读取失败 ({}): {e}", peer);
+                        }
+                    }
+                });
+            }
+            Err(e) => {
+                eprintln!("[gateway] smoke accept 失败: {e}");
+            }
+        }
+    }
 }
 
 /// 把 `config.build_task_store()` 的具体类型擦除为 `Arc<dyn TaskStore>`。
@@ -151,6 +286,7 @@ fn build_task_store_arc(config: &GatewayConfig) -> Result<Arc<dyn TaskStore>> {
 }
 
 /// accept 循环：每个连接 spawn 一个 reader 线程。
+#[allow(clippy::too_many_arguments)]
 fn accept_loop(
     listener: IpcListener,
     registry: AdapterRegistry,
@@ -158,6 +294,9 @@ fn accept_loop(
     auth: Authenticator,
     pending: PendingMap,
     approval_config: Arc<ApprovalConfig>,
+    runtime_whitelist: SharedRuntimeWhitelist,
+    wl_path: std::path::PathBuf,
+    cancel_map: crate::queue::TaskCancelMap,
 ) {
     loop {
         match listener.accept() {
@@ -167,6 +306,9 @@ fn accept_loop(
                 let auth = auth.clone();
                 let pending = pending.clone();
                 let approval_config = approval_config.clone();
+                let runtime_whitelist = runtime_whitelist.clone();
+                let wl_path = wl_path.clone();
+                let cancel_map = cancel_map.clone();
                 if let Err(e) = thread::Builder::new()
                     .name("orcha-adapter-conn".into())
                     .spawn(move || {
@@ -177,6 +319,9 @@ fn accept_loop(
                             auth,
                             pending,
                             approval_config,
+                            runtime_whitelist,
+                            wl_path,
+                            cancel_map,
                         )
                     })
                 {
@@ -198,6 +343,7 @@ fn accept_loop(
 /// - spawn writer 线程：receiver → `write_msg` 到 stream
 /// - reader 循环：`read_msg` → 分发 `Trigger` / `AuthCheck` / `Heartbeat` / `Reply` / `ApprovalResponse`
 /// - watchdog：read 超时计数，连续 3 次断开
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     stream: Box<dyn IpcStream>,
     registry: AdapterRegistry,
@@ -205,6 +351,9 @@ fn handle_connection(
     auth: Authenticator,
     pending: PendingMap,
     approval_config: Arc<ApprovalConfig>,
+    runtime_whitelist: SharedRuntimeWhitelist,
+    wl_path: std::path::PathBuf,
+    cancel_map: crate::queue::TaskCancelMap,
 ) {
     let (id, tx, rx) = registry.register();
     eprintln!(
@@ -266,10 +415,82 @@ fn handle_connection(
                         content,
                         session,
                     } => {
-                        // M7 暂存：打印日志，后续接用户中断 / 继续。
-                        eprintln!(
-                            "[gateway] 收到 Reply task_id={task_id} session={session} content=\"{content}\"（M7 暂存）"
-                        );
+                        let trimmed = content.trim();
+                        if trimmed == "/stop" || trimmed == "/cancel" || trimmed.starts_with("/stop ") {
+                            // 取消指定任务，或取消全部运行中任务
+                            let target_id = if trimmed == "/stop" || trimmed == "/cancel" {
+                                // 不指定 ID：取消全部运行中任务
+                                if task_id.is_empty() {
+                                    None // 取消全部
+                                } else {
+                                    Some(task_id.clone()) // 取消 Reply 携带的 task_id
+                                }
+                            } else {
+                                // /stop <task_id>
+                                let id = trimmed
+                                    .strip_prefix("/stop ")
+                                    .or_else(|| trimmed.strip_prefix("/cancel "))
+                                    .unwrap_or("")
+                                    .trim();
+                                if id.is_empty() { None } else { Some(id.to_string()) }
+                            };
+
+                            eprintln!(
+                                "[gateway] 收到取消命令 target={:?} session={session}",
+                                target_id
+                            );
+
+                            let map = cancel_map.lock().unwrap();
+                            let cancelled: Vec<String> = match target_id {
+                                Some(ref id) => {
+                                    if let Some(token) = map.get(id) {
+                                        token.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        vec![id.clone()]
+                                    } else {
+                                        vec![]
+                                    }
+                                }
+                                None => {
+                                    // 取消全部运行中任务
+                                    let ids: Vec<String> = map.keys().cloned().collect();
+                                    for id in &ids {
+                                        if let Some(token) = map.get(id) {
+                                            token.store(true, std::sync::atomic::Ordering::SeqCst);
+                                        }
+                                    }
+                                    ids
+                                }
+                            };
+
+                            if cancelled.is_empty() {
+                                let _ = tx.send(GatewayToAdapter::Notify {
+                                    task_id: task_id.clone(),
+                                    session: session.clone(),
+                                    level: NotifyLevel::Warn,
+                                    message: "未找到运行中的任务，可能已完成".into(),
+                                });
+                            } else {
+                                let msg = if cancelled.len() == 1 {
+                                    format!("⏳ 正在取消任务 {}…", cancelled[0])
+                                } else {
+                                    format!(
+                                        "⏳ 正在取消 {} 个任务: {}…",
+                                        cancelled.len(),
+                                        cancelled.join(", ")
+                                    )
+                                };
+                                let _ = tx.send(GatewayToAdapter::Notify {
+                                    task_id: task_id.clone(),
+                                    session: session.clone(),
+                                    level: NotifyLevel::Warn,
+                                    message: msg,
+                                });
+                            }
+                        } else {
+                            eprintln!(
+                                "[gateway] 收到 Reply task_id={task_id} session={session} content=\"{content}\""
+                            );
+                        }
                     }
                     AdapterToGateway::ApprovalResponse {
                         action_id,
@@ -286,6 +507,8 @@ fn handle_connection(
                             &operator_open_id,
                             operator_chat_id.as_deref(),
                             decision.clone(),
+                            &runtime_whitelist,
+                            &wl_path,
                         ) {
                             Some((_action, final_decision, operator)) => {
                                 let _ = tx.send(GatewayToAdapter::ApprovalResult {
@@ -495,6 +718,8 @@ mod tests {
         let approval_config: Arc<ApprovalConfig> = Arc::new(ApprovalConfig::default());
         let workspace_config: Arc<crate::config::WorkspaceConfig> =
             Arc::new(crate::config::WorkspaceConfig::default());
+        let runtime_whitelist: SharedRuntimeWhitelist =
+            Arc::new(std::sync::Mutex::new(RuntimeWhitelist::default()));
         let queue = TaskQueue::new(
             task_store,
             history_store,
@@ -506,6 +731,7 @@ mod tests {
             pending,
             approval_config,
             workspace_config,
+            runtime_whitelist,
         );
         // queue drop 会让 worker 退出，但 submitter 持 sender clone 仍可用
         queue.submitter()

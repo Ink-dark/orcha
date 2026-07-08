@@ -21,7 +21,7 @@ use std::time::Duration;
 use anyhow::Result;
 use orcha_core::{
     transition, AiDrivenCycleround, CycleConfig, CycleOutcome, FailureReason, HistoryStore,
-    MemoryStore, TaskStore,
+    MemoryStore, RoundEvent, TaskStore,
 };
 use orcha_llm::LlmClient;
 use orcha_sdk::{Task, TaskStatus};
@@ -30,6 +30,13 @@ use crate::adapter_registry::AdapterRegistry;
 use crate::approval_hook::{GatewayApprovalHook, PendingMap};
 use crate::config::{ApprovalConfig, WorkspaceConfig};
 use crate::protocol::{GatewayToAdapter, NotifyLevel, TriggerSource};
+use crate::runtime_whitelist::SharedRuntimeWhitelist;
+
+/// 可取消的任务句柄——worker 持有以轮询取消信号，IPC handler 持有以触发取消。
+pub type CancelToken = Arc<AtomicBool>;
+/// 共享的任务取消映射表：task_id → CancelToken。
+/// worker 线程在任务开始时插入，结束时移除；IPC handler 在收到 /stop 时设 true。
+pub type TaskCancelMap = Arc<std::sync::Mutex<std::collections::HashMap<String, CancelToken>>>;
 
 /// worker 之间传递的任务消息。
 ///
@@ -65,6 +72,7 @@ impl TaskSubmitter {
             .map_err(|_| anyhow::anyhow!("worker 线程已关闭"))?;
         Ok(())
     }
+
 }
 
 /// 任务队列：入队 + 后台 worker。
@@ -73,6 +81,8 @@ impl TaskSubmitter {
 pub struct TaskQueue {
     submitter: TaskSubmitter,
     handle: Option<thread::JoinHandle<()>>,
+    /// 任务取消映射表——IPC handler 直接写 AtomicBool 来取消运行中任务。
+    cancel_map: TaskCancelMap,
 }
 
 impl TaskQueue {
@@ -89,9 +99,14 @@ impl TaskQueue {
         pending: PendingMap,
         approval_config: Arc<ApprovalConfig>,
         workspace_config: Arc<WorkspaceConfig>,
+        runtime_whitelist: SharedRuntimeWhitelist,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<TaskMessage>();
         let submitter = TaskSubmitter { tx };
+        // 任务取消映射表：worker 和 IPC handler 共享
+        let cancel_map: TaskCancelMap =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let cancel_map_worker = cancel_map.clone();
 
         let handle = thread::Builder::new()
             .name("orcha-worker".into())
@@ -115,6 +130,8 @@ impl TaskQueue {
                                 &pending,
                                 &approval_config,
                                 &workspace_config,
+                                &runtime_whitelist,
+                                cancel_map_worker.clone(),
                                 task,
                                 session,
                                 source,
@@ -130,6 +147,7 @@ impl TaskQueue {
         Self {
             submitter,
             handle: Some(handle),
+            cancel_map,
         }
     }
 
@@ -138,11 +156,18 @@ impl TaskQueue {
         self.submitter.clone()
     }
 
-    /// 阻塞主线程（M7 用，Ctrl-C 由 systemd 处理）。
+    /// 拿取消映射表（IPC handler 直接写 AtomicBool 来取消运行中任务）。
+    pub fn cancel_map(&self) -> &TaskCancelMap {
+        &self.cancel_map
+    }
+
+    /// 阻塞主线程——防止主线程退出导致所有 worker 线程被杀。
+    /// 使用 `thread::park_timeout(Duration::MAX)` 而非 `thread::park()`，
+    /// 避免 spurious wakeup 导致循环退出、主线程结束、进程崩溃。
     pub fn blocking_serve(self) {
         eprintln!("[gateway] 任务队列已启动（Ctrl-C 退出）");
         loop {
-            thread::park();
+            thread::park_timeout(Duration::MAX);
         }
     }
 
@@ -168,6 +193,8 @@ fn run_task(
     pending: &PendingMap,
     approval_config: &Arc<ApprovalConfig>,
     workspace_config: &Arc<WorkspaceConfig>,
+    runtime_whitelist: &SharedRuntimeWhitelist,
+    cancel_map: TaskCancelMap,
     mut task: Task,
     session: String,
     source: TriggerSource,
@@ -212,9 +239,19 @@ fn run_task(
                     worktree_guard = Some(wt);
                 }
                 Err(e) => {
-                    eprintln!("[gateway] task {task_id} worktree 创建失败，回退到原地修改: {e}");
-                    workspace = repo.clone();
-                    worktree_guard = None;
+                    // fail-closed：worktree 创建失败时拒绝执行，不允许原地修改原 repo。
+                    // 原地修改一旦 LLM 乱写会污染真实仓库，必须由管理员修复环境后重试。
+                    let reason = format!("GitWorktree 创建失败（工作区隔离不可用，拒绝原地修改以避免污染原仓库）: {e}");
+                    eprintln!("[gateway] task {task_id} {reason}");
+                    finish_failed(
+                        task_store,
+                        &mut task,
+                        &task_id,
+                        &session,
+                        registry,
+                        reason,
+                    );
+                    return;
                 }
             }
         }
@@ -283,50 +320,174 @@ fn run_task(
             .expect("spawn heartbeat thread")
     };
 
-    // 5. 跑 Cycleround（M7 P1：按 approval_config 选 with_approval / with_memory）
-    let outcome = match llm_client {
-        Some(client) => {
-            if approval_config.enabled() {
-                // 审批启用：构造 GatewayApprovalHook，worker 发起 → reader 回传
-                let hook = GatewayApprovalHook::new(
-                    pending.clone(),
-                    registry.clone(),
-                    task_id.clone(),
-                    session.clone(),
-                    approval_config.timeout(),
-                );
-                let cycle = AiDrivenCycleround::with_approval(
-                    cycle_config.clone(),
-                    client.clone(),
-                    Some(memory_store.clone()),
-                    Arc::new(hook),
-                );
-                cycle.run_with_history(&task, &workspace, history_store.as_ref())
-            } else {
-                // 审批未启用：直接走 with_memory（无 hook）
-                let cycle = AiDrivenCycleround::with_memory(
-                    cycle_config.clone(),
-                    client.clone(),
-                    memory_store.clone(),
-                );
-                cycle.run_with_history(&task, &workspace, history_store.as_ref())
+    // 5. 跑 Cycleround（流式：每步 agent 事件实时推飞书卡片）
+    //    用 catch_unwind 包裹构造过程；调度线程内部自有 panic 兜底（run_inner_streaming）。
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let client = match llm_client {
+            Some(c) => c.clone(),
+            None => {
+                registry.broadcast(&GatewayToAdapter::Notify {
+                    task_id: task_id.clone(),
+                    session: session.clone(),
+                    level: NotifyLevel::Error,
+                    message: "未配置 LLM API Key，无法执行任务".into(),
+                });
+                return CycleOutcome::Failed {
+                    rounds: 0,
+                    reason: FailureReason::MaxRetriesExceeded,
+                    history: vec![],
+                };
+            }
+        };
+
+        // 构造 AiDrivenCycleround（带审批 hook / memory）
+        let mut cycle = if approval_config.enabled() {
+            let hook = GatewayApprovalHook::new(
+                pending.clone(),
+                registry.clone(),
+                task_id.clone(),
+                session.clone(),
+                approval_config.timeout(),
+                runtime_whitelist.clone(),
+            );
+            AiDrivenCycleround::with_approval(
+                cycle_config.clone(),
+                client,
+                Some(memory_store.clone()),
+                Arc::new(hook),
+            )
+        } else {
+            AiDrivenCycleround::with_memory(
+                cycle_config.clone(),
+                client,
+                memory_store.clone(),
+            )
+        };
+
+        // 清空旧 history + memory
+        let _ = history_store.clear_history(&task.id);
+        if let Err(e) = memory_store.clear(&task.id) {
+            eprintln!("warn: memory.clear({}) failed: {}", task.id, e);
+        }
+
+        // 注册取消令牌：IPC handler 可通过 Cancel 消息设 true 来中止任务
+        let cancel_token: CancelToken = Arc::new(AtomicBool::new(false));
+        {
+            let mut map = cancel_map.lock().unwrap();
+            map.insert(task.id.clone(), cancel_token.clone());
+        }
+
+        // 流式执行：每步通过 mpsc channel 推送 RoundEvent
+        let rx = cycle.run_streaming(&task, &workspace);
+        let mut outcome: Option<CycleOutcome> = None;
+
+        for event in rx {
+            // 每收到一个事件都检查取消标志
+            if cancel_token.load(Ordering::SeqCst) {
+                eprintln!("[gateway] task {task_id} 收到取消信号，中止执行");
+                let cancelled_outcome = CycleOutcome::Failed {
+                    rounds: 0,
+                    reason: FailureReason::Cancelled,
+                    history: vec![],
+                };
+                // 清理取消令牌
+                cancel_map.lock().unwrap().remove(&task_id);
+                // 发送取消通知
+                registry.broadcast(&GatewayToAdapter::CardUpdate {
+                    task_id: task_id.clone(),
+                    session: session.clone(),
+                    phase: "🛑 已取消".into(),
+                    detail: "管理员手动取消".into(),
+                    progress: 100,
+                });
+                registry.broadcast(&GatewayToAdapter::Notify {
+                    task_id: task_id.clone(),
+                    session: session.clone(),
+                    level: NotifyLevel::Warn,
+                    message: "任务已被管理员取消".into(),
+                });
+                outcome = Some(cancelled_outcome);
+                break;
+            }
+
+            match event {
+                RoundEvent::AgentStarted { round, agent } => {
+                    let (emoji, phase) = agent_phase(&agent);
+                    registry.broadcast(&GatewayToAdapter::CardUpdate {
+                        task_id: task_id.clone(),
+                        session: session.clone(),
+                        phase: format!("{emoji} {phase}"),
+                        detail: format!("第 {round} 步 · {agent} 工作中…"),
+                        progress: 50,
+                    });
+                }
+                RoundEvent::AgentFinished {
+                    round: _,
+                    agent,
+                    success,
+                    message,
+                } => {
+                    let (emoji, phase) = agent_phase(&agent);
+                    let status_icon = if success { "✅" } else { "❌" };
+                    // 用 chars() 安全截断——message 可能含中文等多字节 UTF-8 字符，
+                    // 直接字节索引 [..120] 会切在字符中间导致 panic。
+                    let detail = if message.chars().count() > 120 {
+                        let truncated: String = message.chars().take(120).collect();
+                        format!("{status_icon} {truncated}…")
+                    } else {
+                        format!("{status_icon} {message}")
+                    };
+                    registry.broadcast(&GatewayToAdapter::CardUpdate {
+                        task_id: task_id.clone(),
+                        session: session.clone(),
+                        phase: format!("{emoji} {phase}"),
+                        detail,
+                        progress: 50,
+                    });
+                }
+                RoundEvent::RoundFinished { round: _, record } => {
+                    // 持久化本轮 history
+                    let _ = history_store.append_round(&task.id, &record);
+                    eprintln!(
+                        "[gateway] task {task_id} round {} 完成（{} 步, {} artifacts）",
+                        record.round,
+                        record.steps.len(),
+                        record.artifacts.len()
+                    );
+                }
+                RoundEvent::TaskCompleted {
+                    outcome: task_outcome,
+                } => {
+                    outcome = Some(task_outcome);
+                    break;
+                }
             }
         }
-        None => {
-            // 无 LLM client（未配置 key）：直接失败，告知用户。
-            registry.broadcast(&GatewayToAdapter::Notify {
-                task_id: task_id.clone(),
-                session: session.clone(),
-                level: NotifyLevel::Error,
-                message: "未配置 LLM API Key，无法执行任务".into(),
-            });
-            CycleOutcome::Failed {
-                rounds: 0,
-                reason: FailureReason::MaxRetriesExceeded,
-                history: vec![],
-            }
+
+        // 清理取消令牌
+        cancel_map.lock().unwrap().remove(&task_id);
+
+        outcome.unwrap_or_else(|| CycleOutcome::Failed {
+            rounds: 0,
+            reason: FailureReason::Panic,
+            history: vec![],
+        })
+    }))
+    .unwrap_or_else(|panic_info| {
+        let reason = if let Some(s) = panic_info.downcast_ref::<String>() {
+            format!("调度线程 panic: {s}")
+        } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+            format!("调度线程 panic: {s}")
+        } else {
+            "调度线程 panic（原因未知）".to_string()
+        };
+        eprintln!("[gateway] task {task_id} {reason}");
+        CycleOutcome::Failed {
+            rounds: 0,
+            reason: FailureReason::Panic,
+            history: vec![],
         }
-    };
+    });
 
     // 停止心跳线程
     heartbeat_stop.store(true, Ordering::SeqCst);
@@ -626,6 +787,20 @@ fn fallback_commit_info(task_description: &str) -> (String, String) {
     )
 }
 
+/// 把 agent 名映射为卡片展示用的 (emoji, 阶段名)。
+fn agent_phase(agent: &str) -> (&'static str, &'static str) {
+    match agent {
+        "observer" => ("🔍", "观察中"),
+        "planner" => ("📋", "规划中"),
+        "worker" => ("💻", "写代码"),
+        "tester" => ("🧪", "测试中"),
+        "reviewer" => ("👀", "审核中"),
+        "fixer" => ("🔧", "修复中"),
+        "exit" => ("🏁", "完成"),
+        _ => ("⚙️", "执行中"),
+    }
+}
+
 /// 清洗字符串为合法的 git 分支 slug（kebab-case）。
 fn sanitize_branch_slug(s: &str) -> String {
     let lower: String = s
@@ -665,6 +840,8 @@ mod tests {
         let pending: PendingMap = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         let approval_config: Arc<ApprovalConfig> = Arc::new(ApprovalConfig::default());
         let workspace_config: Arc<WorkspaceConfig> = Arc::new(WorkspaceConfig::default());
+        let runtime_whitelist: SharedRuntimeWhitelist =
+            Arc::new(std::sync::Mutex::new(Default::default()));
         let queue = TaskQueue::new(
             task_store,
             history_store,
@@ -676,6 +853,7 @@ mod tests {
             pending,
             approval_config,
             workspace_config,
+            runtime_whitelist,
         );
         (queue, registry)
     }
