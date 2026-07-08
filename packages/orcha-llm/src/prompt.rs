@@ -631,7 +631,10 @@ mod tests {
     fn strip_xml_tool_calls_handles_multiple_blocks() {
         let raw = "<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"read_file\">\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>\n{\"steps\":[1]}\n<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name=\"grep\">\n</｜｜DSML｜｜invoke>\n</｜｜DSML｜｜tool_calls>";
         let cleaned = strip_xml_tool_calls(raw);
-        assert!(!cleaned.contains("tool_calls"), "应剥除所有 XML tool_calls 块");
+        assert!(
+            !cleaned.contains("tool_calls"),
+            "应剥除所有 XML tool_calls 块"
+        );
         assert!(cleaned.contains("steps"), "应保留 JSON");
     }
 

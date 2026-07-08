@@ -102,8 +102,9 @@ pub fn run(config: GatewayConfig) -> Result<()> {
 
     // M7 P2：加载运行时审批白名单（由"批准并加入白名单"按钮持久化）
     let runtime_wl_path = config.home.join("runtime_whitelist.toml");
-    let runtime_whitelist: SharedRuntimeWhitelist =
-        Arc::new(std::sync::Mutex::new(RuntimeWhitelist::load(&runtime_wl_path)));
+    let runtime_whitelist: SharedRuntimeWhitelist = Arc::new(std::sync::Mutex::new(
+        RuntimeWhitelist::load(&runtime_wl_path),
+    ));
     {
         let wl = runtime_whitelist.lock().unwrap();
         if !wl.write.is_empty() || !wl.command.is_empty() || !wl.delete.is_empty() {
@@ -209,7 +210,9 @@ fn smoke_listen(port: u16, submitter: TaskSubmitter, cancel_map: crate::queue::T
                 let submitter = submitter.clone();
                 let cancel_map = cancel_map.clone();
                 thread::spawn(move || {
-                    let peer = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
+                    let peer = stream
+                        .peer_addr()
+                        .unwrap_or_else(|_| "unknown".parse().unwrap());
                     let mut reader = BufReader::new(&stream);
                     let mut line = String::new();
                     match reader.read_line(&mut line) {
@@ -416,7 +419,10 @@ fn handle_connection(
                         session,
                     } => {
                         let trimmed = content.trim();
-                        if trimmed == "/stop" || trimmed == "/cancel" || trimmed.starts_with("/stop ") {
+                        if trimmed == "/stop"
+                            || trimmed == "/cancel"
+                            || trimmed.starts_with("/stop ")
+                        {
                             // 取消指定任务，或取消全部运行中任务
                             let target_id = if trimmed == "/stop" || trimmed == "/cancel" {
                                 // 不指定 ID：取消全部运行中任务
@@ -432,7 +438,11 @@ fn handle_connection(
                                     .or_else(|| trimmed.strip_prefix("/cancel "))
                                     .unwrap_or("")
                                     .trim();
-                                if id.is_empty() { None } else { Some(id.to_string()) }
+                                if id.is_empty() {
+                                    None
+                                } else {
+                                    Some(id.to_string())
+                                }
                             };
 
                             eprintln!(

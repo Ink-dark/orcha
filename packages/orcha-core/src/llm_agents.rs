@@ -153,14 +153,12 @@ impl LlmPlanner {
                         )
                         .with_artifacts(vec![artifact])
                     }
-                    Err(retry_err) => {
-                        StepOutput::failure(
-                            "S-planner",
-                            format!(
-                                "解析 LLM 输出失败（重试后仍失败）: {retry_err}; 首次错误: {first_err}"
-                            ),
-                        )
-                    }
+                    Err(retry_err) => StepOutput::failure(
+                        "S-planner",
+                        format!(
+                            "解析 LLM 输出失败（重试后仍失败）: {retry_err}; 首次错误: {first_err}"
+                        ),
+                    ),
                 }
             }
         }
@@ -408,10 +406,7 @@ impl LlmWorker {
                             } else {
                                 return StepOutput::failure(
                                     "S-worker",
-                                    format!(
-                                        "apply_step 失败 {} ({:?}): {e}",
-                                        ws.path, plan_action
-                                    ),
+                                    format!("apply_step 失败 {} ({:?}): {e}", ws.path, plan_action),
                                 );
                             }
                         }

@@ -55,12 +55,24 @@ impl SubAgent for Observer {
 /// 标注关键配置文件。避免把 100+ 文件路径拍平成一行。
 fn summarize_project(files: &[String]) -> String {
     // 1. 检测项目类型
-    let has_cargo = files.iter().any(|f| f == "Cargo.toml" || f.ends_with("/Cargo.toml"));
-    let has_go_mod = files.iter().any(|f| f == "go.mod" || f.ends_with("/go.mod"));
-    let has_package_json = files.iter().any(|f| f == "package.json" || f.ends_with("/package.json"));
-    let has_pyproject = files.iter().any(|f| f == "pyproject.toml" || f.ends_with("/pyproject.toml"));
-    let has_setup_py = files.iter().any(|f| f == "setup.py" || f.ends_with("/setup.py"));
-    let has_cmake = files.iter().any(|f| f == "CMakeLists.txt" || f.ends_with("/CMakeLists.txt"));
+    let has_cargo = files
+        .iter()
+        .any(|f| f == "Cargo.toml" || f.ends_with("/Cargo.toml"));
+    let has_go_mod = files
+        .iter()
+        .any(|f| f == "go.mod" || f.ends_with("/go.mod"));
+    let has_package_json = files
+        .iter()
+        .any(|f| f == "package.json" || f.ends_with("/package.json"));
+    let has_pyproject = files
+        .iter()
+        .any(|f| f == "pyproject.toml" || f.ends_with("/pyproject.toml"));
+    let has_setup_py = files
+        .iter()
+        .any(|f| f == "setup.py" || f.ends_with("/setup.py"));
+    let has_cmake = files
+        .iter()
+        .any(|f| f == "CMakeLists.txt" || f.ends_with("/CMakeLists.txt"));
 
     let project_type = if has_cargo {
         "Rust（Cargo workspace）"
@@ -78,7 +90,8 @@ fn summarize_project(files: &[String]) -> String {
 
     // 2. 收集顶级目录和文件（使用 owned String 避免生命周期问题）
     let mut top_files: Vec<String> = Vec::new();
-    let mut dirs: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut dirs: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
 
     for f in files {
         let normalized = f.replace('\\', "/");
@@ -161,11 +174,7 @@ fn summarize_project(files: &[String]) -> String {
     for (dir, count) in dir_counts.iter().take(max_dirs) {
         // 列出该目录下前 10 个文件
         let entries = &dirs[*dir];
-        let preview: Vec<&str> = entries
-            .iter()
-            .take(10)
-            .map(|e| e.as_str())
-            .collect();
+        let preview: Vec<&str> = entries.iter().take(10).map(|e| e.as_str()).collect();
         let suffix = if entries.len() > 10 {
             format!(" … 等 {} 个文件", entries.len())
         } else {

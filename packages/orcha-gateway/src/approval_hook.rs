@@ -210,10 +210,7 @@ pub fn handle_approval_response(
                     // 白名单通过：用 Adapter 给的决策
                     let core_decision: ApprovalDecision = adapter_decision.clone().into();
                     // 若是 ApproveAndWhitelist：把操作加入运行时白名单
-                    if matches!(
-                        core_decision,
-                        ApprovalDecision::ApproveAndWhitelist
-                    ) {
+                    if matches!(core_decision, ApprovalDecision::ApproveAndWhitelist) {
                         if let Ok(mut wl) = runtime_whitelist.lock() {
                             let added = wl.add(&entry.action);
                             if let Err(e) = wl.save(wl_path) {

@@ -72,7 +72,6 @@ impl TaskSubmitter {
             .map_err(|_| anyhow::anyhow!("worker 线程已关闭"))?;
         Ok(())
     }
-
 }
 
 /// 任务队列：入队 + 后台 worker。
@@ -243,14 +242,7 @@ fn run_task(
                     // 原地修改一旦 LLM 乱写会污染真实仓库，必须由管理员修复环境后重试。
                     let reason = format!("GitWorktree 创建失败（工作区隔离不可用，拒绝原地修改以避免污染原仓库）: {e}");
                     eprintln!("[gateway] task {task_id} {reason}");
-                    finish_failed(
-                        task_store,
-                        &mut task,
-                        &task_id,
-                        &session,
-                        registry,
-                        reason,
-                    );
+                    finish_failed(task_store, &mut task, &task_id, &session, registry, reason);
                     return;
                 }
             }
@@ -357,11 +349,7 @@ fn run_task(
                 Arc::new(hook),
             )
         } else {
-            AiDrivenCycleround::with_memory(
-                cycle_config.clone(),
-                client,
-                memory_store.clone(),
-            )
+            AiDrivenCycleround::with_memory(cycle_config.clone(), client, memory_store.clone())
         };
 
         // 清空旧 history + memory
