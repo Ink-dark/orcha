@@ -34,7 +34,7 @@ jobs:
       - name: Build Gateway
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build -p orcha-gateway --features "llm,smoke" --release --target ${{ matrix.target }}
+        run: cargo build -p orcha-gateway --features "llm" --release --target ${{ matrix.target }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
