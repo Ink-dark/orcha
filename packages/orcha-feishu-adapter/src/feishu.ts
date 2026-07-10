@@ -15,6 +15,7 @@
 
 import * as lark from '@larksuiteoapi/node-sdk';
 import { ApprovalActionDto, ApprovalDecisionDto, TriggerSource } from './protocol';
+import { TTLMap } from './ttl-map';
 
 /** 飞书触发事件（已解析）。 */
 export interface FeishuEvent {
@@ -308,15 +309,35 @@ function buildApprovalResultContent(
  */
 export class HttpFeishuClient implements FeishuClient {
   private readonly client: lark.Client;
-  /** session:taskId → message_id 映射，patch 更新时复用。 */
-  private readonly cardMsgIds = new Map<string, string>();
-  /** M7 P1：action_id → message_id 映射，审批结果 patch 时复用。 */
-  private readonly approvalCardMsgIds = new Map<string, string>();
-  /** M7 P1：action_id → { taskId, action } 缓存，patch 结果卡片时需要展示原动作。 */
-  private readonly approvalActions = new Map<
+  /**
+   * session:taskId → message_id 映射，patch 更新时复用。
+   * #24：改用 TTLMap，1 小时 TTL + 上限 5000，避免已结束任务的卡片映射
+   * 永久堆积导致 OOM。任务结束后卡片无需再 patch，过期自动清理。
+   */
+  private readonly cardMsgIds = new TTLMap<string, string>({
+    ttlMs: 3_600_000,
+    maxSize: 5_000,
+  });
+  /**
+   * M7 P1：action_id → message_id 映射，审批结果 patch 时复用。
+   * #24：超时的审批（Gateway 默认 30 分钟超时）若管理员未点击，卡片映射
+   * 永不清理。TTL 1 小时（>审批超时）覆盖超时场景，上限 5000 防 OOM。
+   */
+  private readonly approvalCardMsgIds = new TTLMap<string, string>({
+    ttlMs: 3_600_000,
+    maxSize: 5_000,
+  });
+  /**
+   * M7 P1：action_id → { taskId, action } 缓存，patch 结果卡片时需要展示原动作。
+   * #24：与 approvalCardMsgIds 同生命周期，TTL 1 小时 + 上限 5000。
+   */
+  private readonly approvalActions = new TTLMap<
     string,
     { taskId: string; action: ApprovalActionDto }
-  >();
+  >({
+    ttlMs: 3_600_000,
+    maxSize: 5_000,
+  });
 
   constructor(cfg: HttpFeishuConfig) {
     this.client = new lark.Client({
