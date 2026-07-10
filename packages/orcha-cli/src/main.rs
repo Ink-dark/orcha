@@ -151,6 +151,10 @@ enum Command {
         /// HTTP 监听端口（默认 7421）。
         #[arg(long, default_value_t = 7421)]
         port: u16,
+        /// 访问令牌（#16）。设置后 Web UI/API 需 Bearer/Cookie/`?token=` 认证；
+        /// 不设则无认证（仅适合单用户本机）。可用环境变量 ORCHA_SHELL_TOKEN。
+        #[arg(long, env = "ORCHA_SHELL_TOKEN")]
+        token: Option<String>,
     },
 }
 
@@ -229,8 +233,8 @@ fn main() -> Result<()> {
             let artifacts = run_artifacts(&resolve_home(cli.home.as_deref()), &id)?;
             println!("{}", serde_json::to_string_pretty(&artifacts)?);
         }
-        Some(Command::Shell { port }) => {
-            run_shell(&resolve_home(cli.home.as_deref()), port)?;
+        Some(Command::Shell { port, token }) => {
+            run_shell(&resolve_home(cli.home.as_deref()), port, token)?;
         }
         None => {
             // 无子命令时打印简短帮助；clap 在 --help 时已自行处理。
@@ -571,11 +575,11 @@ fn run_artifacts(home: &Path, task_id: &str) -> Result<Vec<Artifact>> {
 /// - 构造 [`orcha_shell::HttpServer`] 并阻塞 serve。
 ///
 /// 阻塞运行，Ctrl-C（SIGINT）后 tiny_http 的 incoming_requests 迭代器退出。
-fn run_shell(home: &Path, port: u16) -> Result<()> {
+fn run_shell(home: &Path, port: u16, token: Option<String>) -> Result<()> {
     FileTaskStore::new(home).init()?;
     FileHistoryStore::new(home).init()?;
     FileMemoryStore::new(home).init()?;
-    let server = orcha_shell::HttpServer::new(home, port);
+    let server = orcha_shell::HttpServer::new(home, port).with_auth_token(token);
     server.serve()
 }
 
