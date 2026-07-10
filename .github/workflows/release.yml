@@ -51,7 +51,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $pkg = "orcha-v${{ github.ref_name }}-windows-x86_64"
+          $pkg = "orcha-${{ github.ref_name }}-windows-x86_64"
           New-Item -ItemType Directory -Path $pkg -Force
           Copy-Item target/${{ matrix.target }}/release/orcha-gateway${{ matrix.ext }} $pkg/
           Copy-Item install.ps1 $pkg/
