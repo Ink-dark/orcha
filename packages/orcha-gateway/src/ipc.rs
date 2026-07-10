@@ -250,6 +250,22 @@ impl IpcListener {
             IpcListener::Tcp(t) => t.accept(),
         }
     }
+
+    /// 当前 listener 是否为 TCP 后端。
+    pub fn is_tcp(&self) -> bool {
+        matches!(self, IpcListener::Tcp(_))
+    }
+
+    /// #26：接受连接并做共享密钥握手。
+    ///
+    /// - **Unix**：文件系统权限 0600 已保护（#17），无需握手，直接返回 stream。
+    /// - **TCP + Some(secret)**：accept 后读首行，必须为 `AUTH <secret>`，
+    ///   不匹配/缺失/超时立即断开（返回 `Err`，调用方丢弃 stream）。
+    /// - **TCP + None**：打印警告后放行（dev 向后兼容；生产应配 secret）。
+    pub fn accept_authenticated(&self, secret: Option<&str>) -> io::Result<Box<dyn IpcStream>> {
+        let stream = self.accept()?;
+        server_authenticate(stream, self.is_tcp(), secret)
+    }
 }
 
 /// 统一的服务端 bind：根据 IpcAddr 类型选后端。
@@ -288,6 +304,131 @@ pub fn connect_stream(addr: &IpcAddr) -> io::Result<Box<dyn IpcStream>> {
             "Unix Socket 在当前平台不可用",
         )),
     }
+}
+
+/// #26：客户端连上后做共享密钥握手（仅 TCP 发送 `AUTH <secret>\n`）。
+///
+/// Unix socket 靠文件系统权限保护，不需要握手。与
+/// [`IpcListener::accept_authenticated`] 对应。
+pub fn connect_stream_authenticated(
+    addr: &IpcAddr,
+    secret: Option<&str>,
+) -> io::Result<Box<dyn IpcStream>> {
+    let is_tcp = matches!(addr, IpcAddr::Tcp(_, _));
+    let mut stream = connect_stream(addr)?;
+    client_authenticate(&mut *stream, is_tcp, secret)?;
+    Ok(stream)
+}
+
+// ============================================================
+// #26：TCP 共享密钥握手
+// ============================================================
+
+/// 握手前缀：客户端首行必须发 `AUTH <secret>\n`。
+const AUTH_LINE_PREFIX: &str = "AUTH ";
+/// AUTH 行最大字节数（含前缀 + secret + 换行），防恶意大行耗内存。
+const AUTH_MAX_LINE: usize = 512;
+
+/// 服务端在 accept 后认证（仅 TCP）。
+///
+/// - Unix：直接返回 stream（文件系统 0600 已保护）
+/// - TCP + Some(secret)：读首行，必须为 `AUTH <secret>`，否则返回 `Err`
+///   （调用方丢弃 stream 即断开连接）
+/// - TCP + None：打印警告，放行（dev 向后兼容）
+fn server_authenticate(
+    mut stream: Box<dyn IpcStream>,
+    is_tcp: bool,
+    secret: Option<&str>,
+) -> io::Result<Box<dyn IpcStream>> {
+    if !is_tcp {
+        return Ok(stream);
+    }
+    match secret {
+        None => {
+            eprintln!(
+                "[gateway] 警告: IPC TCP 启用但未配 tcp_secret / ORCHA_IPC_TCP_SECRET，\
+                 任意本机进程可连入伪造触发/审批（#26）"
+            );
+            Ok(stream)
+        }
+        Some(expected) => {
+            // 读首行（到 \n，限长防滥用）
+            let line = read_line_with_limit(&mut *stream, AUTH_MAX_LINE)?;
+            let provided = line
+                .strip_prefix(AUTH_LINE_PREFIX)
+                .map(|s| s.trim_end_matches(['\r', '\n']));
+            match provided {
+                Some(p) if constant_time_eq(p.as_bytes(), expected.as_bytes()) => Ok(stream),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "IPC TCP 握手失败：AUTH 密钥不匹配或缺失",
+                )),
+            }
+        }
+    }
+}
+
+/// 客户端连上后发 `AUTH <secret>\n`（仅 TCP + Some(secret)）。
+fn client_authenticate(
+    stream: &mut dyn IpcStream,
+    is_tcp: bool,
+    secret: Option<&str>,
+) -> io::Result<()> {
+    if !is_tcp {
+        return Ok(());
+    }
+    if let Some(s) = secret {
+        let mut line = String::with_capacity(AUTH_LINE_PREFIX.len() + s.len() + 1);
+        line.push_str(AUTH_LINE_PREFIX);
+        line.push_str(s);
+        line.push('\n');
+        stream.write_all(line.as_bytes())?;
+        stream.flush()?;
+    }
+    Ok(())
+}
+
+/// 读一行（到 `\n`），限长防恶意大行耗内存。`\n` 不包含在返回值里。
+fn read_line_with_limit(stream: &mut dyn IpcStream, max: usize) -> io::Result<String> {
+    let mut buf = Vec::with_capacity(64);
+    let mut byte = [0u8; 1];
+    loop {
+        match stream.read(&mut byte) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "IPC 握手：连接在对端发 AUTH 前关闭",
+                ))
+            }
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                buf.push(byte[0]);
+                if buf.len() > max {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "IPC 握手：AUTH 行过长",
+                    ));
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).to_string())
+}
+
+/// 定长比较，避免 timing attack 泄露密钥前缀。
+/// 长度不同直接返回 false（不泄露长度信息以外的内容）。
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 #[cfg(test)]
@@ -380,5 +521,201 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600, "socket 权限应为 0600，实际 {mode:#o}（#17）");
+    }
+
+    // ============================================================
+    // #26：TCP 共享密钥握手
+    // ============================================================
+
+    /// 找一个本机空闲端口：bind 一次拿到端口，立刻 drop，复用端口。
+    fn free_tcp_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port()
+    }
+
+    /// #26：正确密钥握手成功，之后可正常收发 JSON-line 消息。
+    #[test]
+    fn tcp_handshake_succeeds_with_correct_secret() {
+        let port = free_tcp_port();
+        let addr = IpcAddr::Tcp("127.0.0.1".to_string(), port);
+        let secret = "s3cret-token-#26".to_string();
+
+        let server = bind(&addr).unwrap();
+        let secret_clone = secret.clone();
+        let server_handle = std::thread::spawn(move || {
+            let mut stream = server.accept_authenticated(Some(&secret_clone)).unwrap();
+            // 握手通过后，正常读 JSON-line 消息
+            let mut buf = [0u8; 5];
+            use std::io::Read;
+            let _ = stream.read(&mut buf);
+            buf
+        });
+
+        let mut client = connect_stream_authenticated(&addr, Some(&secret)).unwrap();
+        client.write_all(b"hello").unwrap();
+        client.flush().unwrap();
+        drop(client);
+
+        let buf = server_handle.join().unwrap();
+        assert_eq!(&buf, b"hello", "握手通过后应能正常收发");
+    }
+
+    /// #26：密钥不匹配时，服务端 accept_authenticated 返回 PermissionDenied，
+    /// 且后续消息不会被处理（攻击者无法注入触发/审批）。
+    #[test]
+    fn tcp_handshake_rejects_wrong_secret() {
+        let port = free_tcp_port();
+        let addr = IpcAddr::Tcp("127.0.0.1".to_string(), port);
+        let server_secret = "correct-secret".to_string();
+        let client_wrong_secret = "wrong-secret".to_string();
+
+        let server = bind(&addr).unwrap();
+        let server_handle = std::thread::spawn(move || {
+            // 服务端期望正确密钥
+            server.accept_authenticated(Some(&server_secret))
+        });
+
+        // 客户端发错误密钥
+        let mut client = connect_stream_authenticated(&addr, Some(&client_wrong_secret)).unwrap();
+        // 客户端发完 AUTH 行后立刻注入一条恶意消息（不应被服务端处理）
+        client
+            .write_all(b"{\"type\":\"trigger\",\"malicious\":true}\n")
+            .unwrap();
+        client.flush().unwrap();
+        drop(client);
+
+        let result = server_handle.join().unwrap();
+        let err = match result {
+            Ok(_) => panic!("密钥不匹配应被拒绝，实际握手成功"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "应返回 PermissionDenied，实际 {err:?}"
+        );
+    }
+
+    /// #26：客户端不发 AUTH 行（直接发消息），服务端应拒绝。
+    /// 模拟未授权进程直接连 TCP 注入伪造触发。
+    #[test]
+    fn tcp_handshake_rejects_missing_auth_line() {
+        let port = free_tcp_port();
+        let addr = IpcAddr::Tcp("127.0.0.1".to_string(), port);
+        let secret = "guard-secret".to_string();
+
+        let server = bind(&addr).unwrap();
+        let server_handle = std::thread::spawn(move || server.accept_authenticated(Some(&secret)));
+
+        // 攻击者：直接连，不发 AUTH，直接注入伪造审批响应
+        let mut attacker = connect_stream(&addr).unwrap();
+        attacker
+            .write_all(b"{\"type\":\"approval_response\",\"action_id\":\"forged\"}\n")
+            .unwrap();
+        attacker.flush().unwrap();
+        drop(attacker);
+
+        let result = server_handle.join().unwrap();
+        assert!(result.is_err(), "无 AUTH 行应被拒绝");
+    }
+
+    /// #26：未配 secret（None）时 TCP 仍可连（dev 向后兼容）。
+    #[test]
+    fn tcp_handshake_allows_when_no_secret_configured() {
+        let port = free_tcp_port();
+        let addr = IpcAddr::Tcp("127.0.0.1".to_string(), port);
+
+        let server = bind(&addr).unwrap();
+        let server_handle = std::thread::spawn(move || {
+            // None = dev 模式不认证
+            let mut stream = server.accept_authenticated(None).unwrap();
+            let mut buf = [0u8; 5];
+            use std::io::Read;
+            let _ = stream.read(&mut buf);
+            buf
+        });
+
+        // 客户端也不发 AUTH（secret=None）
+        let mut client = connect_stream_authenticated(&addr, None).unwrap();
+        client.write_all(b"hello").unwrap();
+        client.flush().unwrap();
+        drop(client);
+
+        let buf = server_handle.join().unwrap();
+        assert_eq!(&buf, b"hello", "None 模式应放行（dev 向后兼容）");
+    }
+
+    /// #26：Unix socket 不做握手（文件系统 0600 已保护），secret 被忽略。
+    #[test]
+    #[cfg(unix)]
+    fn unix_handshake_is_noop_regardless_of_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = IpcAddr::Unix(dir.path().join("auth.sock"));
+        let secret = "unused-on-unix".to_string();
+
+        let server = bind(&addr).unwrap();
+        let secret_clone = secret.clone();
+        let server_handle = std::thread::spawn(move || {
+            // Unix 即使传了 secret 也应跳过握手
+            let mut stream = server.accept_authenticated(Some(&secret_clone)).unwrap();
+            let mut buf = [0u8; 5];
+            use std::io::Read;
+            let _ = stream.read(&mut buf);
+            buf
+        });
+
+        // 客户端：Unix 不发 AUTH 行，直接发数据
+        let mut client = connect_stream_authenticated(&addr, Some(&secret)).unwrap();
+        client.write_all(b"hello").unwrap();
+        client.flush().unwrap();
+        drop(client);
+
+        let buf = server_handle.join().unwrap();
+        assert_eq!(&buf, b"hello", "Unix 应跳过握手（0600 保护）");
+    }
+
+    /// #26：constant_time_eq 不泄露密钥前缀（长度不同直接 false）。
+    #[test]
+    fn constant_time_eq_correctness() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab")); // 长度不同
+        assert!(!constant_time_eq(b"", b"a"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    /// #26：read_line_with_limit 在超长行时报错（防恶意大行耗内存）。
+    #[test]
+    fn read_line_with_limit_rejects_oversized_line() {
+        // 用内存中的 Cursor 模拟 stream
+        struct MemStream(std::io::Cursor<Vec<u8>>);
+        impl std::io::Read for MemStream {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(buf)
+            }
+        }
+        impl std::io::Write for MemStream {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.get_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl IpcStream for MemStream {
+            fn set_read_timeout(&self, _: Option<std::time::Duration>) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn try_clone(&self) -> std::io::Result<Box<dyn IpcStream>> {
+                Ok(Box::new(MemStream(std::io::Cursor::new(
+                    self.0.get_ref().clone(),
+                ))))
+            }
+        }
+        let big: Vec<u8> = vec![b'A'; 600]; // 超过 AUTH_MAX_LINE(512)
+        let mut stream = MemStream(std::io::Cursor::new(big));
+        let result = read_line_with_limit(&mut stream, AUTH_MAX_LINE);
+        assert!(result.is_err(), "超长 AUTH 行应被拒绝");
     }
 }
