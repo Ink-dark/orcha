@@ -103,7 +103,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           name: Orcha ${{ github.ref_name }}
-          body_path: RELEASE_v0.1.0-beta.md
+          body_path: RELEASE_${{ github.ref_name }}.md
           files: artifacts/*
           draft: false
           prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
