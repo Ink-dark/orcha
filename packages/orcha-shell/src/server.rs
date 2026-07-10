@@ -391,10 +391,29 @@ fn api_json(value: Result<serde_json::Value>) -> Response<std::io::Cursor<Vec<u8
     match value {
         Ok(v) => Response::from_string(serde_json::to_string(&v).unwrap_or_default())
             .with_header(Header::from_bytes(&b"Content-Type"[..], b"application/json").unwrap()),
-        Err(e) => Response::from_string(format!(r#"{{"error":"{e}"}}"#))
-            .with_status_code(500)
-            .with_header(Header::from_bytes(&b"Content-Type"[..], b"application/json").unwrap()),
+        Err(e) => {
+            // #27：对外只返回 generic error + correlation_id，不把 {e} 写进 body。
+            // 旧实现 format!("{{\"error\":\"{e}\"}}") 会泄露文件系统路径、
+            // DB 路径、模块结构、依赖版本等内部细节给 HTTP 客户端。
+            let (body, cid) = internal_error_response();
+            eprintln!("[shell] API 内部错误 (correlation_id={cid}): {e:#}");
+            Response::from_string(body)
+                .with_status_code(500)
+                .with_header(Header::from_bytes(&b"Content-Type"[..], b"application/json").unwrap())
+        }
     }
+}
+
+/// #27：构造对外错误响应体（不泄露内部细节）。
+///
+/// 返回 `(body_json, correlation_id)`：
+/// - `body_json`：固定为 `{"error":"internal_error","correlation_id":"<id>"}`，
+///   不含任何错误详情。详细错误由 [`api_json`] 记服务端日志（stderr）。
+/// - `correlation_id`：UUID v4，客户端报障时凭此 ID 在服务端日志定位根因。
+fn internal_error_response() -> (String, String) {
+    let cid = uuid::Uuid::new_v4().to_string();
+    let body = format!(r#"{{"error":"internal_error","correlation_id":"{cid}"}}"#);
+    (body, cid)
 }
 
 #[cfg(test)]
@@ -567,6 +586,78 @@ mod tests {
                 .to_ascii_lowercase()
                 .contains("access-control-allow-origin"),
             "响应不应含 Access-Control-Allow-Origin（#23 已移除 CORS *）:\n{resp}"
+        );
+    }
+
+    // ---- #27 错误响应不得泄露内部细节 ----
+
+    #[test]
+    fn internal_error_response_does_not_leak_details() {
+        // 模拟一个含敏感内部细节的错误（文件系统路径 + DB 路径 + 模块结构）
+        let sensitive = "/home/user/.orcha/orcha.db (rusqlite::inner Os code 13)";
+        let err = anyhow::anyhow!("读取任务存储失败: {sensitive}");
+        // 证明错误本身确实携带敏感信息——旧实现 format!("{{\"error\":\"{e}\"}}")
+        // 会把它原样写进 HTTP 响应体泄露给客户端
+        assert!(
+            format!("{err}").contains(sensitive),
+            "前置：错误 Display 应含敏感信息"
+        );
+
+        // 对外响应体不得包含该敏感信息
+        let (body, cid) = internal_error_response();
+        assert!(
+            body.contains("internal_error"),
+            "body 应含 generic error 标识: {body}"
+        );
+        assert!(
+            body.contains(&cid),
+            "body 应含 correlation_id 供排障: {body}"
+        );
+        assert!(
+            !body.contains(sensitive),
+            "#27: body 不得泄露内部细节（路径/模块/DB），实际: {body}"
+        );
+
+        // correlation_id 是合法 UUID v4
+        let parsed = uuid::Uuid::parse_str(&cid).expect("correlation_id 应是合法 UUID");
+        assert_eq!(
+            parsed.get_version(),
+            Some(uuid::Version::Random),
+            "correlation_id 应是 v4 随机 UUID"
+        );
+
+        // 两次调用产生不同 correlation_id
+        let (_, cid2) = internal_error_response();
+        assert_ne!(cid, cid2, "correlation_id 应每次不同");
+    }
+
+    #[test]
+    fn api_json_error_branch_returns_generic_500_with_correlation_id() {
+        // 端到端验证：传入含敏感信息的错误，api_json 产出的响应体应只有 generic
+        // error + correlation_id，且不含敏感信息。
+        let sensitive = "INTERNAL: /var/lib/orcha/secret path + module::inner";
+        let value: Result<serde_json::Value> = Err(anyhow::anyhow!("boom: {sensitive}"));
+        let resp = api_json(value);
+
+        // tiny_http Response 可通过 as_reader 读 body；这里用 unwrap 的长度推断
+        // 改用 Response 的 into_reader 拿到 body 字节
+        use std::io::Read;
+        let mut cursor = resp.into_reader();
+        let mut buf = Vec::new();
+        cursor.read_to_end(&mut buf).unwrap();
+        let body = String::from_utf8(buf).unwrap();
+
+        assert!(
+            body.contains("internal_error"),
+            "响应体应含 generic error: {body}"
+        );
+        assert!(
+            body.contains("correlation_id"),
+            "响应体应含 correlation_id: {body}"
+        );
+        assert!(
+            !body.contains(sensitive),
+            "#27: 响应体不得泄露内部细节: {body}"
         );
     }
 }
