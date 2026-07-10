@@ -14,8 +14,11 @@
 //!
 //! # 匹配规则
 //!
-//! - WriteFile / DeleteFile：按 path 的 basename（文件名）精确匹配，
-//!   这样不同 worktree 路径前缀不影响匹配。
+//! - WriteFile / DeleteFile：按**完整规范化相对路径**精确匹配（#20），
+//!   不再仅取 basename——否则批准 `src/main.rs` 后 LLM 可写任意目录下的
+//!   `main.rs`（如 `tests/main.rs`、`.github/main.rs`），构成越权。
+//!   路径会规范化（消去 `.`/`..`、统一分隔符），`src/./main.rs` 与
+//!   `src/main.rs` 视作同一文件。
 //! - RunCommand：按 `program:arg1 arg2 ...` 精确匹配。
 
 use std::path::Path;
@@ -117,14 +120,28 @@ impl RuntimeWhitelist {
     }
 }
 
-/// 计算路径指纹：取 basename（文件名），忽略目录前缀。
-/// 这样不同 worktree 路径前缀不影响匹配。
+/// 计算路径指纹：返回**完整规范化相对路径**（#20）。
+///
+/// 仅取 basename 会导致同名文件跨目录越权（批准 `src/main.rs` 后可写
+/// `tests/main.rs`）。此处规范化整个相对路径，使不同目录的同名文件指纹不同。
 fn fingerprint_path(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(path)
-        .to_string()
+    normalize_relative(path)
+}
+
+/// 把相对 workspace 的路径规范化：统一分隔符为 '/'，消去 '.'，解析 '..'
+/// （不允许越过根目录，越界的 '..' 被丢弃）。
+fn normalize_relative(path: &str) -> String {
+    let mut stack: Vec<&str> = Vec::new();
+    for comp in path.split(['/', '\\']) {
+        match comp {
+            "" | "." => continue,
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    stack.join("/")
 }
 
 /// 计算命令指纹：`program:arg1 arg2 ...`
@@ -141,10 +158,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fingerprint_path_takes_basename() {
-        assert_eq!(fingerprint_path("src/utils/mod.rs"), "mod.rs");
-        assert_eq!(fingerprint_path("/tmp/worktree-x/src/lib.rs"), "lib.rs");
+    fn fingerprint_path_normalizes_full_relative_path() {
+        // 完整相对路径，不再是 basename（#20）
+        assert_eq!(fingerprint_path("src/utils/mod.rs"), "src/utils/mod.rs");
         assert_eq!(fingerprint_path("a.txt"), "a.txt");
+        // 规范化：消去 '.' 与 '..'，统一分隔符
+        assert_eq!(fingerprint_path("src/./main.rs"), "src/main.rs");
+        assert_eq!(fingerprint_path("src/../tests/main.rs"), "tests/main.rs");
+        assert_eq!(fingerprint_path("src\\lib.rs"), "src/lib.rs");
     }
 
     #[test]
@@ -157,16 +178,33 @@ mod tests {
     }
 
     #[test]
-    fn matches_write_file_by_basename() {
+    fn matches_write_file_by_full_relative_path() {
         let mut wl = RuntimeWhitelist::default();
-        wl.write.push("mod.rs".into());
+        wl.write.push("src/main.rs".into());
 
-        // basename 匹配，路径前缀不同也算命中
+        // 完整相对路径匹配
         let action = orcha_core::ApprovalAction::WriteFile {
-            path: "/tmp/worktree-abc/src/utils/mod.rs".into(),
+            path: "src/main.rs".into(),
             content_preview: "".into(),
         };
         assert!(wl.matches(&action));
+
+        // 规范化等价路径也命中
+        let action_norm = orcha_core::ApprovalAction::WriteFile {
+            path: "src/./main.rs".into(),
+            content_preview: "".into(),
+        };
+        assert!(wl.matches(&action_norm));
+
+        // 不同目录的同名文件不得命中（#20 的核心：防越权）
+        let action_evil = orcha_core::ApprovalAction::WriteFile {
+            path: "tests/main.rs".into(),
+            content_preview: "".into(),
+        };
+        assert!(
+            !wl.matches(&action_evil),
+            "tests/main.rs 不得命中 src/main.rs"
+        );
 
         // 不同文件名不命中
         let action2 = orcha_core::ApprovalAction::WriteFile {
@@ -174,6 +212,20 @@ mod tests {
             content_preview: "".into(),
         };
         assert!(!wl.matches(&action2));
+    }
+
+    #[test]
+    fn whitelist_does_not_over_match_same_basename_different_dir() {
+        // #20 回归测试：批准 src/main.rs 后，任意其它目录的 main.rs 都不得自动放行
+        let mut wl = RuntimeWhitelist::default();
+        wl.write.push("src/main.rs".into());
+        for evil in ["tests/main.rs", "build/main.rs", ".github/main.rs"] {
+            let action = orcha_core::ApprovalAction::WriteFile {
+                path: evil.into(),
+                content_preview: "".into(),
+            };
+            assert!(!wl.matches(&action), "{evil} 不应命中 src/main.rs 的白名单");
+        }
     }
 
     #[test]
@@ -195,14 +247,24 @@ mod tests {
     }
 
     #[test]
-    fn matches_delete_file_by_basename() {
+    fn matches_delete_file_by_full_relative_path() {
         let mut wl = RuntimeWhitelist::default();
-        wl.delete.push("debug.log".into());
+        wl.delete.push("logs/debug.log".into());
 
+        // 完整相对路径匹配
         let action = orcha_core::ApprovalAction::DeleteFile {
-            path: "/some/path/debug.log".into(),
+            path: "logs/debug.log".into(),
         };
         assert!(wl.matches(&action));
+
+        // 不同目录的同名文件不得命中
+        let action_evil = orcha_core::ApprovalAction::DeleteFile {
+            path: "build/debug.log".into(),
+        };
+        assert!(
+            !wl.matches(&action_evil),
+            "build/debug.log 不得命中 logs/debug.log"
+        );
     }
 
     #[test]

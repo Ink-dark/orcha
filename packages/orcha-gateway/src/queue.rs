@@ -766,7 +766,7 @@ fn generate_commit_info(
 fn fallback_commit_info(task_description: &str) -> (String, String) {
     let slug = sanitize_branch_slug(&task_description.chars().take(40).collect::<String>());
     (
-        format!("chore: apply orcha task ({})", &slug),
+        format!("chore: apply orcha task ({})", slug),
         if slug.is_empty() {
             "orcha-task".into()
         } else {
