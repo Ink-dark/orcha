@@ -28,6 +28,10 @@ llm = ["dep:orcha-llm"]
 # 启用 SQLite 后端（M6，WAL + 跨进程锁，替代 FileTaskStore）
 sqlite = ["dep:rusqlite"]
 
+[target.'cfg(unix)'.dependencies]
+# 仅 Unix 需要：execute_run_command 超时时用 killpg 杀整个进程组（#7）。
+libc = "0.2"
+
 [dev-dependencies]
 # tempfile 同时作为 dev-dependency 以便测试中直接使用。
 tempfile = "3"
