@@ -78,11 +78,34 @@ pub struct IpcConfig {
     #[serde(default = "default_ipc_port")]
     pub port: u16,
 
+    /// #26：TCP 后端共享密钥。
+    ///
+    /// - `None`（默认）：查 `ORCHA_IPC_TCP_SECRET` 环境变量；仍为空则 TCP 不做认证
+    ///   （仅 dev/CI 用，Gateway 启动时打警告：任意本机进程可连入伪造触发/审批）。
+    /// - `Some(s)`：TCP 连接建立后，客户端必须先发 `AUTH <s>\n`，服务端校验通过才
+    ///   进入 JSON-line 协议；不匹配立即断开。
+    ///
+    /// Unix socket 后端靠文件系统权限 0600 保护（见 #17），不需要此字段。
+    #[serde(default)]
+    pub tcp_secret: Option<String>,
+
     /// Smoke 测试端口（纯文本 TCP，一行 = 一个任务）。0 = 禁用。默认 7423。
     /// 仅 `smoke` feature 启用时编译。
     #[cfg(feature = "smoke")]
     #[serde(default = "default_smoke_port")]
     pub smoke_port: u16,
+}
+
+impl IpcConfig {
+    /// 实际生效的 TCP 密钥：config 字段优先，否则查 `ORCHA_IPC_TCP_SECRET` 环境变量。
+    /// 两处都未配置返回 `None`（TCP 不做认证，dev 模式）。
+    pub fn effective_tcp_secret(&self) -> Option<String> {
+        self.tcp_secret.clone().or_else(|| {
+            std::env::var("ORCHA_IPC_TCP_SECRET")
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
+    }
 }
 
 fn default_ipc_kind() -> String {
@@ -102,6 +125,7 @@ impl Default for IpcConfig {
         Self {
             kind: default_ipc_kind(),
             port: default_ipc_port(),
+            tcp_secret: None,
             #[cfg(feature = "smoke")]
             smoke_port: default_smoke_port(),
         }

@@ -135,6 +135,15 @@ pub fn run(config: GatewayConfig) -> Result<()> {
     // 3. IPC server
     let ipc_addr = IpcAddr::from_kind(&config.ipc.kind, &config.home, config.ipc.port);
     let listener = ipc::bind(&ipc_addr).context("bind IPC listener")?;
+    // #26：TCP 后端共享密钥握手。None（且环境变量也没配）= dev 模式不认证，
+    // accept_authenticated 内部会打警告。Unix socket 靠 0600 权限保护（#17）。
+    let ipc_tcp_secret = config.ipc.effective_tcp_secret();
+    if listener.is_tcp() {
+        match &ipc_tcp_secret {
+            Some(_) => eprintln!("[gateway] IPC TCP 已启用共享密钥握手（#26）"),
+            None => eprintln!("[gateway] 警告: IPC TCP 未配 tcp_secret，任意本机进程可连入（#26）"),
+        }
+    }
     eprintln!("[gateway] IPC listening on {}", format_ipc_addr(&ipc_addr));
 
     let submitter = queue.submitter();
@@ -147,11 +156,13 @@ pub fn run(config: GatewayConfig) -> Result<()> {
     let accept_approval = approval_config.clone();
     let accept_wl = runtime_whitelist.clone();
     let accept_wl_path = runtime_wl_path.clone();
+    let accept_ipc_secret = ipc_tcp_secret.clone();
     thread::Builder::new()
         .name("orcha-accept".into())
         .spawn(move || {
             accept_loop(
                 listener,
+                accept_ipc_secret,
                 accept_registry,
                 submitter,
                 accept_auth,
@@ -292,6 +303,7 @@ fn build_task_store_arc(config: &GatewayConfig) -> Result<Arc<dyn TaskStore>> {
 #[allow(clippy::too_many_arguments)]
 fn accept_loop(
     listener: IpcListener,
+    ipc_secret: Option<String>,
     registry: AdapterRegistry,
     submitter: TaskSubmitter,
     auth: Authenticator,
@@ -302,7 +314,8 @@ fn accept_loop(
     cancel_map: crate::queue::TaskCancelMap,
 ) {
     loop {
-        match listener.accept() {
+        // #26：TCP 后端做共享密钥握手；Unix socket 直接放行（0600 保护）。
+        match listener.accept_authenticated(ipc_secret.as_deref()) {
             Ok(stream) => {
                 let registry = registry.clone();
                 let submitter = submitter.clone();
@@ -332,8 +345,13 @@ fn accept_loop(
                 }
             }
             Err(e) => {
-                eprintln!("[gateway] accept 失败: {e}");
-                thread::sleep(Duration::from_millis(100));
+                // 握手失败（密钥不匹配）也走这里，日志区分一下
+                if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    eprintln!("[gateway] IPC 连接握手被拒: {e}");
+                } else {
+                    eprintln!("[gateway] accept 失败: {e}");
+                    thread::sleep(Duration::from_millis(100));
+                }
             }
         }
     }

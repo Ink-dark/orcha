@@ -47,6 +47,12 @@ interface AdapterConfig {
   feishuAppId?: string;
   /** 飞书 app_secret（非 mock 模式必填）。 */
   feishuAppSecret?: string;
+  /**
+   * #26：IPC TCP 共享密钥（来自 ORCHA_IPC_TCP_SECRET）。
+   * TCP 连接建立后客户端先发 `AUTH <secret>\n`。Unix socket 忽略。
+   * 未设置 = 不发 AUTH（仅 Gateway 侧也未配 secret 的 dev 模式可用）。
+   */
+  ipcTcpSecret?: string;
 }
 
 /** 从环境变量读配置。失败时抛错并退出。 */
@@ -68,11 +74,15 @@ function loadConfig(): AdapterConfig {
     }
   }
 
+  // #26：TCP 后端共享密钥（与 Gateway 的 ORCHA_IPC_TCP_SECRET / config.ipc.tcp_secret 对齐）
+  const ipcTcpSecret = process.env.ORCHA_IPC_TCP_SECRET || undefined;
+
   return {
     gatewayEndpoint,
     mock,
     feishuAppId,
     feishuAppSecret,
+    ipcTcpSecret,
   };
 }
 
@@ -156,6 +166,8 @@ function createFeishuClient(cfg: AdapterConfig): FeishuClient {
 function createIpcClient(cfg: AdapterConfig, feishuClient: FeishuClient): IpcClient {
   const opts: IpcClientOptions = {
     endpoint: cfg.gatewayEndpoint,
+    // #26：TCP 后端共享密钥握手（Unix socket 时 IpcClient 内部会忽略）
+    tcpSecret: cfg.ipcTcpSecret,
     heartbeatIntervalMs: 30_000,
     reconnectBaseMs: 1_000,
     reconnectMaxMs: 30_000,

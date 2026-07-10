@@ -23,6 +23,14 @@ export interface IpcClientOptions {
    * - `unix:///path/to/sock`：Unix domain socket
    */
   endpoint: string;
+  /**
+   * #26：TCP 后端共享密钥。
+   * - TCP 连接建立后，客户端必须先发 `AUTH <secret>\n` 作为首行，
+   *   Gateway 校验通过才进入 JSON-line 协议；不匹配会被立即断开。
+   * - Unix socket 靠文件系统权限 0600 保护，此字段被忽略。
+   * - 不传（undefined）= 不发 AUTH 行（仅当 Gateway 侧也未配 secret 的 dev 模式可用）。
+   */
+  tcpSecret?: string;
   /** 心跳间隔，默认 30s（与 Rust 侧 watchdog 35s read timeout 配合）。 */
   heartbeatIntervalMs?: number;
   /** 重连初始退避，默认 1s。 */
@@ -53,8 +61,17 @@ const MAX_LINE_BYTES = 1024 * 1024;
  * 一条连接内多路复用多个会话（用消息的 `session` 字段区分），
  * 因此 Adapter 进程通常只需一个 IpcClient 实例。
  */
+/** 构造后已填默认值的配置（tcpSecret 保持可选）。 */
+type ResolvedIpcOptions = {
+  endpoint: string;
+  tcpSecret: string | undefined;
+  heartbeatIntervalMs: number;
+  reconnectBaseMs: number;
+  reconnectMaxMs: number;
+};
+
 export class IpcClient {
-  private readonly opts: Required<IpcClientOptions>;
+  private readonly opts: ResolvedIpcOptions;
   private readonly handlers: IpcClientHandlers;
 
   private socket: net.Socket | null = null;
@@ -67,6 +84,7 @@ export class IpcClient {
   constructor(opts: IpcClientOptions, handlers: IpcClientHandlers) {
     this.opts = {
       endpoint: opts.endpoint,
+      tcpSecret: opts.tcpSecret,
       heartbeatIntervalMs: opts.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_MS,
       reconnectBaseMs: opts.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS,
       reconnectMaxMs: opts.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS,
@@ -134,6 +152,11 @@ export class IpcClient {
 
     sock.once('connect', () => {
       this.reconnectAttempts = 0;
+      // #26：TCP 后端先发 AUTH <secret>\n 作为首行，Gateway 校验通过才进入
+      // JSON-line 协议。必须在心跳/业务消息之前发出。Unix socket 跳过（0600 保护）。
+      if (parsed.kind === 'tcp' && this.opts.tcpSecret !== undefined) {
+        sock.write(`AUTH ${this.opts.tcpSecret}\n`);
+      }
       this.startHeartbeat();
       this.handlers.onConnect();
     });
