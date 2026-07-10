@@ -377,6 +377,92 @@ const MAX_COMMAND_OUTPUT_CHARS: usize = 4000;
 /// Worker 工具执行的命令超时（秒）。编译/测试可能很久，给 10 分钟。
 const COMMAND_TIMEOUT_SECS: u64 = 600;
 
+/// `run_with_timeout` 的失败原因。
+#[derive(Debug)]
+enum RunTimeoutErr {
+    Spawn(std::io::Error),
+    Wait(std::io::Error),
+    /// 超时，已杀整个进程组。
+    Timeout {
+        pid: u32,
+    },
+}
+
+/// 在独立进程组中执行命令，超时则杀整个进程组（防子进程成为孤儿，#7）。
+///
+/// - stdout/stderr 用管道捕获，单独线程读取，避免管道写满后子进程阻塞；
+/// - Unix 下 `process_group(0)` 让子进程成为新进程组 leader，超时时用
+///   `killpg(pid, SIGKILL)` 一次性杀掉整个进程树（含孙进程）；
+/// - 其他平台用 `child.kill()` 杀直接子进程。
+fn run_with_timeout(
+    cmd: &mut Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, RunTimeoutErr> {
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // 让子进程成为新进程组 leader（pgid == child pid），
+        // 超时时可用 killpg(child_pid) 一次性杀掉整个进程树。
+        cmd.process_group(0);
+    }
+
+    let mut child = cmd.spawn().map_err(RunTimeoutErr::Spawn)?;
+    let pid = child.id();
+
+    // 取出 stdout/stderr 管道，单独线程读取，避免管道写满后子进程阻塞。
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut stderr = child.stderr.take().expect("piped stderr");
+    let stdout_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout, &mut buf);
+        buf
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr, &mut buf);
+        buf
+    });
+
+    // 轮询 try_wait，超时则杀进程组并回收僵尸进程。
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    // 超时：杀整个进程组（Unix）/ 直接杀子进程（其他平台）
+                    #[cfg(unix)]
+                    {
+                        // SIGKILL 整个进程组，避免孙子进程成为孤儿。
+                        unsafe {
+                            libc::killpg(pid as i32, libc::SIGKILL);
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = child.kill();
+                    }
+                    // 回收僵尸进程
+                    let _ = child.wait();
+                    return Err(RunTimeoutErr::Timeout { pid });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(RunTimeoutErr::Wait(e)),
+        }
+    };
+
+    let stdout_bytes = stdout_handle.join().unwrap_or_default();
+    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+    Ok(std::process::Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
+}
+
 fn execute_run_command(
     args: &serde_json::Value,
     workspace: &Path,
@@ -426,27 +512,27 @@ fn execute_run_command(
         workspace.display()
     );
 
-    // 在新线程中执行命令，超时则杀进程
-    let program_clone = program.clone();
-    let cmd_args_clone = cmd_args.clone();
-    let ws_clone = workspace.to_path_buf();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = Command::new(&program_clone)
-            .args(&cmd_args_clone)
-            .current_dir(&ws_clone)
-            .output();
-        let _ = tx.send(result);
-    });
-
-    let output = match rx.recv_timeout(std::time::Duration::from_secs(COMMAND_TIMEOUT_SECS)) {
-        Ok(Ok(o)) => o,
-        Ok(Err(e)) => {
+    // 在独立进程组中执行命令，超时则杀整个进程组（防子进程成为孤儿，#7）
+    let mut cmd = Command::new(&program);
+    cmd.args(&cmd_args).current_dir(workspace);
+    let output = match run_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(COMMAND_TIMEOUT_SECS),
+    ) {
+        Ok(o) => o,
+        Err(RunTimeoutErr::Spawn(e)) => {
             return format!("执行 {program} 失败: {e}");
         }
-        Err(_timeout) => {
+        Err(RunTimeoutErr::Wait(e)) => {
+            return format!("执行 {program} 等待失败: {e}");
+        }
+        Err(RunTimeoutErr::Timeout { pid }) => {
+            eprintln!(
+                "[{agent_name}] 命令超时（>{COMMAND_TIMEOUT_SECS}s），已杀进程组 pid={pid}: {program} {}",
+                cmd_args.join(" ")
+            );
             return format!(
-                "执行 {program} 超时（>{COMMAND_TIMEOUT_SECS} 秒），已终止。请简化命令或分步执行。"
+                "执行 {program} 超时（>{COMMAND_TIMEOUT_SECS} 秒），已终止整个进程组。请简化命令或分步执行。"
             );
         }
     };
@@ -1005,6 +1091,57 @@ mod tests {
             );
             assert!(result.contains("已截断"), "应截断: {result}");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_with_timeout_kills_entire_process_group_on_unix() {
+        // 验证 #7 修复：超时后用 killpg 杀掉整个进程组，孙进程不会成为孤儿。
+        // 整个测试用 #[cfg(unix)] 编译期门控：依赖 libc::kill 和 sh，Windows 不编译。
+        use std::time::Duration;
+        let ws = tempfile::tempdir().unwrap();
+        let pidfile = ws.path().join("grandchild.pid");
+        // sh 起一个 sleep 30 孙进程并把其 pid 写入文件；sh 自身 wait。
+        // 若仅杀 sh（直接子进程）而不杀进程组，sleep 30 会作为孤儿继续运行 30s。
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg(&script).current_dir(ws.path());
+
+        let start = std::time::Instant::now();
+        let result = run_with_timeout(&mut cmd, Duration::from_secs(1));
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(RunTimeoutErr::Timeout { .. })),
+            "应超时返回: {result:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "超时后应迅速返回（已杀进程组），实际 {elapsed:?}"
+        );
+
+        // 读取孙进程 pid，验证 killpg 已将其杀掉（kill -0 探活返回非 0）。
+        let grandchild_pid: i32 = {
+            let mut content = String::new();
+            for _ in 0..50 {
+                if let Ok(s) = std::fs::read_to_string(&pidfile) {
+                    content = s;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            content
+                .trim()
+                .parse::<i32>()
+                .expect("pidfile 应含孙进程 pid")
+        };
+        // 给 killpg 一点生效时间
+        std::thread::sleep(Duration::from_millis(300));
+        let still_alive = unsafe { libc::kill(grandchild_pid, 0) } == 0;
+        assert!(
+            !still_alive,
+            "孙进程 pid={grandchild_pid} 应已被 killpg 杀掉，但仍存活（孤儿）"
+        );
     }
 
     #[test]
