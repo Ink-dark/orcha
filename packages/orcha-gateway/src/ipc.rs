@@ -153,6 +153,7 @@ mod tcp_backend {
 mod unix_backend {
     use super::{IpcAddr, IpcStream};
     use std::io::{self, Read, Write};
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
 
     pub struct UnixTransport {
@@ -201,6 +202,13 @@ mod unix_backend {
             // 清理可能残留的旧 socket 文件
             let _ = std::fs::remove_file(path);
             let listener = UnixListener::bind(path)?;
+            // #17: 收紧 socket 文件权限为 0600，防止同机其他用户连接。
+            // 默认受 umask 影响（常为 0755/0777），多用户系统下可被他人连入
+            // 伪造触发/绕过审批。设权限失败则清理并报错，避免遗留可连 socket。
+            if let Err(e) = std::fs::set_permissions(path, PermissionsExt::from_mode(0o600)) {
+                let _ = std::fs::remove_file(path);
+                return Err(e);
+            }
             Ok(Self { listener })
         }
 
@@ -353,5 +361,24 @@ mod tests {
         drop(client);
 
         handle.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_socket_permissions_are_restricted() {
+        // #17：bind 后 socket 文件权限应为 0600，防止同机其他用户连接。
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("perm.sock");
+        let addr = IpcAddr::Unix(sock.clone());
+
+        let _server = bind(&addr).expect("bind");
+
+        let mode = std::fs::metadata(&sock)
+            .expect("socket 元数据")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "socket 权限应为 0600，实际 {mode:#o}（#17）");
     }
 }
