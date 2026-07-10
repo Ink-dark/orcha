@@ -17,6 +17,8 @@ thiserror.workspace = true
 anyhow.workspace = true
 tiny_http.workspace = true
 chrono.workspace = true
+# #27：API 错误响应用 UUID v4 作 correlation_id，便于排障而不泄露内部细节。
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
