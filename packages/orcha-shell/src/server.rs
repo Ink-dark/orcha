@@ -380,7 +380,6 @@ fn status_str(s: TaskStatus) -> String {
 fn asset(content_type: &str, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_string(body)
         .with_header(Header::from_bytes(&b"Content-Type"[..], content_type.as_bytes()).unwrap())
-        .with_header(cors())
 }
 
 fn page(_name: &str, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
@@ -391,17 +390,11 @@ fn page(_name: &str, body: &str) -> Response<std::io::Cursor<Vec<u8>>> {
 fn api_json(value: Result<serde_json::Value>) -> Response<std::io::Cursor<Vec<u8>>> {
     match value {
         Ok(v) => Response::from_string(serde_json::to_string(&v).unwrap_or_default())
-            .with_header(Header::from_bytes(&b"Content-Type"[..], b"application/json").unwrap())
-            .with_header(cors()),
+            .with_header(Header::from_bytes(&b"Content-Type"[..], b"application/json").unwrap()),
         Err(e) => Response::from_string(format!(r#"{{"error":"{e}"}}"#))
             .with_status_code(500)
-            .with_header(Header::from_bytes(&b"Content-Type"[..], b"application/json").unwrap())
-            .with_header(cors()),
+            .with_header(Header::from_bytes(&b"Content-Type"[..], b"application/json").unwrap()),
     }
-}
-
-fn cors() -> Header {
-    Header::from_bytes(&b"Access-Control-Allow-Origin"[..], b"*").unwrap()
 }
 
 #[cfg(test)]
@@ -529,5 +522,51 @@ mod tests {
         assert_eq!(srv.auth_token.as_deref(), Some("t1"));
         let srv2 = HttpServer::new("/tmp", 7421);
         assert!(srv2.auth_token.is_none(), "默认无认证（向后兼容）");
+    }
+
+    // ---- #23 CORS 回归测试：响应不得再带 Access-Control-Allow-Origin ----
+
+    #[test]
+    fn api_responses_do_not_carry_cors_star_header() {
+        use std::io::{Read, Write};
+        // 取一个空闲端口供 tiny_http server 使用
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+
+        let server = Server::http(addr).expect("CORS 测试绑定失败");
+        let home = tempfile::tempdir().unwrap();
+        // 初始化 store，让 /api/tasks 返回 200
+        FileTaskStore::new(home.path()).init().unwrap();
+        let home_path = home.path().to_path_buf();
+
+        let client = std::thread::spawn(move || -> Vec<u8> {
+            for _ in 0..50 {
+                if let Ok(mut s) = std::net::TcpStream::connect(addr) {
+                    s.write_all(b"GET /api/tasks HTTP/1.0\r\nHost: localhost\r\n\r\n")
+                        .unwrap();
+                    let mut buf = Vec::new();
+                    s.read_to_end(&mut buf).unwrap();
+                    return buf;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("无法连接测试服务器");
+        });
+
+        let req = server.incoming_requests().next().expect("no request");
+        handle(req, &home_path, &None).unwrap();
+        drop(server);
+
+        let resp_bytes = client.join().unwrap();
+        let resp = String::from_utf8_lossy(&resp_bytes);
+        assert!(
+            !resp
+                .to_ascii_lowercase()
+                .contains("access-control-allow-origin"),
+            "响应不应含 Access-Control-Allow-Origin（#23 已移除 CORS *）:\n{resp}"
+        );
     }
 }
