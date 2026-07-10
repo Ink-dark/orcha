@@ -250,17 +250,13 @@ pub fn handle_approval_response(
     Some((entry.action, final_decision, operator))
 }
 
-/// 极简 UUID v4 生成（不引依赖，用时间戳 + 计数器 + 随机）。
-/// 用于 action_id。不追求密码学安全，只追求全局唯一。
+/// 生成密码学安全的 UUID v4 作为审批 action_id。
+///
+/// #22：旧实现用 `SystemTime` 纳秒 + `AtomicU64` 计数器，攻击者拿到 IPC
+/// 访问权即可推算后续 action_id，伪造 `ApprovalResponse` 越权批准/拒绝。
+/// 改用 `uuid` crate 的 CSPRNG UUID v4（底层 getrandom），不可预测。
 fn uuid_v4_simple() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let cnt = COUNTER.fetch_add(1, Ordering::SeqCst);
-    format!("{ts:016x}-{cnt:016x}")
+    uuid::Uuid::new_v4().to_string()
 }
 
 // ============================================================
@@ -289,6 +285,29 @@ mod tests {
         let b = uuid_v4_simple();
         assert_ne!(a, b, "连续生成的 UUID 应不同");
         assert!(a.len() > 10, "UUID 应有一定长度");
+    }
+
+    /// #22：action_id 必须是不可预测的 UUID v4（8-4-4-4-12，version 位为 4），
+    /// 不能再是 `时间戳-计数器` 这种可推算格式。
+    #[test]
+    fn uuid_v4_simple_is_cryptographically_random_v4() {
+        let id = uuid_v4_simple();
+        let parsed = uuid::Uuid::parse_str(&id).expect("action_id 应是合法 UUID");
+        assert_eq!(
+            parsed.get_version(),
+            Some(uuid::Version::Random),
+            "action_id 应是 v4 随机 UUID，实际 {id}"
+        );
+        // 连续取一批，两两不同（CSPRNG 碰撞概率忽略不计）
+        let mut set = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            assert!(set.insert(uuid_v4_simple()), "1000 次 UUID 不应碰撞");
+        }
+        // 不应再出现旧的 `016x-016x` 单段连字符格式
+        assert!(
+            id.matches('-').count() == 4,
+            "UUID v4 标准格式应有 4 个连字符，实际 {id}"
+        );
     }
 
     #[test]

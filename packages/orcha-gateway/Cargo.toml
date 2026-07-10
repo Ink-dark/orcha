@@ -19,6 +19,8 @@ thiserror.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 toml.workspace = true
+# #22：审批 action_id 改用 CSPRNG UUID v4，杜绝时间戳+计数器可预测。
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
